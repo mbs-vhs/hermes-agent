@@ -191,6 +191,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/devops/devops-kanban-orchestrator',
                     'user-guide/skills/bundled/devops/devops-kanban-worker',
                     'user-guide/skills/bundled/devops/devops-webhook-subscriptions',
+                    'user-guide/skills/bundled/devops/devops-xurl',
                   ],
                 },
                 {
@@ -329,15 +330,6 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/smart-home/smart-home-openhue',
-                  ],
-                },
-                {
-                  type: 'category',
-                  label: 'social-media',
-                  key: 'skills-bundled-social-media',
-                  collapsed: true,
-                  items: [
-                    'user-guide/skills/bundled/social-media/social-media-xurl',
                   ],
                 },
                 {

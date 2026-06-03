@@ -370,6 +370,121 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_child_repairs_split_brain_fallback_runtime(self):
+        """Regression: fallback subagents must not inherit provider/base_url mismatch."""
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://api.anthropic.com"
+        parent.api_key = "anthropic-key"
+        parent.provider = "openai-codex"
+        parent.model = "gpt-5.5"
+        parent.api_mode = "codex_responses"
+        parent._fallback_activated = True
+
+        fake_client = MagicMock()
+        fake_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fake_client.api_key = "codex-key"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fake_client, "gpt-5.5"),
+        ) as mock_resolve:
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+                mock_child.run_conversation.return_value = {
+                    "final_response": "ok",
+                    "completed": True,
+                    "api_calls": 1,
+                }
+                MockAgent.return_value = mock_child
+
+                delegate_task(goal="Test repaired fallback inheritance", parent_agent=parent)
+
+                _, kwargs = MockAgent.call_args
+                self.assertEqual(kwargs["provider"], "openai-codex")
+                self.assertEqual(kwargs["base_url"], "https://chatgpt.com/backend-api/codex")
+                self.assertEqual(kwargs["api_key"], "codex-key")
+                self.assertEqual(kwargs["api_mode"], "codex_responses")
+
+                # --- Security property (cross-provider credential leak guard) ---
+                # The child must resolve the *target provider's own* credential.
+                # It must NEVER pass the parent's explicit api_key / base_url into
+                # the resolver, or the child would reuse the parent's (wrong-
+                # provider) credential. A regression that reintroduces
+                # explicit_api_key=parent / explicit_base_url=parent must FAIL here.
+                self.assertTrue(mock_resolve.called, "resolver must be invoked to repair the split-brain runtime")
+                res_args, res_kwargs = mock_resolve.call_args
+
+                # explicit_api_key must be absent or None (never the parent's key).
+                self.assertIsNone(
+                    res_kwargs.get("explicit_api_key"),
+                    "resolve_provider_client must not receive an explicit_api_key (leaks parent cred)",
+                )
+                # explicit_base_url must be absent or None (never the parent's URL).
+                self.assertIsNone(
+                    res_kwargs.get("explicit_base_url"),
+                    "resolve_provider_client must not receive an explicit_base_url (pins parent endpoint)",
+                )
+                # The parent's anthropic credential / endpoint must not appear in
+                # ANY positional or keyword argument handed to the resolver.
+                _all_resolver_args = [str(a) for a in res_args] + [str(v) for v in res_kwargs.values()]
+                for tainted in ("anthropic-key", "api.anthropic.com"):
+                    self.assertFalse(
+                        any(tainted in a for a in _all_resolver_args),
+                        f"parent credential/endpoint {tainted!r} leaked into resolve_provider_client args: {_all_resolver_args}",
+                    )
+
+                # The repaired child runtime must carry NONE of the parent's
+                # anthropic credential or base_url.
+                self.assertNotEqual(kwargs["api_key"], "anthropic-key")
+                self.assertNotEqual(kwargs["base_url"], "https://api.anthropic.com")
+                self.assertNotIn("api.anthropic.com", str(kwargs["base_url"]))
+
+    def test_child_repairs_fallback_for_non_codex_non_anthropic_provider(self):
+        """Reviewer nit #2: the broad fallback-active mismatch branch (a provider
+        that is neither openai-codex nor anthropic, e.g. xai-oauth) must also
+        resolve the target provider's OWN credential — never the parent's."""
+        parent = _make_mock_parent(depth=0)
+        # Split-brain inherited state: provider says xai-oauth, but the inherited
+        # base_url/api_key still point at the parent's anthropic fallback runtime.
+        parent.base_url = "https://api.anthropic.com"
+        parent.api_key = "anthropic-key"
+        parent.provider = "xai-oauth"
+        parent.model = "grok-4"
+        parent.api_mode = "chat_completions"
+        parent._fallback_activated = True
+
+        fake_client = MagicMock()
+        fake_client.base_url = "https://api.x.ai/v1"
+        fake_client.api_key = "xai-key"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fake_client, "grok-4"),
+        ) as mock_resolve:
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+                mock_child.run_conversation.return_value = {
+                    "final_response": "ok",
+                    "completed": True,
+                    "api_calls": 1,
+                }
+                MockAgent.return_value = mock_child
+
+                delegate_task(goal="Test xai fallback repair", parent_agent=parent)
+
+                self.assertTrue(mock_resolve.called, "broad fallback branch must invoke the resolver")
+                _, res_kwargs = mock_resolve.call_args
+                self.assertIsNone(res_kwargs.get("explicit_api_key"))
+                self.assertIsNone(res_kwargs.get("explicit_base_url"))
+
+                _, kwargs = MockAgent.call_args
+                self.assertEqual(kwargs["provider"], "xai-oauth")
+                self.assertEqual(kwargs["base_url"], "https://api.x.ai/v1")
+                self.assertEqual(kwargs["api_key"], "xai-key")
+                # No leak of the parent's anthropic cred/endpoint into the child.
+                self.assertNotEqual(kwargs["api_key"], "anthropic-key")
+                self.assertNotIn("api.anthropic.com", str(kwargs["base_url"]))
+
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         sink = MagicMock()

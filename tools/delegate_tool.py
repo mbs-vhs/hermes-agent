@@ -867,6 +867,77 @@ def _build_child_progress_callback(
     return _callback
 
 
+def _coherent_inherited_runtime(
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    api_mode: Optional[str],
+    parent_agent,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return a provider/model-consistent runtime bundle for inherited children.
+
+    Parent agents can be mid-fallback when they delegate.  In that state some
+    older gateway sessions have exposed a split-brain runtime such as
+    ``provider=openai-codex`` while ``base_url`` still points at
+    ``https://api.anthropic.com``.  A child that blindly inherits those fields
+    retries the wrong endpoint and never reaches the provider that represents
+    its role.  Repair only obvious inherited/fallback mismatch cases; explicit
+    delegation.provider/base_url overrides are handled before this helper.
+    """
+    provider_norm = (provider or "").strip().lower()
+    model_norm = (model or "").strip()
+    base_url_norm = str(base_url or "").strip()
+    host = base_url_hostname(base_url_norm) if base_url_norm else ""
+
+    fallback_active = getattr(parent_agent, "_fallback_activated", False) is True
+    mismatch = False
+    if provider_norm == "openai-codex" and host in {"api.anthropic.com", ""}:
+        mismatch = True
+    elif provider_norm == "anthropic" and host and host not in {"api.anthropic.com"}:
+        mismatch = True
+    elif fallback_active and provider_norm and model_norm:
+        # Fallback activation should have produced a coherent runtime. Resolve
+        # defensively because this path runs rarely and bad inherited state is
+        # much costlier than one provider-client lookup.
+        mismatch = True
+
+    if not mismatch or not provider_norm or not model_norm:
+        return base_url, api_key, api_mode, provider
+
+    try:
+        from agent.auxiliary_client import resolve_provider_client
+
+        client, resolved_model = resolve_provider_client(
+            provider_norm,
+            model=model_norm,
+            raw_codex=True,
+        )
+        if client is None:
+            return base_url, api_key, api_mode, provider
+        fixed_base_url = str(getattr(client, "base_url", "") or base_url_norm) or base_url
+        fixed_api_key = getattr(client, "api_key", None) or api_key
+        fixed_api_mode = api_mode
+        fixed_host = base_url_hostname(fixed_base_url) if fixed_base_url else ""
+        fixed_base_url_str = str(fixed_base_url or "")
+        if provider_norm == "openai-codex":
+            fixed_api_mode = "codex_responses"
+        elif provider_norm == "anthropic" or fixed_host == "api.anthropic.com" or fixed_base_url_str.rstrip("/").lower().endswith("/anthropic"):
+            fixed_api_mode = "anthropic_messages"
+        logger.info(
+            "Repaired inherited subagent runtime: provider=%s model=%s base_url=%s -> %s",
+            provider_norm,
+            model_norm,
+            base_url_norm or "<empty>",
+            fixed_base_url,
+        )
+        return fixed_base_url, fixed_api_key, fixed_api_mode, provider_norm
+    except Exception:
+        logger.debug("Could not repair inherited subagent runtime", exc_info=True)
+        return base_url, api_key, api_mode, provider
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1022,6 +1093,24 @@ def _build_child_agent(
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
     effective_base_url = override_base_url or parent_agent.base_url
     effective_api_key = override_api_key or parent_api_key
+
+    if not any([override_provider, override_base_url, override_api_key, override_api_mode, override_acp_command]):
+        (
+            effective_base_url,
+            effective_api_key,
+            repaired_api_mode,
+            effective_provider,
+        ) = _coherent_inherited_runtime(
+            provider=effective_provider,
+            model=effective_model,
+            base_url=effective_base_url,
+            api_key=effective_api_key,
+            api_mode=getattr(parent_agent, "api_mode", None),
+            parent_agent=parent_agent,
+        )
+    else:
+        repaired_api_mode = None
+    effective_base_url = effective_base_url or ""
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1030,6 +1119,8 @@ def _build_child_agent(
     _parent_provider = getattr(parent_agent, "provider", None) or ""
     if override_api_mode is not None:
         effective_api_mode = override_api_mode
+    elif repaired_api_mode is not None:
+        effective_api_mode = repaired_api_mode
     elif effective_provider != _parent_provider:
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:

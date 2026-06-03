@@ -9,17 +9,16 @@ lifecycle:
   end-to-end through ``runner.stop()`` (the same way ``test_gateway_shutdown.py``
   exercises the drain/interrupt paths).
 
-* the **boot-side gate** — the ``elif _recovery_notification_pending(): await
-  self._send_home_channel_startup_notifications(); _clear_recovery_marker()``
-  branch in ``GatewayRunner.start()``. That branch is embedded inside the giant
-  ``start()`` method and is NOT extracted into a callable unit (see the module
-  docstring caveat below), so the boot tests here replicate the EXACT branch
-  sequence against the REAL runner methods + REAL marker helpers (real
-  ``_send_home_channel_startup_notifications`` + ``RestartTestAdapter`` capturing
-  sent messages). This proves the marker -> notifier -> clear contract end-to-end
-  through every collaborator EXCEPT the literal ``if/elif`` wiring inside
-  ``start()``; closing that last gap needs a small production refactor (extract
-  the gate), documented in the reviewer report — NOT done here (test-only role).
+* the **boot-side gate** — the ``if /restart … elif _recovery_notification_pending():``
+  branch that fires the home-channel "gateway online" message. CLAWD-1019 extracted
+  this out of the giant ``start()`` method into
+  ``GatewayRunner._send_post_connect_lifecycle_notifications()``, so the boot tests
+  here drive that REAL method directly (via the ``_run_boot_gate`` shim + the
+  ``RestartTestAdapter`` capturing sent messages). A break in the ``if/elif`` wiring
+  is therefore caught here (revert-verified). The only line not under unit test is
+  ``start()``'s single ``await self._send_post_connect_lifecycle_notifications()``
+  call, which was live-verified during the CLAWD-1019 fleet deploy (a seeded-marker
+  restart on the ``legal`` gateway fired the home-channel send).
 """
 
 import json
@@ -33,26 +32,13 @@ from gateway.platforms.base import SendResult
 from tests.gateway.restart_test_helpers import make_restart_runner
 
 
-# Faithful replica of the CLAWD-1019 boot gate (gateway/run.py start(), the
-# block immediately after adapters connect). Keep this byte-aligned with the
-# production branch so the test stays a true call-site proxy. If start() ever
-# changes the gate, this helper must change in lockstep — that coupling is the
-# point: it is what makes the gap "the if/elif wiring", not the behavior.
+# Exercise the REAL boot-gate logic. CLAWD-1019 extracted the gate out of
+# start() into GatewayRunner._send_post_connect_lifecycle_notifications(), so
+# these tests now drive production code directly (no replica to drift) — a break
+# in the if/elif wiring is caught here. The only line not covered is start()'s
+# single call to this method (live-verified during the CLAWD-1019 fleet deploy).
 async def _run_boot_gate(runner) -> None:
-    restart_notification_pending = gateway_run._restart_notification_pending()
-    delivered_restart_target = await runner._send_restart_notification()
-
-    if restart_notification_pending or delivered_restart_target is not None:
-        skip_home_targets = (
-            {delivered_restart_target} if delivered_restart_target else None
-        )
-        await runner._send_home_channel_startup_notifications(
-            skip_targets=skip_home_targets,
-        )
-        gateway_run._clear_recovery_marker()
-    elif gateway_run._recovery_notification_pending():
-        await runner._send_home_channel_startup_notifications()
-        gateway_run._clear_recovery_marker()
+    await runner._send_post_connect_lifecycle_notifications()
 
 
 def _configure_home(runner, chat_id="home-42", name="Ops Home", thread_id=None):

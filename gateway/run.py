@@ -772,6 +772,45 @@ def _clear_recovery_marker() -> None:
         logger.debug("recovery-notify marker clear failed: %s", exc)
 
 
+# CLAWD-1023: seconds to wait after a graceful stop() completes before the
+# hard-exit watchdog (in start_gateway's signal handler) force-exits. A normal
+# shutdown exits ~1-3s after stop(); if it hasn't, a lingering tool subprocess
+# or unclosed asyncio transport is pinning the event loop, and we os._exit
+# rather than hang to systemd's TimeoutStopSec (210s). The 180s agent-turn
+# drain is unaffected — the watchdog only starts its grace AFTER stop()
+# (drain included) has fully completed. Override via HERMES_HARD_EXIT_GRACE_SEC.
+def _hard_exit_grace_seconds() -> float:
+    """Grace (seconds) after stop() before the watchdog force-exits. A malformed
+    env value must NOT crash module import (that would fail all 10 gateways at
+    once), so fall back to the 20s default."""
+    try:
+        return float(os.environ.get("HERMES_HARD_EXIT_GRACE_SEC", "20") or "20")
+    except (TypeError, ValueError):
+        return 20.0
+
+
+_HARD_EXIT_GRACE_SEC = _hard_exit_grace_seconds()
+
+
+def _resolve_hung_shutdown_exit_code(runner, signal_initiated: bool) -> int:
+    """Exit code the hard-exit watchdog uses when a shutdown hangs.
+
+    Mirrors ``start_gateway()``'s post-``wait_for_shutdown()`` exit decision
+    (≈the ``should_exit_with_failure`` / ``exit_code`` / signal-initiated /
+    ``_restart_via_service`` ladder) so the watchdog never changes shutdown
+    semantics. Keep in sync if that decision changes. (CLAWD-1023)
+    """
+    if getattr(runner, "should_exit_with_failure", False):
+        return 1
+    if runner.exit_code is not None:
+        return runner.exit_code
+    if signal_initiated and not runner._restart_requested:
+        return 1
+    if runner._restart_via_service:
+        return GATEWAY_SERVICE_RESTART_EXIT_CODE
+    return 0
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -18520,6 +18559,36 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
+
+        # Hard-exit watchdog (CLAWD-1023). A graceful stop() completes in ~2.5s
+        # (drain + pid/lock release), but a lingering tool subprocess or an
+        # unclosed asyncio transport can keep the process spinning in its event
+        # loop afterward, hanging until systemd's TimeoutStopSec (210s) SIGKILLs
+        # the cgroup (→ historically SIGABRT+coredump). Once stop() has fully
+        # completed — at which point the pid file and runtime lock are already
+        # released inside stop() (≈line 6172) — give the normal exit a short
+        # grace, then force-exit so a hung teardown can't pin the gateway.
+        # systemd reaps any orphaned cgroup children. The 180s drain is inside
+        # stop(), so awaiting wait_for_shutdown() keeps the watchdog clear of it.
+        async def _hard_exit_watchdog():
+            try:
+                await runner.wait_for_shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(_HARD_EXIT_GRACE_SEC)
+            # Still alive → exit is hung. Resolve the code via the shared helper
+            # that mirrors start_gateway()'s decision (CLAWD-1023).
+            code = _resolve_hung_shutdown_exit_code(runner, _signal_initiated_shutdown)
+            logger.warning(
+                "Hard-exit watchdog: process still alive %.0fs after stop() "
+                "completed — a lingering subprocess/transport is blocking exit; "
+                "forcing os._exit(%d). (CLAWD-1023)",
+                _HARD_EXIT_GRACE_SEC,
+                code,
+            )
+            os._exit(code)
+
+        asyncio.create_task(_hard_exit_watchdog())
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():

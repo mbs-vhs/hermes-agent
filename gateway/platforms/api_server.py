@@ -2960,8 +2960,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit
-        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
+        # Enforce concurrency limit — count IN-FLIGHT runs, not retained result
+        # streams. A completed run keeps its _run_streams entry until its SSE
+        # stream is consumed by a reader or the orphan reaper sweeps it after
+        # _RUN_STREAM_TTL (300s). A fire-and-forget client that never drains the
+        # stream — e.g. the agent-meeting-space bus, which POSTs /v1/runs and
+        # tracks completion out-of-band via its own event log — would otherwise
+        # accumulate _run_streams entries and wedge the gateway at 429 after
+        # _MAX_CONCURRENT_RUNS *completed* runs within the TTL window, blocking
+        # all new turns. _active_run_tasks is popped in _run_and_close's finally,
+        # so it reflects only runs still executing.
+        active_runs = sum(1 for t in self._active_run_tasks.values() if not t.done())
+        if active_runs >= self._MAX_CONCURRENT_RUNS:
             return web.json_response(
                 _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
                 status=429,

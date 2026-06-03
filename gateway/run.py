@@ -4359,33 +4359,10 @@ class GatewayRunner:
         if connected_count > 0:
             await asyncio.sleep(1.0)
 
-        # Notify the chat that initiated /restart that the gateway is back.
-        restart_notification_pending = _restart_notification_pending()
-        delivered_restart_target = await self._send_restart_notification()
-
-        # Broadcast a lightweight "gateway is back" message to configured
-        # home channels only when this startup is resuming from /restart. If a
-        # /restart requester already received a direct completion notice in the
-        # same chat, skip the generic broadcast there to avoid duplicates while
-        # still allowing a home-channel fallback when the direct send fails.
-        if restart_notification_pending or delivered_restart_target is not None:
-            skip_home_targets = (
-                {delivered_restart_target} if delivered_restart_target else None
-            )
-            await self._send_home_channel_startup_notifications(
-                skip_targets=skip_home_targets,
-            )
-            # A /restart supersedes any same-cycle external-recovery marker;
-            # drop it so it can't double-fire on the next boot. (CLAWD-1019)
-            _clear_recovery_marker()
-        elif _recovery_notification_pending():
-            # External (systemd / SIGTERM / `--replace`) restart that interrupted
-            # in-flight work leaves no .restart_notify.json marker, so the branch
-            # above is skipped and the recovery would otherwise be silent.
-            # Announce "gateway online" to the home channel, then clear the
-            # marker so it fires exactly once per restart. (CLAWD-1019)
-            await self._send_home_channel_startup_notifications()
-            _clear_recovery_marker()
+        # Post-connect lifecycle notifications: /restart completion + the
+        # external-restart "gateway online" recovery. Extracted into a method so
+        # the if/elif wiring is unit-testable against real code (CLAWD-1019).
+        await self._send_post_connect_lifecycle_notifications()
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -14479,6 +14456,47 @@ class GatewayRunner:
                 exit_code_path.unlink(missing_ok=True)
 
         return True
+
+    async def _send_post_connect_lifecycle_notifications(self) -> None:
+        """Fire post-connect lifecycle notifications once adapters are up.
+
+        Two mutually-exclusive paths, either of which clears the external-restart
+        recovery marker so "gateway online" fires at most once:
+          - in-band ``/restart``: notify the requester + home channels.
+          - external restart (systemd / SIGTERM / ``--replace``) that interrupted
+            in-flight work: announce "gateway online" via the recovery marker,
+            which the ``/restart`` path never writes (CLAWD-1019).
+
+        Extracted from ``start()`` so the if/elif wiring is unit-testable against
+        real code rather than a replica.
+        """
+        # Notify the chat that initiated /restart that the gateway is back.
+        restart_notification_pending = _restart_notification_pending()
+        delivered_restart_target = await self._send_restart_notification()
+
+        # Broadcast a lightweight "gateway is back" message to configured home
+        # channels when resuming from /restart. If the /restart requester already
+        # received a direct completion notice in the same chat, skip the generic
+        # broadcast there to avoid duplicates while still allowing a home-channel
+        # fallback when the direct send fails.
+        if restart_notification_pending or delivered_restart_target is not None:
+            skip_home_targets = (
+                {delivered_restart_target} if delivered_restart_target else None
+            )
+            await self._send_home_channel_startup_notifications(
+                skip_targets=skip_home_targets,
+            )
+            # A /restart supersedes any same-cycle external-recovery marker;
+            # drop it so it can't double-fire on the next boot. (CLAWD-1019)
+            _clear_recovery_marker()
+        elif _recovery_notification_pending():
+            # External (systemd / SIGTERM / `--replace`) restart that interrupted
+            # in-flight work leaves no .restart_notify.json marker, so the branch
+            # above is skipped and the recovery would otherwise be silent.
+            # Announce "gateway online" to the home channel, then clear the
+            # marker so it fires exactly once per restart. (CLAWD-1019)
+            await self._send_home_channel_startup_notifications()
+            _clear_recovery_marker()
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""

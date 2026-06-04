@@ -92,7 +92,7 @@ Editing files in `~/dev/hermes-agent-fork/` does **not** change the running flee
 
 Ten user-level systemd services run, one per profile, all confirmed **active/running**:
 
-`clients`, `engineer`, `finance`, `growth`, `legal`, `librarian`, `marketing`, `minerva`, `research`, `strategy`.
+`clients`, `engineer`, `finance`, `legal`, `librarian`, `marketing`, `minerva`, `research`, `sales`, `strategy` (the former `growth` profile was converted to `sales`).
 
 Each profile is a fully isolated instance with its own `HERMES_HOME` at `~/.hermes/profiles/<id>/` (config.yaml, .env, auth.json, sessions, skills, plugins, logs, state.db). The profile mechanism is `_apply_profile_override()` in `hermes_cli/main.py` setting `HERMES_HOME` before any module imports — see `AGENTS.md` → **Profiles** for the profile-safe-code rules.
 

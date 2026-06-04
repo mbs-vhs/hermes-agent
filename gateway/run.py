@@ -749,19 +749,49 @@ def _recovery_notification_pending() -> bool:
     return (_hermes_home / _GATEWAY_RECOVERY_MARKER).exists()
 
 
-def _write_recovery_marker(interrupted: int) -> None:
+def _write_recovery_marker(
+    interrupted: int,
+    targets: Optional[list] = None,
+    shutdown_ts: Optional[float] = None,
+) -> None:
     """Persist the recovery marker so the next boot announces "gateway online".
+
+    ``targets`` records the home-channel shutdown DMs actually sent
+    (platform/chat_id/thread_id/message_id dicts) so the next boot can EDIT
+    each down-DM in place into the online notice — an edit produces no
+    push notification, so recovery flips the chat list to "online" without a
+    second alert (CLAWD-1144). ``shutdown_ts`` (epoch seconds) lets the boot
+    include the downtime duration in the online notice.
 
     Best-effort: a failure here must never block shutdown.
     """
     try:
+        payload: dict = {"interrupted": int(interrupted)}
+        if targets:
+            payload["targets"] = targets
+        if shutdown_ts is not None:
+            payload["ts"] = float(shutdown_ts)
         atomic_json_write(
             _hermes_home / _GATEWAY_RECOVERY_MARKER,
-            {"interrupted": int(interrupted)},
+            payload,
             indent=None,
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("recovery-notify marker write failed: %s", exc)
+
+
+def _read_recovery_marker() -> Optional[dict]:
+    """Read the recovery marker, or None when absent/unreadable.
+
+    Tolerates the pre-CLAWD-1144 shape ({"interrupted": N} with no targets/ts)
+    — callers fall back to a fresh send when ``targets`` is missing.
+    """
+    try:
+        raw = (_hermes_home / _GATEWAY_RECOVERY_MARKER).read_text()
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def _clear_recovery_marker() -> None:
@@ -3432,12 +3462,18 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
-    async def _notify_active_sessions_of_shutdown(self) -> None:
+    async def _notify_active_sessions_of_shutdown(self) -> list:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the very start of stop() — adapters are still connected so
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
+
+        Returns the home-channel targets the down-DM was actually delivered to
+        (dicts of platform/chat_id/thread_id/message_id). The shutdown sequence
+        persists them in the recovery marker so the next boot can EDIT each
+        down-DM in place into the online notice (CLAWD-1144 — symmetric
+        announce-up-iff-announced-down, with zero extra notifications).
         """
         active = self._snapshot_running_agents()
 
@@ -3533,7 +3569,19 @@ class GatewayRunner:
         # elsewhere), which would otherwise trigger
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
+        home_targets: list = []
         for platform, adapter in list(self.adapters.items()):
+            if platform == Platform.EMAIL:
+                # CLAWD-1144 (ratified 2026-06-04): gateway lifecycle notices
+                # are chat-platform-only. Email is the independent BACKSTOP
+                # channel (supervisor escalation when the operator is
+                # unreachable or the host is dark), not a per-event copy —
+                # 10 profile gateways emailing every fleet bounce drowned it.
+                # Active-session interruption notices (the loop above) still
+                # reach email conversations; only the home-channel lifecycle
+                # broadcast skips it.
+                continue
+
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
@@ -3566,6 +3614,20 @@ class GatewayRunner:
                     continue
 
                 notified.add(dedup_key)
+                # Record the delivered down-DM so the next boot can edit it in
+                # place into the online notice (CLAWD-1144). message_id may be
+                # None on platforms that don't return one — the boot falls back
+                # to a fresh send for those targets.
+                home_targets.append({
+                    "platform": platform.value,
+                    "chat_id": str(home.chat_id),
+                    "thread_id": str(home.thread_id) if home.thread_id else None,
+                    "message_id": (
+                        str(result.message_id)
+                        if result is not None and getattr(result, "message_id", None)
+                        else None
+                    ),
+                })
                 logger.info(
                     "Sent shutdown notification to home channel %s:%s",
                     platform.value,
@@ -3578,6 +3640,8 @@ class GatewayRunner:
                     home.chat_id,
                     e,
                 )
+
+        return home_targets
 
     def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
         for agent in active_agents.values():
@@ -5977,7 +6041,9 @@ class GatewayRunner:
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
-            await self._notify_active_sessions_of_shutdown()
+            # The returned home-channel targets feed the recovery marker below
+            # so the next boot can edit the down-DMs in place (CLAWD-1144).
+            _home_targets = await self._notify_active_sessions_of_shutdown()
             logger.info(
                 "Shutdown phase: notify_active_sessions done at +%.2fs",
                 _phase_elapsed(),
@@ -6002,13 +6068,21 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
-            # If this (external) shutdown had active sessions in flight, leave a
-            # durable marker so the NEXT boot announces "gateway online" to the
-            # home channel. The in-band /restart path writes its own
-            # .restart_notify.json and emits its own notification, so skip the
-            # marker there to avoid a double message. (CLAWD-1019)
-            if _pre_drain_keys and not self._restart_requested:
-                _write_recovery_marker(len(_pre_drain_keys))
+            # Leave a durable marker whenever this (external) shutdown ANNOUNCED
+            # itself — home-channel down-DMs sent OR sessions in flight — so the
+            # NEXT boot announces "gateway online" by editing those down-DMs in
+            # place (CLAWD-1144; formerly in-flight-only, which made idle
+            # restarts loud going down and silent coming back — the gap observed
+            # on the 06-02/06-03 fleet bounces). The in-band /restart path
+            # writes its own .restart_notify.json and emits its own
+            # notification, so skip the marker there to avoid a double message.
+            # (CLAWD-1019)
+            if (_home_targets or _pre_drain_keys) and not self._restart_requested:
+                _write_recovery_marker(
+                    len(_pre_drain_keys),
+                    targets=_home_targets,
+                    shutdown_ts=time.time(),
+                )
 
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -14529,12 +14603,18 @@ class GatewayRunner:
             # drop it so it can't double-fire on the next boot. (CLAWD-1019)
             _clear_recovery_marker()
         elif _recovery_notification_pending():
-            # External (systemd / SIGTERM / `--replace`) restart that interrupted
-            # in-flight work leaves no .restart_notify.json marker, so the branch
-            # above is skipped and the recovery would otherwise be silent.
-            # Announce "gateway online" to the home channel, then clear the
+            # External (systemd / SIGTERM / `--replace`) restart leaves no
+            # .restart_notify.json marker, so the branch above is skipped and
+            # the recovery would otherwise be silent. Announce "gateway online"
+            # — preferring an IN-PLACE EDIT of the recorded down-DMs (an edit
+            # produces no push notification, so the chat list flips to "online"
+            # without a second alert — CLAWD-1144) with a fresh silent send as
+            # fallback for targets that couldn't be edited — then clear the
             # marker so it fires exactly once per restart. (CLAWD-1019)
-            await self._send_home_channel_startup_notifications()
+            edited = await self._edit_recovery_notifications()
+            await self._send_home_channel_startup_notifications(
+                skip_targets=edited or None,
+            )
             _clear_recovery_marker()
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
@@ -14600,6 +14680,93 @@ class GatewayRunner:
         finally:
             notify_path.unlink(missing_ok=True)
 
+    async def _edit_recovery_notifications(self) -> set[tuple[str, str, Optional[str]]]:
+        """Edit the recorded shutdown down-DMs in place into the online notice.
+
+        Reads the recovery marker's ``targets`` (written by the shutdown path
+        with the message ids of the home-channel "shutting down" DMs) and edits
+        each into the "gateway online" message. An edit produces NO push
+        notification, so recovery flips the chat list to "online" without a
+        second alert — one silent tray entry per restart, total (CLAWD-1144).
+
+        Returns the successfully edited targets in the same key shape as the
+        startup-notification dedup set so the caller can skip fresh sends for
+        them. Targets without a message_id, failed edits, and pre-CLAWD-1144
+        markers (no ``targets``) are simply not returned — the caller's
+        fallback fresh send covers those. Best-effort throughout.
+        """
+        edited: set[tuple[str, str, Optional[str]]] = set()
+        marker = _read_recovery_marker()
+        if not marker:
+            return edited
+        targets = marker.get("targets")
+        if not isinstance(targets, list) or not targets:
+            return edited
+
+        message = "♻️ Gateway online — Hermes is back and ready."
+        ts = marker.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            down_secs = max(0, int(time.time() - ts))
+            message = (
+                f"♻️ Gateway online — Hermes is back and ready (was down ~{down_secs}s)."
+            )
+
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            platform_str = target.get("platform")
+            chat_id = target.get("chat_id")
+            message_id = target.get("message_id")
+            thread_id = target.get("thread_id")
+            if not platform_str or not chat_id or not message_id:
+                continue
+            try:
+                platform = Platform(platform_str)
+            except ValueError:
+                continue
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                continue
+
+            platform_cfg = self.config.platforms.get(platform)
+            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                logger.info(
+                    "Recovery edit suppressed: %s has gateway_restart_notification=false",
+                    platform.value,
+                )
+                continue
+
+            try:
+                result = await adapter.edit_message(
+                    str(chat_id), str(message_id), message, finalize=True,
+                )
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.debug(
+                        "Recovery edit failed for %s:%s (msg %s): %s — falling back to send",
+                        platform.value,
+                        chat_id,
+                        message_id,
+                        getattr(result, "error", "edit returned success=False"),
+                    )
+                    continue
+                edited.add(
+                    (platform.value, str(chat_id), str(thread_id) if thread_id else None)
+                )
+                logger.info(
+                    "Edited shutdown notice into online notice for %s:%s",
+                    platform.value,
+                    chat_id,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Recovery edit failed for %s:%s (msg %s): %s — falling back to send",
+                    platform_str,
+                    chat_id,
+                    message_id,
+                    exc,
+                )
+        return edited
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -14609,13 +14776,22 @@ class GatewayRunner:
 
         The notification is best-effort and sent once per connected platform
         home channel. ``skip_targets`` lets startup avoid duplicate messages
-        when a more specific restart notification is queued for the same chat.
+        when a more specific restart notification is queued for the same chat
+        or when the recovery path already edited the down-DM in place
+        (CLAWD-1144).
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
+            if platform == Platform.EMAIL:
+                # CLAWD-1144 (ratified 2026-06-04): gateway lifecycle notices
+                # are chat-platform-only — email is the supervisor's backstop
+                # channel, not a per-event copy. Mirrors the shutdown-side skip
+                # in _notify_active_sessions_of_shutdown.
+                continue
+
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue

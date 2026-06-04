@@ -92,11 +92,11 @@ Memory backends are pluggable via the `MemoryProvider` ABC (`agent/memory_provid
 
 The **mnemosyne** plugin (ADR-058) follows exactly that pattern — it lives as **runtime state under each profile's `plugins/` directory**, not in this repo's tree:
 
-- Present at `~/.hermes/profiles/<id>/plugins/mnemosyne/` for **research, finance, legal, marketing** (verified on disk: `__init__.py`, `adapter.py`, `clawd_client.py`, `dedupe.py`, `plugin.yaml`).
-- **Active** only where `memory.provider: mnemosyne` is set in that profile's `config.yaml` — verified **`research`** (the live canary). `minerva` does **not** have it set (matches the staged-rollout state: research canary live; finance/legal/marketing staged).
+- Present at `~/.hermes/profiles/<id>/plugins/mnemosyne/` for **all 10 profiles** (`__init__.py`, `adapter.py`, `clawd_client.py`, `dedupe.py`, `plugin.yaml`) — ADR-058 rollout complete 2026-06-02.
+- **Active** in **all 10 profiles** — `memory.provider: mnemosyne` is set in every profile's `config.yaml`; recall **and** auto-capture (the full 2-way bridge) are live fleet-wide (verified 2026-06-02).
 - Design (per `plugin.yaml` + `__init__.py` docstring): **recall** via subprocess CLI to the mnemosyne venv (`mnemosyne librarian compose` → `compose_context`); **memorialize** via `POST /admin/memory-items` to clawd with `source="hermes"` + content-hash dedupe. No `pip_dependencies` — the gateway venv stays decoupled from mnemosyne's deps. v1 is transparent (`get_tool_schemas() == []`), load-bearing on `prefetch` + `on_memory_write`.
 
-**Do not "fix" the ADR-058 rollout before its 2026-06-01 OAuth-cap gate** — the staged state (canary live, others staged) is intentional, not broken.
+**The ADR-058 rollout is complete** (2026-06-02, all 10 profiles live) — there is no staged remainder to "finish".
 
 ### The ACP adapter (don't break it)
 
@@ -152,7 +152,7 @@ Stop and ask if:
 
 - **(a) Deploy / fleet mutation.** The change would deploy code to the **runtime checkout** (`~/.hermes/hermes-agent/`) or **restart any `ai.hermes.gateway-<id>.service`**. Editing this repo is in-lane; touching the running fleet is operator-coordinated (10 live gateways, blast radius = whole mesh).
 - **(b) Shared-OAuth / credential pool.** The change would modify `~/.hermes/auth.json`, the credential pool, or any profile's `auth.json` / `.env`. This is the fleet-wide SPOF and is gated behind the 2026-06-01 OAuth-cap timeline. State the action and ask inline.
-- **(c) Live profile config.** The change would hand-edit a live profile's `config.yaml` or runtime state under `~/.hermes/profiles/<id>/` (including the mnemosyne plugin install or `memory.provider` flips). The ADR-058 staged rollout (research canary live; finance/legal/marketing staged) is intentional — do not flip provider state to "fix" it.
+- **(c) Live profile config.** The change would hand-edit a live profile's `config.yaml` or runtime state under `~/.hermes/profiles/<id>/` (including the mnemosyne plugin install or `memory.provider` flips). The ADR-058 rollout is complete (2026-06-02, all 10 profiles live); provider state remains operator-gated — do not flip it from a doc-driven session.
 - **(d) Plugin touches core.** The change would put plugin-specific logic into a core file (`run_agent.py`, `cli.py`, `gateway/run.py`, `hermes_cli/main.py`) — violates the Teknium rule. Expand the generic plugin surface instead.
 - **(e) ACP adapter contract.** The change would alter the ACP server's protocol surface (`acp_adapter/server.py`, `session.py`, `tools.py`) in a way that could break editor integrations. Run the ACP test suites and flag the blast radius.
 - **(f) Cache-breaking mid-conversation.** The change would alter past context, change toolsets, or rebuild system prompts mid-conversation (breaks prompt caching). See `AGENTS.md` → **Prompt Caching Must Not Break**.

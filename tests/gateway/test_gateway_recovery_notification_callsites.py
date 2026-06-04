@@ -319,8 +319,8 @@ async def test_stop_restart_requested_does_not_write_recovery_marker(
 async def test_stop_external_shutdown_no_inflight_work_writes_no_marker(
     tmp_path, monkeypatch
 ):
-    """External shutdown with NO running agents interrupts nothing → no marker
-    (a clean idle bounce should stay silent on recovery)."""
+    """External shutdown with NO running agents AND no home channel interrupts
+    nothing and announces nothing → no marker (a truly silent idle bounce)."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     runner, adapter = make_restart_runner()
@@ -329,6 +329,87 @@ async def test_stop_external_shutdown_no_inflight_work_writes_no_marker(
 
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
         await runner.stop()
+
+    assert not (tmp_path / gateway_run._GATEWAY_RECOVERY_MARKER).exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CLAWD-1144: shutdown-side write now records home-channel targets + ts, and
+# fires for IDLE shutdowns that ANNOUNCED to a home channel (formerly
+# in-flight-only). /restart still writes no marker.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stop_records_home_targets_and_ts_in_marker(tmp_path, monkeypatch):
+    """An external shutdown that DMs the home channel records that target (with
+    message_id) and a ts into the marker so the next boot can edit it in place."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    _configure_home(runner, chat_id="home-42")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="down-msg"))
+    runner._restart_drain_timeout = 0.0
+    runner._running_agents = {"session-a": MagicMock()}
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    marker = tmp_path / gateway_run._GATEWAY_RECOVERY_MARKER
+    assert marker.exists()
+    data = json.loads(marker.read_text())
+    assert data["targets"] == [
+        {
+            "platform": "telegram",
+            "chat_id": "home-42",
+            "thread_id": None,
+            "message_id": "down-msg",
+        }
+    ]
+    assert isinstance(data["ts"], (int, float)) and data["ts"] > 0
+
+
+@pytest.mark.asyncio
+async def test_stop_idle_but_announced_to_home_writes_marker(tmp_path, monkeypatch):
+    """CLAWD-1144 change: an IDLE shutdown (no in-flight agents) that still
+    announced to the home channel now leaves a marker — previously the marker
+    was in-flight-only, making idle restarts loud down / silent up."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    _configure_home(runner, chat_id="home-42")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="down-msg"))
+    runner._running_agents = {}  # IDLE — nothing in flight
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    marker = tmp_path / gateway_run._GATEWAY_RECOVERY_MARKER
+    assert marker.exists(), "idle shutdown that announced to home must leave a marker"
+    data = json.loads(marker.read_text())
+    assert data["interrupted"] == 0  # no in-flight agents
+    assert data["targets"][0]["chat_id"] == "home-42"
+
+
+@pytest.mark.asyncio
+async def test_stop_restart_requested_writes_no_marker_even_with_home(
+    tmp_path, monkeypatch
+):
+    """/restart (restart=True) writes its own .restart_notify.json and must NOT
+    leave the recovery marker, even when a home channel was announced to."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    _configure_home(runner, chat_id="home-42")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="down-msg"))
+    runner._restart_drain_timeout = 0.0
+    runner._running_agents = {"session-a": MagicMock()}
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop(restart=True)
 
     assert not (tmp_path / gateway_run._GATEWAY_RECOVERY_MARKER).exists()
 

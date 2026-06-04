@@ -55,3 +55,48 @@ def test_write_recovery_marker_never_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "atomic_json_write", _boom)
     gateway_run._write_recovery_marker(2)  # must not raise
     assert gateway_run._recovery_notification_pending() is False
+
+
+# ── CLAWD-1144: extended marker (targets + ts) + _read_recovery_marker ──────
+
+
+def test_read_recovery_marker_absent_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    assert gateway_run._read_recovery_marker() is None
+
+
+def test_read_recovery_marker_round_trips_legacy_shape(tmp_path, monkeypatch):
+    """A pre-CLAWD-1144 marker ({"interrupted": N}) reads back as a dict with no
+    targets/ts so callers fall back to a fresh send."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    gateway_run._write_recovery_marker(4)
+
+    marker = gateway_run._read_recovery_marker()
+    assert marker == {"interrupted": 4}
+    assert "targets" not in marker
+    assert "ts" not in marker
+
+
+def test_read_recovery_marker_round_trips_targets_and_ts(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    targets = [
+        {"platform": "telegram", "chat_id": "home-1", "thread_id": None, "message_id": "m1"}
+    ]
+    gateway_run._write_recovery_marker(2, targets=targets, shutdown_ts=1717000000.0)
+
+    marker = gateway_run._read_recovery_marker()
+    assert marker["interrupted"] == 2
+    assert marker["targets"] == targets
+    assert marker["ts"] == 1717000000.0
+
+
+def test_read_recovery_marker_corrupt_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / gateway_run._GATEWAY_RECOVERY_MARKER).write_text("}{ not json")
+    assert gateway_run._read_recovery_marker() is None
+
+
+def test_read_recovery_marker_non_dict_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / gateway_run._GATEWAY_RECOVERY_MARKER).write_text('"just-a-string"')
+    assert gateway_run._read_recovery_marker() is None

@@ -338,17 +338,101 @@ class TestPlatformReconnectWatcher:
         assert info["paused"] is True
         assert info["attempts"] == 10
         assert "pause_reason" in info
+        # Half-open: paused with a FINITE probe time, not float("inf").
+        assert info["next_retry"] != float("inf")
+        assert info["next_retry"] > time.monotonic()
 
     @pytest.mark.asyncio
-    async def test_reconnect_skips_paused_platforms(self):
-        """A paused platform should not be retried by the watcher tick."""
+    async def test_paused_platform_reconnects_on_halfopen_probe(self):
+        """Half-open circuit: a PAUSED platform whose probe interval has elapsed
+        gets probed and, on success, recovers — no manual /platform resume.
+        (Pre-fix this was impossible: paused platforms were skipped forever.)
+        """
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": platform_config,
+            "attempts": 10,
+            "paused": True,
+            "pause_reason": "WAN blip",
+            "next_retry": time.monotonic() - 1,  # probe interval elapsed
+        }
+
+        succeed_adapter = StubAdapter(succeed=True)
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=succeed_adapter):
+            with patch("gateway.run.build_channel_directory", create=True):
+                runner._running = True
+                call_count = 0
+
+                async def fake_sleep(n):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count > 1:
+                        runner._running = False
+                    await real_sleep(0)
+
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    await runner._platform_reconnect_watcher()
+
+        # Recovered without intervention.
+        assert Platform.TELEGRAM not in runner._failed_platforms
+        assert Platform.TELEGRAM in runner.adapters
+
+    @pytest.mark.asyncio
+    async def test_paused_platform_stays_paused_when_halfopen_probe_fails(self):
+        """A failed half-open probe keeps the platform paused and re-arms a
+        FINITE next_retry — never hammered, never dropped, never unpaused."""
         runner = _make_runner()
 
         platform_config = PlatformConfig(enabled=True, token="test")
         runner._failed_platforms[Platform.TELEGRAM] = {
             "config": platform_config,
             "attempts": 10,
-            "next_retry": time.monotonic() - 1,  # would normally retry now
+            "paused": True,
+            "pause_reason": "WAN blip",
+            "next_retry": time.monotonic() - 1,
+        }
+
+        fail_adapter = StubAdapter(
+            succeed=False, fatal_error="still down", fatal_retryable=True
+        )
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=fail_adapter):
+            runner._running = True
+            call_count = 0
+
+            async def fake_sleep(n):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:
+                    runner._running = False
+                await real_sleep(0)
+
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                await runner._platform_reconnect_watcher()
+
+        assert Platform.TELEGRAM in runner._failed_platforms
+        info = runner._failed_platforms[Platform.TELEGRAM]
+        assert info["paused"] is True  # still paused
+        assert info["next_retry"] != float("inf")  # finite, re-armed
+        assert info["next_retry"] > time.monotonic()  # into the future
+
+    @pytest.mark.asyncio
+    async def test_reconnect_skips_paused_platform_before_probe_interval(self):
+        """A paused platform is NOT probed before its half-open interval elapses
+        (not hammered between probes — next_retry in the future is skipped)."""
+        runner = _make_runner()
+
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": platform_config,
+            "attempts": 10,
+            "next_retry": time.monotonic() + 9999,  # probe interval not elapsed
             "paused": True,
             "pause_reason": "paused via /platform pause",
         }
@@ -578,11 +662,14 @@ class TestPauseResume:
             "attempts": 3,
             "next_retry": time.monotonic() + 30,
         }
+        before = time.monotonic()
         runner._pause_failed_platform(Platform.TELEGRAM, reason="manual")
         info = runner._failed_platforms[Platform.TELEGRAM]
         assert info["paused"] is True
         assert info["pause_reason"] == "manual"
-        assert info["next_retry"] == float("inf")
+        # Half-open: a FINITE periodic probe is scheduled, not float("inf").
+        assert info["next_retry"] != float("inf")
+        assert info["next_retry"] > before
 
     def test_pause_is_idempotent(self):
         runner = _make_runner()

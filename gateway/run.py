@@ -1353,6 +1353,15 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
+# Half-open circuit breaker: once a platform is paused (after
+# _PAUSE_AFTER_FAILURES consecutive reconnect failures), the watcher still
+# probes it this often instead of giving up forever (next_retry = inf). A
+# transient outage (e.g. a WAN blip) then self-heals without a manual
+# `/platform resume` or gateway restart, while a genuinely-broken platform is
+# probed gently (once per interval, not every 30s) rather than hammered.
+# Overridable via env for tests/tuning.
+_PAUSE_HALFOPEN_PROBE_SEC = int(os.environ.get("HERMES_PAUSE_HALFOPEN_PROBE_SEC", "600"))
+
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
         _INTERRUPT_REASON_STOP.lower(),
@@ -2834,9 +2843,10 @@ class GatewayRunner:
             return
         info["paused"] = True
         info["pause_reason"] = reason or "auto-paused after repeated failures"
-        # Push next_retry far enough out that even if "paused" is missed
-        # by a stale code path, the watcher won't fire on it.
-        info["next_retry"] = float("inf")
+        # Half-open circuit: schedule a slow periodic probe instead of giving up
+        # forever (was float("inf")). A transient cause (WAN blip) self-heals on
+        # the next probe; a real fault just gets re-armed, never hammered.
+        info["next_retry"] = time.monotonic() + _PAUSE_HALFOPEN_PROBE_SEC
         try:
             self._update_platform_runtime_status(
                 platform.value,
@@ -2847,11 +2857,11 @@ class GatewayRunner:
         except Exception:
             pass
         logger.warning(
-            "%s paused after %d consecutive failures (%s) — "
-            "fix the underlying issue then run `/platform resume %s` "
-            "to retry, or `hermes gateway restart` to restart the gateway.",
+            "%s paused after %d consecutive failures (%s) — backing off to a "
+            "half-open probe every %ds (auto-recovers when the cause clears); "
+            "force an immediate retry with `/platform resume %s`.",
             platform.value, info.get("attempts", 0),
-            info["pause_reason"], platform.value,
+            info["pause_reason"], _PAUSE_HALFOPEN_PROBE_SEC, platform.value,
         )
 
     def _resume_paused_platform(self, platform) -> bool:
@@ -5845,10 +5855,14 @@ class GatewayRunner:
         Uses exponential backoff: 30s → 60s → 120s → 240s → 300s (cap).
         Retryable failures keep retrying at the backoff cap indefinitely
         — but if a platform fails ``_PAUSE_AFTER_FAILURES`` times in a row
-        without ever succeeding, it is *paused*: kept in the retry queue
-        but no longer hammered.  The user surfaces it with ``/platform list``
-        and resumes it with ``/platform resume <name>``.  Non-retryable
-        failures (bad auth, etc.) still drop out of the queue immediately.
+        without ever succeeding, it is *paused* (circuit breaker open).
+        A paused platform is no longer hammered, but the breaker is
+        **half-open**: the watcher still probes it once every
+        ``_PAUSE_HALFOPEN_PROBE_SEC`` so a transient outage (e.g. a WAN blip)
+        self-heals without a manual ``/platform resume`` or gateway restart;
+        a genuinely-broken platform is just re-armed, never hammered. The user
+        can still force an immediate retry with ``/platform resume <name>``.
+        Non-retryable failures (bad auth, etc.) still drop out immediately.
         """
         _BACKOFF_CAP = 300  # 5 minutes max between retries
         _PAUSE_AFTER_FAILURES = 10  # circuit-breaker threshold
@@ -5868,10 +5882,9 @@ class GatewayRunner:
                 if not self._running:
                     return
                 info = self._failed_platforms[platform]
-                # Skip paused platforms entirely — they need explicit
-                # /platform resume to come back.
-                if info.get("paused"):
-                    continue
+                # Half-open: paused platforms aren't hammered, but once their slow
+                # probe interval (next_retry) elapses they get ONE probe attempt so
+                # a transient outage self-heals without a manual /platform resume.
                 if now < info["next_retry"]:
                     continue  # not time yet
 
@@ -5931,6 +5944,14 @@ class GatewayRunner:
                             platform.value, adapter.fatal_error_message,
                         )
                         del self._failed_platforms[platform]
+                    elif info.get("paused"):
+                        # Half-open probe of a paused platform failed — keep it
+                        # paused (status unchanged) and slow-probe again later.
+                        info["next_retry"] = time.monotonic() + _PAUSE_HALFOPEN_PROBE_SEC
+                        logger.info(
+                            "Half-open probe of paused %s failed; next probe in %ds",
+                            platform.value, _PAUSE_HALFOPEN_PROBE_SEC,
+                        )
                     else:
                         self._update_platform_runtime_status(
                             platform.value,
@@ -5954,21 +5975,30 @@ class GatewayRunner:
                                 ),
                             )
                 except Exception as e:
-                    self._update_platform_runtime_status(
-                        platform.value,
-                        platform_state="retrying",
-                        error_code=None,
-                        error_message=str(e),
-                    )
-                    backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
-                    info["attempts"] = attempt
-                    info["next_retry"] = time.monotonic() + backoff
-                    logger.warning(
-                        "Reconnect %s error: %s, next retry in %ds",
-                        platform.value, e, backoff,
-                    )
-                    if attempt >= _PAUSE_AFTER_FAILURES:
-                        self._pause_failed_platform(platform, reason=str(e))
+                    if info.get("paused"):
+                        # Half-open probe of a paused platform errored — stay
+                        # paused and slow-probe again later.
+                        info["next_retry"] = time.monotonic() + _PAUSE_HALFOPEN_PROBE_SEC
+                        logger.warning(
+                            "Half-open probe of paused %s errored: %s; next probe in %ds",
+                            platform.value, e, _PAUSE_HALFOPEN_PROBE_SEC,
+                        )
+                    else:
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="retrying",
+                            error_code=None,
+                            error_message=str(e),
+                        )
+                        backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
+                        info["attempts"] = attempt
+                        info["next_retry"] = time.monotonic() + backoff
+                        logger.warning(
+                            "Reconnect %s error: %s, next retry in %ds",
+                            platform.value, e, backoff,
+                        )
+                        if attempt >= _PAUSE_AFTER_FAILURES:
+                            self._pause_failed_platform(platform, reason=str(e))
 
             # Check every 10 seconds for platforms that need reconnection
             for _ in range(10):

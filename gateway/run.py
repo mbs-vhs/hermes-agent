@@ -6392,10 +6392,10 @@ class GatewayRunner:
                 except Exception:
                     pass
             _notify_mode = _notify_mode or "important"
-            if _notify_mode not in {"all", "important"}:
+            if _notify_mode not in {"all", "important", "silent"}:
                 logger.warning(
                     "Unknown telegram notifications mode '%s', "
-                    "defaulting to 'important' (valid: all, important)",
+                    "defaulting to 'important' (valid: all, important, silent)",
                     _notify_mode,
                 )
                 _notify_mode = "important"

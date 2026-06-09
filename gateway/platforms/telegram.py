@@ -486,6 +486,12 @@ class TelegramAdapter(BasePlatformAdapter):
         #               push notifications too noisy.
         # "all"       — every message triggers a push notification (legacy
         #               behavior; opt-in via display.platforms.telegram.notifications).
+        # "silent"    — NO message ever triggers a push (always disable_notification),
+        #               overriding even final responses/approvals and an explicit
+        #               metadata["notify"]=True. For non-primary mesh agents that
+        #               should deliver quietly while one designated agent
+        #               (Quasimodo/engineer) carries the loud alerts. Messages still
+        #               arrive in the chat; they just never ping.
         self._notifications_mode: str = "important"
         # send_or_update_status() bookkeeping: {(chat_id, status_key) -> bot message_id}
         # Tracks status bubbles owned by this adapter so subsequent calls with the
@@ -495,13 +501,17 @@ class TelegramAdapter(BasePlatformAdapter):
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Return disable_notification kwargs when the adapter is in silent mode.
+        """Return disable_notification kwargs based on the adapter's notification mode.
 
-        In "important" mode, all message sends are silently delivered
-        (disable_notification=True) unless the caller explicitly requests a
-        notification by setting ``metadata["notify"] = True``.
+        "silent"    — always silent (disable_notification=True), overriding even
+                      an explicit ``metadata["notify"] = True``.
+        "important" — silent unless the caller sets ``metadata["notify"] = True``.
+        "all"       — never silent (every send pushes).
         """
-        if getattr(self, "_notifications_mode", "important") != "important":
+        mode = getattr(self, "_notifications_mode", "important")
+        if mode == "silent":
+            return {"disable_notification": True}
+        if mode != "important":  # "all"
             return {}
         if (metadata or {}).get("notify"):
             return {}

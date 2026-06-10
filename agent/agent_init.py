@@ -271,6 +271,7 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    agent._shared_conversation_id = ""  # Stable (person, agent) key for cross-surface continuity (CLAWD-1542); derived below
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1138,6 +1139,13 @@ def init_agent(
                         _profile = get_active_profile_name()
                         _init_kwargs["agent_identity"] = _profile
                         _init_kwargs["agent_workspace"] = "hermes"
+                        # Derive the stable (person, agent) conversation_id for
+                        # cross-surface continuity (CLAWD-1542). Empty user_id
+                        # (e.g. CLI, no gateway user) => "" => no-op upstream.
+                        agent._shared_conversation_id = (
+                            f"{_profile}:{agent._user_id}"
+                            if (_profile and agent._user_id) else ""
+                        )
                     except Exception:
                         pass
                     agent._memory_manager.initialize_all(**_init_kwargs)

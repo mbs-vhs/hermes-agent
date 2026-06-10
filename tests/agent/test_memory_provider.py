@@ -52,7 +52,7 @@ class FakeMemoryProvider(MemoryProvider):
     def queue_prefetch(self, query, *, session_id=""):
         self.queued_prefetches.append(query)
 
-    def sync_turn(self, user_content, assistant_content, *, session_id=""):
+    def sync_turn(self, user_content, assistant_content, *, session_id="", conversation_id=""):
         self.synced_turns.append((user_content, assistant_content))
 
     def get_tool_schemas(self):

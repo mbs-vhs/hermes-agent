@@ -624,7 +624,7 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     # ── Turn sync ──────────────────────────────────────────────────────────
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", conversation_id: str = "") -> None:
         """Queue turn for async ingest. Returns immediately."""
         if not self._queue or not user_content:
             return

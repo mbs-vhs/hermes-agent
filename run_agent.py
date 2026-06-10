@@ -2175,6 +2175,7 @@ class AIAgent:
             self._memory_manager.sync_all(
                 original_user_message, final_response,
                 session_id=self.session_id or "",
+                conversation_id=getattr(self, "_shared_conversation_id", "") or "",
             )
             self._memory_manager.queue_prefetch_all(
                 original_user_message,

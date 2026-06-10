@@ -38,7 +38,7 @@ class _RecordingProvider(MemoryProvider):
     def get_tool_schemas(self):
         return []
 
-    def sync_turn(self, user_content, assistant_content, *, session_id=""):
+    def sync_turn(self, user_content, assistant_content, *, session_id="", conversation_id=""):
         self.sync_calls.append(
             {"user": user_content, "asst": assistant_content, "session_id": session_id}
         )

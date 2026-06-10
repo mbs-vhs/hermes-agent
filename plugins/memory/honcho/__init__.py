@@ -1117,7 +1117,7 @@ class HonchoMemoryProvider(MemoryProvider):
             ),
         }
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", conversation_id: str = "") -> None:
         """Record the conversation turn in Honcho (non-blocking).
 
         Messages exceeding the Honcho API limit (default 25k chars) are

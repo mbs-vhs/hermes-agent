@@ -111,11 +111,15 @@ class MemoryProvider(ABC):
         that do background prefetching should override this.
         """
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", conversation_id: str = "") -> None:
         """Persist a completed turn to the backend.
 
         Called after each turn. Should be non-blocking — queue for
         background processing if the backend has latency.
+
+        conversation_id is the stable (person, agent) key for cross-surface
+        continuity (default "" = none). Providers that don't consume it can
+        ignore it.
         """
 
     @abstractmethod

@@ -1413,7 +1413,7 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["tags"] = merged_tags
         return kwargs
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", conversation_id: str = "") -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
         The actual aretain_batch runs on a single long-lived writer thread

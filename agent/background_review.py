@@ -314,6 +314,7 @@ def build_memory_write_metadata(
         ),
         "session_id": agent.session_id or "",
         "parent_session_id": agent._parent_session_id or "",
+        "conversation_id": getattr(agent, "_shared_conversation_id", "") or "",
         "platform": agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
         "tool_name": "memory",
     }

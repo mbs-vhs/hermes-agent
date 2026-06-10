@@ -493,6 +493,12 @@ class TelegramAdapter(BasePlatformAdapter):
         #               (Quasimodo/engineer) carries the loud alerts. Messages still
         #               arrive in the chat; they just never ping.
         self._notifications_mode: str = "important"
+        # CLAWD-1376: when True, gateway online/offline lifecycle transitions are
+        # delivered badge-free by editing ONE pinned status message per home
+        # channel in place (created+pinned once via disable_notification=True),
+        # instead of sending a fresh "shutting down" DM that the next boot edits
+        # (the CLAWD-1144 path). Off by default; rollout is operator-coordinated.
+        self._lifecycle_pinned: bool = False
         # send_or_update_status() bookkeeping: {(chat_id, status_key) -> bot message_id}
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
@@ -503,11 +509,20 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Return disable_notification kwargs based on the adapter's notification mode.
 
+        An explicit ``metadata["notify"] = False`` force-silences the send in
+        EVERY mode (including "all") — callers that must never push a badge
+        (e.g. the badge-free pinned lifecycle status, CLAWD-1376) set it so the
+        send cannot leak a notification under "all".
+
         "silent"    — always silent (disable_notification=True), overriding even
                       an explicit ``metadata["notify"] = True``.
         "important" — silent unless the caller sets ``metadata["notify"] = True``.
-        "all"       — never silent (every send pushes).
+        "all"       — never silent (every send pushes) unless force-silenced via
+                      ``metadata["notify"] = False``.
         """
+        # Explicit notify=False is a hard force-silence in any mode.
+        if (metadata or {}).get("notify") is False:
+            return {"disable_notification": True}
         mode = getattr(self, "_notifications_mode", "important")
         if mode == "silent":
             return {"disable_notification": True}
@@ -2438,6 +2453,42 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug(
                 "[%s] Failed to delete Telegram message %s: %s",
+                self.name, message_id, e,
+            )
+            return False
+
+    async def pin_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        disable_notification: bool = True,
+    ) -> bool:
+        """Pin a previously sent Telegram message.
+
+        Used by the badge-free gateway lifecycle path (CLAWD-1376): each
+        gateway keeps ONE pinned status message per home channel and edits it
+        in place on every online/offline transition. ``pinChatMessage`` is
+        called with ``disable_notification=True`` so the initial pin never
+        pushes a notification — only an explicit loud send (Quasimodo/engineer
+        fleet alerts) ever badges.
+
+        Best-effort: a failure here (no pin permission, message too old) is
+        logged at debug and returns False so the caller can fall back to the
+        unpinned status message rather than crashing the lifecycle path.
+        """
+        if not self._bot:
+            return False
+        try:
+            await self._bot.pin_chat_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                disable_notification=disable_notification,
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to pin Telegram message %s: %s",
                 self.name, message_id, e,
             )
             return False

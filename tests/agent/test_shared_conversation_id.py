@@ -104,8 +104,12 @@ class TestConversationIdDerivation:
         assert 'agent._shared_conversation_id = ""' in src, (
             "init_agent must seed a safe default _shared_conversation_id"
         )
-        assert 'f"{_profile}:{agent._user_id}"' in src, (
-            "init_agent must derive the shared conversation_id from profile+user_id"
+        assert 'resolve_person(' in src, (
+            "init_agent must collapse the per-surface user_id to a stable "
+            "person id (CLAWD-1565) before keying the conversation_id"
+        )
+        assert 'f"{_profile}:{_person}"' in src, (
+            "init_agent must derive the shared conversation_id from profile+person"
         )
 
 
@@ -219,6 +223,85 @@ class TestCrossSurfaceConversationIdEquality:
 #    mnemosyne is importable from the HAF venv only when the HMP worktree is on
 #    sys.path. We inject it here and skip cleanly if unavailable.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 5. Person normalization convergence (CLAWD-1565).
+#    The agent_init seam derives the shared id as f"{profile}:{person}" where
+#    person = resolve_person(profile, platform, raw_user_id). This proves the
+#    CONVERGENCE guarantee: an operator's Telegram id and the (flag-on)
+#    api_server surface collapse to the SAME person => the SAME conversation_id,
+#    while a stranger's telegram id stays ISOLATED on a different id.
+# ---------------------------------------------------------------------------
+
+
+from gateway.person_identity import resolve_person
+
+
+def _derive_via_person(profile, platform, raw_user_id):
+    """Mirror the production seam in agent_init.py:1148-1152 exactly:
+    collapse the per-surface raw id to a person, then key on profile+person.
+    Pinned by test — if the production formula changes, this must change.
+    """
+    person = resolve_person(profile, platform, raw_user_id)
+    return f"{profile}:{person}" if (profile and person) else ""
+
+
+class TestPersonNormalizedDerivation:
+    """CLAWD-1565: cross-surface convergence + stranger isolation, driven by
+    the real resolve_person mapping read from operator env at call time."""
+
+    @pytest.fixture(autouse=True)
+    def _operator_env(self, monkeypatch):
+        # Configure morgan as the operator on telegram + the api_server surface.
+        monkeypatch.setenv("HERMES_OPERATOR_PERSON_ID", "morgan")
+        monkeypatch.setenv("HERMES_OPERATOR_TELEGRAM_IDS", "111,222")
+        monkeypatch.setenv("HERMES_OPERATOR_API_SERVER", "1")
+        yield
+
+    def test_telegram_operator_and_api_server_converge(self):
+        """An operator Telegram id and the api_server surface (no per-user id)
+        resolve to the SAME (person, agent) conversation_id."""
+        cid_telegram = _derive_via_person("minerva", "telegram", "222")
+        cid_api = _derive_via_person("minerva", "api_server", None)
+
+        assert cid_telegram == "minerva:morgan"
+        assert cid_api == "minerva:morgan"
+        assert cid_telegram == cid_api
+
+    def test_two_distinct_operator_telegram_ids_converge(self):
+        """Two different operator devices/ids both map to morgan => one
+        conversation_id (the merge the per-surface raw id could never achieve)."""
+        cid_a = _derive_via_person("minerva", "telegram", "111")
+        cid_b = _derive_via_person("minerva", "telegram", "222")
+        assert cid_a == cid_b == "minerva:morgan"
+
+    def test_non_operator_telegram_id_is_isolated(self):
+        """A stranger's telegram id resolves to a DIFFERENT conversation_id —
+        it must NOT be merged into the operator's shared conversation."""
+        cid_operator = _derive_via_person("minerva", "telegram", "222")
+        cid_stranger = _derive_via_person("minerva", "telegram", "999")
+
+        assert cid_operator == "minerva:morgan"
+        assert cid_stranger == "minerva:999"
+        assert cid_stranger != cid_operator
+
+    def test_no_operator_env_telegram_id_isolated(self, monkeypatch):
+        """FAIL-SAFE convergence guard: with the operator env removed, even a
+        previously-operator id stays on its raw id (no accidental merge)."""
+        monkeypatch.delenv("HERMES_OPERATOR_PERSON_ID", raising=False)
+        monkeypatch.delenv("HERMES_OPERATOR_TELEGRAM_IDS", raising=False)
+        monkeypatch.delenv("HERMES_OPERATOR_API_SERVER", raising=False)
+        assert _derive_via_person("minerva", "telegram", "222") == "minerva:222"
+        # api_server with no flag => empty person => no-op key (no bare "minerva:").
+        assert _derive_via_person("minerva", "api_server", None) == ""
+
+    def test_different_agents_same_operator_diverge(self):
+        """Same person, different agent (profile) => different conversation_id;
+        the key is (person, agent), not person alone."""
+        assert _derive_via_person("minerva", "telegram", "222") != _derive_via_person(
+            "growth", "telegram", "222"
+        )
 
 
 _HMP_PATH = Path("/tmp/1542-worktrees/hmp")

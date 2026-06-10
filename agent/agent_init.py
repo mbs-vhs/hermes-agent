@@ -1136,15 +1136,19 @@ def init_agent(
                     # Profile identity for per-profile provider scoping
                     try:
                         from hermes_cli.profiles import get_active_profile_name
+                        from gateway.person_identity import resolve_person
                         _profile = get_active_profile_name()
                         _init_kwargs["agent_identity"] = _profile
                         _init_kwargs["agent_workspace"] = "hermes"
                         # Derive the stable (person, agent) conversation_id for
-                        # cross-surface continuity (CLAWD-1542). Empty user_id
-                        # (e.g. CLI, no gateway user) => "" => no-op upstream.
+                        # cross-surface continuity (CLAWD-1542). The raw
+                        # gateway user_id is per-surface, so collapse it to a
+                        # stable person id (CLAWD-1565) before keying — empty
+                        # person (e.g. CLI, stranger) => "" => no-op upstream.
+                        _person = resolve_person(_profile, agent.platform, agent._user_id)
                         agent._shared_conversation_id = (
-                            f"{_profile}:{agent._user_id}"
-                            if (_profile and agent._user_id) else ""
+                            f"{_profile}:{_person}"
+                            if (_profile and _person) else ""
                         )
                     except Exception:
                         pass

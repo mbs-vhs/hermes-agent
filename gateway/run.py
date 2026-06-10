@@ -802,6 +802,42 @@ def _clear_recovery_marker() -> None:
         logger.debug("recovery-notify marker clear failed: %s", exc)
 
 
+# CLAWD-1376: badge-free pinned gateway lifecycle. Each gateway keeps ONE pinned
+# status message per home channel and edits it in place on every online/offline
+# transition. The message id must survive a restart (the offline edit runs in a
+# different process than the online edit), so it is persisted here — same
+# durable-marker pattern as the recovery marker above. Keyed by
+# ``platform:chat_id:thread_id`` so a forum-topic home channel pins distinctly.
+_GATEWAY_PINNED_STATUS_MARKER = ".gateway_pinned_status.json"
+
+
+def _pinned_status_key(platform: str, chat_id: str, thread_id: Optional[str]) -> str:
+    """Stable store key for a home-channel pinned status message."""
+    return f"{platform}:{chat_id}:{thread_id or ''}"
+
+
+def _read_pinned_status() -> dict:
+    """Read the pinned-status id map ({key -> message_id}); {} when absent."""
+    try:
+        raw = (_hermes_home / _GATEWAY_PINNED_STATUS_MARKER).read_text()
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_pinned_status(data: dict) -> None:
+    """Persist the pinned-status id map. Best-effort — never block lifecycle."""
+    try:
+        atomic_json_write(
+            _hermes_home / _GATEWAY_PINNED_STATUS_MARKER,
+            data,
+            indent=None,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("pinned-status marker write failed: %s", exc)
+
+
 # CLAWD-1023: seconds to wait after a graceful stop() completes before the
 # hard-exit watchdog (in start_gateway's signal handler) force-exits. A normal
 # shutdown exits ~1-3s after stop(); if it hasn't, a lingering tool subprocess
@@ -3579,6 +3615,15 @@ class GatewayRunner:
         # elsewhere), which would otherwise trigger
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
+
+        # CLAWD-1376: badge-free pinned lifecycle. For adapters in pinned mode,
+        # the gateway-offline transition is an in-place EDIT of the pinned status
+        # message (no fresh down-DM, no badge). This runs before the legacy
+        # broadcast loop below, which then skips pinned-mode adapters — so the
+        # home channel gets a pin edit OR a down-DM, never both, and pinned mode
+        # records no down-DM target (the next boot edits the pin, not a DM).
+        await self._update_pinned_lifecycle_status("offline")
+
         home_targets: list = []
         for platform, adapter in list(self.adapters.items()):
             if platform == Platform.EMAIL:
@@ -3590,6 +3635,11 @@ class GatewayRunner:
                 # Active-session interruption notices (the loop above) still
                 # reach email conversations; only the home-channel lifecycle
                 # broadcast skips it.
+                continue
+
+            # CLAWD-1376: pinned-lifecycle adapters already edited their pinned
+            # status to "offline" above — a fresh down-DM here would badge.
+            if self._adapter_lifecycle_pinned(adapter):
                 continue
 
             home = self.config.get_home_channel(platform)
@@ -6430,6 +6480,26 @@ class GatewayRunner:
                 )
                 _notify_mode = "important"
             adapter._notifications_mode = _notify_mode
+            # CLAWD-1376: badge-free pinned lifecycle. When enabled, gateway
+            # online/offline transitions edit ONE pinned status message per home
+            # channel in place (created+pinned once, silently) instead of the
+            # CLAWD-1144 send-down-DM-then-edit path. Off by default; the
+            # staggered 11-profile rollout is operator-coordinated. ENV override
+            # for quick testing, else display.platforms.telegram.lifecycle_pinned.
+            _lifecycle_pinned_raw = os.getenv("HERMES_TELEGRAM_LIFECYCLE_PINNED", "")
+            if not _lifecycle_pinned_raw:
+                try:
+                    _gw_cfg = _load_gateway_config()
+                    _lp = cfg_get(
+                        _gw_cfg, "display", "platforms", "telegram", "lifecycle_pinned"
+                    )
+                    if _lp not in {None, ""}:
+                        _lifecycle_pinned_raw = str(_lp)
+                except Exception:
+                    pass
+            adapter._lifecycle_pinned = str(_lifecycle_pinned_raw).strip().lower() in {
+                "1", "true", "yes", "on",
+            }
             return adapter
         
         elif platform == Platform.WHATSAPP:
@@ -14613,6 +14683,15 @@ class GatewayRunner:
         Extracted from ``start()`` so the if/elif wiring is unit-testable against
         real code rather than a replica.
         """
+        # CLAWD-1376: badge-free pinned lifecycle. For adapters in pinned mode,
+        # the gateway-online transition is an in-place edit of the pinned status
+        # message (no fresh send, no badge). This runs FIRST and independently of
+        # the /restart and recovery branches below — those legacy paths skip
+        # pinned-mode adapters (see _send_home_channel_startup_notifications and
+        # _edit_recovery_notifications), so the home channel never gets both a
+        # pin edit and a fresh "gateway online" DM.
+        await self._update_pinned_lifecycle_status("online")
+
         # Notify the chat that initiated /restart that the gateway is back.
         restart_notification_pending = _restart_notification_pending()
         delivered_restart_target = await self._send_restart_notification()
@@ -14758,6 +14837,11 @@ class GatewayRunner:
             if adapter is None:
                 continue
 
+            # CLAWD-1376: pinned-lifecycle adapters own their online transition
+            # via the pinned status edit; skip the legacy down-DM recovery edit.
+            if self._adapter_lifecycle_pinned(adapter):
+                continue
+
             platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
@@ -14822,6 +14906,12 @@ class GatewayRunner:
                 # in _notify_active_sessions_of_shutdown.
                 continue
 
+            # CLAWD-1376: pinned-lifecycle adapters already flipped their pinned
+            # status to "online" in _update_pinned_lifecycle_status — a fresh
+            # "gateway online" DM here would double-announce and badge.
+            if self._adapter_lifecycle_pinned(adapter):
+                continue
+
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
@@ -14868,6 +14958,125 @@ class GatewayRunner:
                 )
 
         return delivered
+
+    def _adapter_lifecycle_pinned(self, adapter) -> bool:
+        """True when this adapter is in badge-free pinned-lifecycle mode and
+        can pin (CLAWD-1376). Requires both the opt-in flag and a ``pin_message``
+        capability so only adapters that actually support pinning take the path.
+        """
+        return bool(
+            getattr(adapter, "_lifecycle_pinned", False)
+            and callable(getattr(adapter, "pin_message", None))
+        )
+
+    async def _update_pinned_lifecycle_status(self, state: str) -> bool:
+        """Reflect a gateway lifecycle transition in the pinned status message.
+
+        CLAWD-1376: each gateway keeps ONE pinned status message per home
+        channel and EDITS it in place on every online/offline transition — an
+        edit produces no push notification, and the one-time create+pin is done
+        with ``disable_notification=True``, so the operator's chat list flips
+        state with ZERO badges. If the stored message can't be edited (operator
+        unpinned/deleted it, or first run), a fresh status message is sent
+        silently and re-pinned.
+
+        ``state`` is ``"online"`` or ``"offline"``. Returns True when at least
+        one home channel's pinned status was updated, so the caller can skip the
+        legacy CLAWD-1144 send/edit-down-DM path for those platforms.
+
+        Best-effort throughout — a failure here must never block start/stop.
+        """
+        message = (
+            "🟢 Gateway online — Hermes is connected and ready."
+            if state == "online"
+            else "🔴 Gateway offline — Hermes is restarting; back shortly."
+        )
+        store = _read_pinned_status()
+        updated = False
+
+        for platform, adapter in list(self.adapters.items()):
+            if not self._adapter_lifecycle_pinned(adapter):
+                continue
+            if platform == Platform.EMAIL:
+                continue
+
+            home = self.config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                continue
+
+            platform_cfg = self.config.platforms.get(platform)
+            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                logger.info(
+                    "Pinned lifecycle status suppressed: %s has gateway_restart_notification=false",
+                    platform.value,
+                )
+                continue
+
+            chat_id = str(home.chat_id)
+            thread_id = str(home.thread_id) if home.thread_id else None
+            key = _pinned_status_key(platform.value, chat_id, thread_id)
+            metadata = {"thread_id": home.thread_id} if home.thread_id else None
+
+            try:
+                cached_id = store.get(key)
+                if cached_id:
+                    result = await adapter.edit_message(
+                        chat_id, str(cached_id), message, finalize=True,
+                        metadata=metadata,
+                    )
+                    if result is not None and getattr(result, "success", True):
+                        store[key] = str(
+                            getattr(result, "message_id", None) or cached_id
+                        )
+                        updated = True
+                        logger.info(
+                            "Edited pinned lifecycle status (%s) for %s:%s",
+                            state, platform.value, chat_id,
+                        )
+                        continue
+                    # Edit failed (unpinned/deleted/too old) — drop the stale id
+                    # and recreate below.
+                    logger.debug(
+                        "Pinned lifecycle status edit failed for %s:%s — recreating",
+                        platform.value, chat_id,
+                    )
+
+                # First run, or the stored message is gone: send a fresh status
+                # message silently and pin it silently. metadata.notify is left
+                # unset so the adapter's notification mode (important/silent)
+                # delivers it without a push; the pin is explicitly silent.
+                send_result = await adapter.send(chat_id, message, metadata=metadata)
+                new_id = (
+                    getattr(send_result, "message_id", None)
+                    if send_result is not None
+                    and getattr(send_result, "success", True)
+                    else None
+                )
+                if not new_id:
+                    logger.debug(
+                        "Pinned lifecycle status send failed for %s:%s",
+                        platform.value, chat_id,
+                    )
+                    store.pop(key, None)
+                    continue
+                await adapter.pin_message(
+                    chat_id, str(new_id), disable_notification=True,
+                )
+                store[key] = str(new_id)
+                updated = True
+                logger.info(
+                    "Created+pinned lifecycle status (%s) for %s:%s",
+                    state, platform.value, chat_id,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Pinned lifecycle status update failed for %s:%s: %s",
+                    platform.value, chat_id, exc,
+                )
+
+        if updated:
+            _write_pinned_status(store)
+        return updated
 
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.

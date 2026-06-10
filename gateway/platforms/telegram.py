@@ -509,11 +509,20 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Return disable_notification kwargs based on the adapter's notification mode.
 
+        An explicit ``metadata["notify"] = False`` force-silences the send in
+        EVERY mode (including "all") — callers that must never push a badge
+        (e.g. the badge-free pinned lifecycle status, CLAWD-1376) set it so the
+        send cannot leak a notification under "all".
+
         "silent"    — always silent (disable_notification=True), overriding even
                       an explicit ``metadata["notify"] = True``.
         "important" — silent unless the caller sets ``metadata["notify"] = True``.
-        "all"       — never silent (every send pushes).
+        "all"       — never silent (every send pushes) unless force-silenced via
+                      ``metadata["notify"] = False``.
         """
+        # Explicit notify=False is a hard force-silence in any mode.
+        if (metadata or {}).get("notify") is False:
+            return {"disable_notification": True}
         mode = getattr(self, "_notifications_mode", "important")
         if mode == "silent":
             return {"disable_notification": True}

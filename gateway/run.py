@@ -5975,6 +5975,16 @@ class GatewayRunner:
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
+                        # CLAWD-1376: a WAN-blip recovery flips the pinned status
+                        # back to "online" — badge-free, edit-in-place (create
+                        # only if the operator removed it, always silent). Gated
+                        # by the same _adapter_lifecycle_pinned flag (default OFF)
+                        # and best-effort, so it never blocks reconnect.
+                        try:
+                            await self._update_pinned_lifecycle_status("online")
+                        except Exception:
+                            pass
+
                         # Rebuild channel directory with the new adapter
                         try:
                             from gateway.channel_directory import build_channel_directory
@@ -15015,7 +15025,12 @@ class GatewayRunner:
             chat_id = str(home.chat_id)
             thread_id = str(home.thread_id) if home.thread_id else None
             key = _pinned_status_key(platform.value, chat_id, thread_id)
-            metadata = {"thread_id": home.thread_id} if home.thread_id else None
+            # notify=False force-silences the create/recreate send in EVERY
+            # notification mode (incl. "all"), so the badge-free invariant holds
+            # regardless of the adapter's configured mode (CLAWD-1376).
+            metadata: Dict[str, Any] = {"notify": False}
+            if home.thread_id:
+                metadata["thread_id"] = home.thread_id
 
             try:
                 cached_id = store.get(key)
@@ -15042,9 +15057,13 @@ class GatewayRunner:
                     )
 
                 # First run, or the stored message is gone: send a fresh status
-                # message silently and pin it silently. metadata.notify is left
-                # unset so the adapter's notification mode (important/silent)
-                # delivers it without a push; the pin is explicitly silent.
+                # message silently and pin it silently. metadata.notify=False
+                # force-silences the send in every mode (incl. "all"); the pin
+                # is explicitly silent. Recreate fires only when the edit FAILS
+                # (deleted, or unpinned+too-old). A bare unpin where the message
+                # is still editable is intentionally NOT auto-re-pinned — that
+                # would require a pin-state probe; the status text still updates
+                # in place via the edit, just without re-pinning.
                 send_result = await adapter.send(chat_id, message, metadata=metadata)
                 new_id = (
                     getattr(send_result, "message_id", None)

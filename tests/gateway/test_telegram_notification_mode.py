@@ -35,6 +35,14 @@ def test_all_always_pushes():
     assert _nk("all", {"notify": True}) == {}
 
 
+def test_explicit_notify_false_force_silences_every_mode():
+    # CLAWD-1376 FIX 1: an explicit notify=False is a hard force-silence in
+    # EVERY mode, including "all" — the badge-free pinned lifecycle status send
+    # sets it so the create/recreate send can never leak a push under "all".
+    for mode in ("silent", "important", "all"):
+        assert _nk(mode, {"notify": False}) == {"disable_notification": True}
+
+
 def test_default_mode_is_important():
     stub = types.SimpleNamespace()  # no _notifications_mode attr set
     assert TelegramAdapter._notification_kwargs(stub, None) == {"disable_notification": True}

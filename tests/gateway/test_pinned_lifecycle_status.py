@@ -35,17 +35,31 @@ class _PinAdapter:
     tests can assert the silent-send + silent-pin invariants.
     """
 
-    def __init__(self, *, lifecycle_pinned=True, edit_ok=True):
+    def __init__(self, *, lifecycle_pinned=True, edit_ok=True, notifications_mode="important"):
         self._lifecycle_pinned = lifecycle_pinned
         self._edit_ok = edit_ok
+        # Drives the REAL TelegramAdapter._notification_kwargs so the silent-send
+        # invariant is observable (every send records the disable_notification it
+        # would have passed to Telegram). CLAWD-1376 FIX 1 must hold under "all".
+        self._notifications_mode = notifications_mode
         self._next_id = 100
         self.sends: list = []
         self.edits: list = []
         self.pins: list = []
 
+    def _send_disable_notification(self, metadata):
+        from gateway.platforms.telegram import TelegramAdapter
+
+        return TelegramAdapter._notification_kwargs(self, metadata).get(
+            "disable_notification", False
+        )
+
     async def send(self, chat_id, content, metadata=None):
         self._next_id += 1
         self.sends.append((str(chat_id), content, metadata))
+        # Record what disable_notification the real adapter would compute for
+        # this send under the configured mode, so badge-free is provable.
+        self.last_send_silent = self._send_disable_notification(metadata)
         return types.SimpleNamespace(
             success=True, message_id=str(self._next_id), error=None,
         )
@@ -193,6 +207,29 @@ def test_thread_aware_home_channel_keys_distinctly(monkeypatch, tmp_path):
     _run(runner._update_pinned_lifecycle_status("online"))
 
     assert _read_pinned_status() == {"telegram:555:77": "101"}
-    # The send carried the thread metadata so it lands in the right topic.
+    # The send carried the thread metadata so it lands in the right topic, plus
+    # the force-silence notify=False (CLAWD-1376 FIX 1).
     _chat, _content, metadata = adapter.sends[0]
-    assert metadata == {"thread_id": "77"}
+    assert metadata == {"notify": False, "thread_id": "77"}
+
+
+def test_create_send_is_silent_even_under_all_mode(monkeypatch, tmp_path):
+    # CLAWD-1376 FIX 1: under notifications_mode="all" a bare send pushes a
+    # badge, but the lifecycle create/recreate send carries notify=False, which
+    # force-silences it in EVERY mode. The created+pinned status must NOT push.
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    adapter = _PinAdapter(notifications_mode="all")
+    runner = _make_runner(adapter)
+
+    updated = _run(runner._update_pinned_lifecycle_status("online"))
+
+    assert updated is True
+    assert len(adapter.sends) == 1
+    # The create send carried notify=False ...
+    _chat, _content, metadata = adapter.sends[0]
+    assert metadata is not None and metadata.get("notify") is False
+    # ... and the real _notification_kwargs computed disable_notification=True
+    # for it despite "all" mode — zero badge.
+    assert adapter.last_send_silent is True
+    # The pin is silent too.
+    assert adapter.pins[0][2] is True

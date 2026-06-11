@@ -658,6 +658,21 @@ def run_conversation(
         except Exception:
             pass
 
+    # Recent cross-surface context seed (ADR-065 / CLAWD-1542 Phase S).
+    # Fresh-at-turn-start read of the shared (person, agent) conversation so
+    # turns that just happened on another surface (chat/voice) are visible
+    # here. Gated + fail-open + hard-timed inside read_recent_seed; the result
+    # is injected into the CURRENT USER MESSAGE below (never the system prompt)
+    # to preserve prompt-cache prefix stability. Empty when disabled/unset.
+    _recent_seed_block = ""
+    try:
+        from agent.recent_seeding import read_recent_seed as _read_recent_seed
+        _recent_seed_block = _read_recent_seed(
+            getattr(agent, "_shared_conversation_id", "") or ""
+        )
+    except Exception:
+        _recent_seed_block = ""
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -831,6 +846,11 @@ def run_conversation(
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
                     if _fenced:
                         _injections.append(_fenced)
+                # Recent cross-surface context seed (CLAWD-1542 Phase S):
+                # injected into the user message (NOT the system prompt) so the
+                # cached system prefix stays byte-stable. Empty => nothing added.
+                if _recent_seed_block:
+                    _injections.append(_recent_seed_block)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
                 if _injections:

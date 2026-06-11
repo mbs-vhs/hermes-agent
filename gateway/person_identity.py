@@ -18,6 +18,13 @@ read from the environment at call time:
   to the operator person.
 - ``HERMES_OPERATOR_API_SERVER`` — truthy flag marking the API server as an
   operator-only surface (its caller has no per-user id).
+- ``HERMES_OPERATOR_WEBUI`` — truthy flag marking the hermes-webui browser
+  surface (``chat.vhs.box``) as operator-only. Like the API server it carries no
+  per-user id (the in-process webui session runs ``platform="webui"`` with
+  ``user_id=None``), so the whole surface maps to the operator when set. This is
+  what lets a chat.vhs.box turn resolve the same ``"{profile}:morgan"``
+  conversation the voice / Telegram / api surfaces use, so Phase S recent-context
+  seeding (CLAWD-1542) reaches it (CLAWD-1561 / ADR-065 P2b).
 
 FAIL-SAFE by construction: strangers, unknown platforms, and the CLI never
 merge. Any unexpected error, or a matched rule with an empty person id, falls
@@ -46,6 +53,8 @@ def _operator_person_id() -> str:
         return "morgan"
     if (os.getenv("HERMES_OPERATOR_API_SERVER") or "").strip().lower() in _TRUTHY:
         return "morgan"
+    if (os.getenv("HERMES_OPERATOR_WEBUI") or "").strip().lower() in _TRUTHY:
+        return "morgan"
     return ""
 
 
@@ -58,6 +67,11 @@ def _operator_telegram_ids() -> set[str]:
 def _operator_api_server() -> bool:
     """Whether the API server is an operator-only surface."""
     return (os.getenv("HERMES_OPERATOR_API_SERVER") or "").strip().lower() in _TRUTHY
+
+
+def _operator_webui() -> bool:
+    """Whether the hermes-webui browser surface is an operator-only surface."""
+    return (os.getenv("HERMES_OPERATOR_WEBUI") or "").strip().lower() in _TRUTHY
 
 
 # Platform -> predicate mapping. Each predicate decides whether the given
@@ -73,9 +87,16 @@ def _api_server_matches(raw_user_id: str | None) -> bool:
     return _operator_api_server()
 
 
+def _webui_matches(raw_user_id: str | None) -> bool:
+    # hermes-webui's in-process session carries no per-user id (platform="webui",
+    # user_id=None); the whole surface is operator-only when the flag is set.
+    return _operator_webui()
+
+
 _OPERATOR_PREDICATES = {
     "telegram": _telegram_matches,
     "api_server": _api_server_matches,
+    "webui": _webui_matches,
 }
 
 

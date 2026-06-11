@@ -20,6 +20,7 @@ from gateway.person_identity import resolve_person
 _PERSON = "HERMES_OPERATOR_PERSON_ID"
 _TG = "HERMES_OPERATOR_TELEGRAM_IDS"
 _API = "HERMES_OPERATOR_API_SERVER"
+_WEBUI = "HERMES_OPERATOR_WEBUI"
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +29,7 @@ def _clean_operator_env(monkeypatch):
     declares exactly the mapping it intends. delenv(raising=False) tolerates a
     var that was never set in the hermetic test env.
     """
-    for key in (_PERSON, _TG, _API):
+    for key in (_PERSON, _TG, _API, _WEBUI):
         monkeypatch.delenv(key, raising=False)
     yield
 
@@ -123,6 +124,70 @@ class TestApiServerSurface:
         """A non-truthy junk value is treated as OFF."""
         monkeypatch.setenv(_API, "banana")
         assert resolve_person("minerva", "api_server", None) == ""
+
+
+# ---------------------------------------------------------------------------
+# WebUI surface (chat.vhs.box) — CLAWD-1561 / ADR-065 P2b
+# ---------------------------------------------------------------------------
+
+
+class TestWebuiSurface:
+    """hermes-webui's in-process session runs platform="webui" with no per-user
+    id; the whole surface maps to the operator when HERMES_OPERATOR_WEBUI is on,
+    so a chat.vhs.box turn resolves the shared "{profile}:morgan" conversation."""
+
+    @pytest.mark.parametrize("flag", ["1", "true", "yes", "on", "True", "ON", "Yes"])
+    def test_webui_flag_on_resolves_to_person(self, monkeypatch, flag):
+        monkeypatch.setenv(_WEBUI, flag)
+        monkeypatch.setenv(_PERSON, "morgan")
+        assert resolve_person("minerva", "webui", None) == "morgan"
+
+    def test_webui_flag_on_defaults_person_to_morgan(self, monkeypatch):
+        monkeypatch.setenv(_WEBUI, "1")
+        # No explicit person id; mapping present => default to "morgan".
+        assert resolve_person("minerva", "webui", None) == "morgan"
+
+    def test_webui_flag_off_returns_empty(self, monkeypatch):
+        monkeypatch.setenv(_WEBUI, "0")
+        assert resolve_person("minerva", "webui", None) == ""
+
+    def test_webui_flag_unset_returns_empty(self, monkeypatch):
+        """Fail-safe: flag unset + raw None => "" (no bare "minerva:" key)."""
+        assert resolve_person("minerva", "webui", None) == ""
+
+    def test_webui_garbage_flag_returns_empty(self, monkeypatch):
+        monkeypatch.setenv(_WEBUI, "banana")
+        assert resolve_person("minerva", "webui", None) == ""
+
+    def test_webui_flag_off_with_person_set_still_does_not_resolve(self, monkeypatch):
+        """Mutation guard (revert-validation): pin an explicit person id so the
+        empty-person fall-through can NOT mask a predicate that ignores the flag.
+        With HERMES_OPERATOR_WEBUI off but a person id configured (e.g. via the
+        api_server mapping), _webui_matches MUST still return False, so the webui
+        surface does not silently merge to the operator. Without pinning the
+        person id, a predicate that always returned True would still pass
+        test_webui_flag_off_returns_empty because _operator_person_id() is ""."""
+        monkeypatch.setenv(_WEBUI, "0")
+        monkeypatch.setenv(_PERSON, "morgan")  # person id is now non-empty
+        # Another surface's mapping is present, so person defaults exist, but the
+        # webui flag itself is OFF -> the webui surface must not resolve.
+        assert resolve_person("minerva", "webui", None) == ""
+
+    def test_webui_flag_unset_with_person_set_still_does_not_resolve(self, monkeypatch):
+        """Same guard with the flag fully unset rather than explicitly '0'."""
+        monkeypatch.setenv(_PERSON, "morgan")
+        assert resolve_person("minerva", "webui", None) == ""
+
+    def test_webui_converges_with_api_and_telegram_on_same_key(self, monkeypatch):
+        """The point of P2b: webui, api_server, and telegram all collapse to the
+        SAME person id, so all three build the one "{profile}:morgan" key."""
+        monkeypatch.setenv(_WEBUI, "1")
+        monkeypatch.setenv(_API, "1")
+        monkeypatch.setenv(_TG, "222")
+        monkeypatch.setenv(_PERSON, "morgan")
+        assert resolve_person("minerva", "webui", None) == "morgan"
+        assert resolve_person("minerva", "api_server", None) == "morgan"
+        assert resolve_person("minerva", "telegram", "222") == "morgan"
 
 
 # ---------------------------------------------------------------------------

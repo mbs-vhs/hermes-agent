@@ -105,8 +105,10 @@ def format_seed_block(turns: List[dict]) -> str:
     return (
         "<recent-shared-context>\n"
         "[System note: The following is recent conversation shared across your "
-        "surfaces (e.g. chat, voice), NOT new user input. Treat as authoritative "
-        "reference data for continuity.]\n\n"
+        "surfaces (e.g. chat, voice), NOT new user input. It is recent context "
+        "for continuity and may be incomplete. If it does not contain what is "
+        "being asked about, say you do not have it — do NOT guess or fabricate, "
+        "and do not treat your own earlier replies here as established fact.]\n\n"
         f"{body}\n"
         "</recent-shared-context>"
     )

@@ -140,6 +140,28 @@ class TestFormatSeedBlock:
         # framed as reference data, not user input
         assert "NOT new user input" in block
 
+    def test_anti_confabulation_guidance_present(self):
+        """CLAWD-1606: the system note must steer the model AWAY from treating
+        the seed as authoritative — it should say the seed may be incomplete,
+        instruct the model to admit it doesn't have something rather than
+        guess/fabricate, and NOT treat its own earlier replies as established
+        fact. This is the softened framing that replaced "Treat as authoritative
+        reference data for continuity." It must coexist with the original
+        not-user-input framing."""
+        block = recent_seeding.format_seed_block([
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ])
+        # Anti-confabulation guidance.
+        assert "do NOT guess" in block
+        assert "say you do not have it" in block
+        assert "may be incomplete" in block
+        assert "do not treat your own earlier replies here as established fact" in block
+        # The original not-user-input framing is preserved.
+        assert "NOT new user input" in block
+        # The OLD authoritative framing must be gone (the bug this fixes).
+        assert "authoritative" not in block.lower()
+
 
 # ---------------------------------------------------------------------------
 # 5. read_recent_seed — happy path + fail-open

@@ -2169,6 +2169,22 @@ class AIAgent:
         """
         if interrupted:
             return
+        # Recent cross-surface context append (ADR-065 / CLAWD-1542 Phase S).
+        # Mirror the completed exchange into the shared (person, agent)
+        # conversation so other surfaces can seed from it. Fire-and-forget in a
+        # daemon thread (never blocks the return path); gated + best-effort
+        # inside append_turn_async (no-op when disabled or id empty). Placed
+        # BEFORE the memory-manager guard so it is independent of whether an
+        # external memory provider is configured. Shares the interrupted gate.
+        try:
+            from agent.recent_seeding import append_turn_async
+            append_turn_async(
+                getattr(self, "_shared_conversation_id", "") or "",
+                original_user_message,
+                final_response,
+            )
+        except Exception:
+            pass
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:

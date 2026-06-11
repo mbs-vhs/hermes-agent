@@ -190,9 +190,105 @@ def append_turn_async(
     return thread
 
 
+# ---------------------------------------------------------------------------
+# Thread-canonical append (Embodiment Phase 2a / CLAWD-1621, ADR-067).
+#
+# When HERMES_THREAD_CANONICAL is truthy the gateway lands the completed turn in
+# the canonical clawd (person, agent) chat thread via the new
+# POST /chat/conversation/{cid}/turn endpoint INSTEAD of writing the Redis
+# recent-turns window directly. The endpoint runs the same recent-turns bridge
+# voice/Control use, so the turn still reaches convturns -- through the thread,
+# not around it. This is the EITHER/OR design (flag ON => thread-write; OFF =>
+# direct convturns append) -- so there is no double-land.
+#
+# Fail-OPEN: a turn must never be lost. If the canonical write fails for ANY
+# reason (exception or non-2xx on either POST) the worker falls back to the
+# existing direct convturns append (_append_worker), so a slow/broken clawd
+# thread-write degrades to today's behaviour rather than dropping the turn.
+# ---------------------------------------------------------------------------
+
+
+def thread_canonical_enabled() -> bool:
+    """Gate for landing turns in the canonical clawd thread (default OFF).
+
+    When OFF the gateway behaves byte-identically to today (direct convturns
+    append via ``append_turn_async``). Mirrors ``seeding_enabled()``.
+    """
+    return os.environ.get("HERMES_THREAD_CANONICAL", "").strip().lower() in _TRUTHY
+
+
+def _canonical_post_turn(client: "object", base_url: str, conversation_id: str,
+                         role: str, content: str) -> None:
+    """POST one turn to the cid-keyed canonical-thread endpoint.
+
+    Raises on a non-2xx so the worker can fall back to the direct convturns
+    append (fail-open). Mirrors ``_post_turn`` but targets the new endpoint and
+    sends the ``{role, content}`` body the route expects (privacy_class defaults
+    to ``work_videotape`` server-side, matching the voice/Control thread class).
+    """
+    url = f"{base_url}/chat/conversation/{conversation_id}/turn"
+    resp = client.post(url, json={"role": role, "content": content})  # type: ignore[attr-defined]
+    status = getattr(resp, "status_code", 0)
+    if not (200 <= status < 300):
+        raise RuntimeError(f"canonical thread-write non-2xx ({status})")
+
+
+def _append_canonical_worker(conversation_id: str, user_text: str,
+                             assistant_text: str) -> None:
+    """Land the completed turn in the canonical clawd thread; fall back to the
+    direct convturns append on ANY failure (fail-open -- never drop the turn)."""
+    try:
+        import httpx
+
+        base_url = _base_url()
+        with httpx.Client(timeout=_write_timeout(), headers=_auth_headers()) as client:
+            # Chronological order: user turn first, then assistant turn.
+            _canonical_post_turn(client, base_url, conversation_id, "user", user_text)
+            _canonical_post_turn(client, base_url, conversation_id, "assistant", assistant_text)
+    except Exception as exc:  # noqa: BLE001 -- fail open: fall back to direct convturns.
+        logger.debug(
+            "canonical thread-write failed (%s); falling back to direct convturns append",
+            exc,
+        )
+        _append_worker(conversation_id, user_text, assistant_text)
+
+
+def append_turn_canonical_async(
+    conversation_id: str,
+    user_message: Optional[str],
+    assistant_response: Optional[str],
+) -> Optional[threading.Thread]:
+    """Fire-and-forget land of a completed turn in the canonical clawd thread.
+
+    Same daemon-thread / off-critical-path / no-op gating contract as
+    ``append_turn_async`` (the OTHER arm of the either/or), but writes the
+    clawd thread via ``POST /chat/conversation/{cid}/turn`` and fails OPEN to
+    the direct convturns append. Gated on ``thread_canonical_enabled()`` -- the
+    caller selects this OR ``append_turn_async`` per the flag, never both.
+    No-op (returns ``None``) when the flag is off, the id is empty, or either
+    side of the exchange is missing.
+    """
+    if not thread_canonical_enabled() or not conversation_id:
+        return None
+    user_text = (user_message or "").strip() if isinstance(user_message, str) else ""
+    assistant_text = (assistant_response or "").strip() if isinstance(assistant_response, str) else ""
+    if not user_text or not assistant_text:
+        return None
+    thread = threading.Thread(
+        target=_append_canonical_worker,
+        args=(conversation_id, user_text, assistant_text),
+        daemon=True,
+        name="thread-canonical-append",
+    )
+    thread.start()
+    return thread
+
+
 __all__ = [
     "seeding_enabled",
     "format_seed_block",
     "read_recent_seed",
     "append_turn_async",
+    "thread_canonical_enabled",
+    "append_turn_canonical_async",
 ]

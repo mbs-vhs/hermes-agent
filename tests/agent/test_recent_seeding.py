@@ -22,6 +22,7 @@ from agent import recent_seeding
 def _set_env(monkeypatch, **kwargs):
     for key in (
         "HERMES_RECENT_SEEDING_ENABLED",
+        "HERMES_THREAD_CANONICAL",
         "CLAWD_BASE_URL",
         "CLAWD_API_AUTH_TOKEN",
         "HERMES_RECENT_SEEDING_LIMIT",
@@ -295,3 +296,162 @@ class TestAppendTurnAsync:
             # worker thread must not propagate — join completes cleanly
             t.join(timeout=5)
             assert not t.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# 7. thread-canonical append (CLAWD-1621 / ADR-067) — gate, either/or, fail-open
+# ---------------------------------------------------------------------------
+
+
+class TestThreadCanonicalEnabled:
+    def test_default_off(self, monkeypatch):
+        _set_env(monkeypatch)
+        assert recent_seeding.thread_canonical_enabled() is False
+
+    @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
+    def test_truthy(self, monkeypatch, val):
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL=val)
+        assert recent_seeding.thread_canonical_enabled() is True
+
+    @pytest.mark.parametrize("val", ["0", "false", "no", "off", ""])
+    def test_falsy(self, monkeypatch, val):
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL=val)
+        assert recent_seeding.thread_canonical_enabled() is False
+
+
+class TestCanonicalInertWhenDisabled:
+    def test_no_thread_when_flag_off(self, monkeypatch):
+        _set_env(monkeypatch)  # HERMES_THREAD_CANONICAL unset => off
+        with patch("httpx.Client") as client_cls:
+            t = recent_seeding.append_turn_canonical_async("minerva:morgan", "hi", "hello")
+        assert t is None
+        client_cls.assert_not_called()
+
+    def test_empty_id_no_op(self, monkeypatch):
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1")
+        with patch("httpx.Client") as client_cls:
+            t = recent_seeding.append_turn_canonical_async("", "hi", "hello")
+        assert t is None
+        client_cls.assert_not_called()
+
+    def test_skips_when_either_side_empty(self, monkeypatch):
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1")
+        with patch("httpx.Client") as client_cls:
+            assert recent_seeding.append_turn_canonical_async("c", "", "hello") is None
+            assert recent_seeding.append_turn_canonical_async("c", "hi", "") is None
+            assert recent_seeding.append_turn_canonical_async("c", None, "hello") is None
+        client_cls.assert_not_called()
+
+
+class TestCanonicalHappyPath:
+    def test_posts_both_turns_to_canonical_endpoint(self, monkeypatch):
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1",
+                 CLAWD_API_AUTH_TOKEN="tok",
+                 HERMES_RECENT_SEEDING_WRITE_TIMEOUT="2.0")
+        client = MagicMock()
+        client.post.return_value = _resp(200, {})
+        with patch("httpx.Client", return_value=_client_cm(client)) as client_cls:
+            t = recent_seeding.append_turn_canonical_async("minerva:morgan", "hi", "hello")
+            assert t is not None
+            t.join(timeout=5)
+        # two POSTs: user then assistant, to the cid-keyed canonical endpoint.
+        assert client.post.call_count == 2
+        first, second = client.post.call_args_list
+        assert first.args[0].endswith("/chat/conversation/minerva:morgan/turn")
+        assert first.kwargs["json"] == {"role": "user", "content": "hi"}
+        assert second.args[0].endswith("/chat/conversation/minerva:morgan/turn")
+        assert second.kwargs["json"] == {"role": "assistant", "content": "hello"}
+        # hard write-timeout + bearer threaded through.
+        _, kwargs = client_cls.call_args
+        assert kwargs["timeout"] == 2.0
+        assert kwargs["headers"]["Authorization"] == "Bearer tok"
+
+    def test_does_not_hit_direct_convturns_on_success(self, monkeypatch):
+        """The success path must NOT also write the direct convturns endpoint
+        (no double-land — the either/or invariant)."""
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1")
+        client = MagicMock()
+        client.post.return_value = _resp(201, {})
+        with patch("httpx.Client", return_value=_client_cm(client)):
+            t = recent_seeding.append_turn_canonical_async("c", "hi", "hello")
+            t.join(timeout=5)
+        # Every POST went to the canonical /turn endpoint; none to /conversation-turns/.
+        for call in client.post.call_args_list:
+            assert "/chat/conversation/" in call.args[0]
+            assert "/conversation-turns/" not in call.args[0]
+
+
+class TestCanonicalFailOpenFallback:
+    def test_non_2xx_falls_back_to_direct_convturns(self, monkeypatch):
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1")
+        # canonical worker uses one httpx.Client; the fallback _append_worker
+        # opens another. Return 500 for the canonical POSTs so the worker raises
+        # internally and falls back; the fallback client then posts to convturns.
+        canonical_client = MagicMock()
+        canonical_client.post.return_value = _resp(500, {})
+        fallback_client = MagicMock()
+        fallback_client.post.return_value = _resp(200, {})
+        clients = [_client_cm(canonical_client), _client_cm(fallback_client)]
+        with patch("httpx.Client", side_effect=clients):
+            t = recent_seeding.append_turn_canonical_async("c", "hi", "hello")
+            t.join(timeout=5)
+        # canonical attempted (>=1 POST, all to /turn), then fell back.
+        assert canonical_client.post.call_count >= 1
+        assert all("/chat/conversation/" in c.args[0] for c in canonical_client.post.call_args_list)
+        # fallback wrote the direct convturns endpoint (user + assistant).
+        assert fallback_client.post.call_count == 2
+        assert all("/conversation-turns/" in c.args[0] for c in fallback_client.post.call_args_list)
+
+    def test_exception_falls_back_to_direct_convturns(self, monkeypatch):
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1")
+        canonical_client = MagicMock()
+        canonical_client.post.side_effect = ConnectionError("boom")
+        fallback_client = MagicMock()
+        fallback_client.post.return_value = _resp(200, {})
+        clients = [_client_cm(canonical_client), _client_cm(fallback_client)]
+        with patch("httpx.Client", side_effect=clients):
+            t = recent_seeding.append_turn_canonical_async("c", "hi", "hello")
+            t.join(timeout=5)
+            assert not t.is_alive()
+        # fell back to the direct convturns append after the connection error.
+        assert fallback_client.post.call_count == 2
+        assert all("/conversation-turns/" in c.args[0] for c in fallback_client.post.call_args_list)
+
+    def test_fallback_failure_does_not_propagate(self, monkeypatch):
+        """If BOTH the canonical write and the fallback fail, the worker thread
+        must still complete cleanly (best-effort; a dropped turn is acceptable
+        only in a dual outage)."""
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1")
+        canonical_client = MagicMock()
+        canonical_client.post.side_effect = ConnectionError("canonical down")
+        fallback_client = MagicMock()
+        fallback_client.post.side_effect = ConnectionError("convturns down")
+        clients = [_client_cm(canonical_client), _client_cm(fallback_client)]
+        with patch("httpx.Client", side_effect=clients):
+            t = recent_seeding.append_turn_canonical_async("c", "hi", "hello")
+            t.join(timeout=5)
+            assert not t.is_alive()
+
+
+class TestEitherOrSelection:
+    """The flag selects exactly one arm; the OTHER stays inert. This pins the
+    invariant the run_agent call-site relies on (no double-land)."""
+
+    def test_canonical_off_leaves_direct_path_unchanged(self, monkeypatch):
+        # Flag off + seeding off => neither arm fires (byte-identical to today).
+        _set_env(monkeypatch)
+        assert recent_seeding.thread_canonical_enabled() is False
+        with patch("httpx.Client") as client_cls:
+            assert recent_seeding.append_turn_canonical_async("c", "hi", "ho") is None
+            # direct arm still gated by its own seeding flag (also off here).
+            assert recent_seeding.append_turn_async("c", "hi", "ho") is None
+        client_cls.assert_not_called()
+
+    def test_direct_arm_unaffected_by_canonical_flag(self, monkeypatch):
+        """Turning on the canonical flag must not change append_turn_async's
+        own behaviour (it remains gated solely on HERMES_RECENT_SEEDING_ENABLED).
+        """
+        _set_env(monkeypatch, HERMES_THREAD_CANONICAL="1")  # canonical on, seeding off
+        with patch("httpx.Client") as client_cls:
+            assert recent_seeding.append_turn_async("c", "hi", "ho") is None
+        client_cls.assert_not_called()

@@ -83,6 +83,16 @@ def _write_timeout() -> float:
         return _DEFAULT_WRITE_TIMEOUT
 
 
+def _neutralize_fence(text: str) -> str:
+    """Defang the ``<recent-shared-context>`` delimiters inside a turn so that
+    attacker/user-authored content cannot close the fence early and smuggle text
+    OUTSIDE the data block (indirect prompt-injection). Escapes both tags."""
+    return (
+        text.replace("</recent-shared-context>", "&lt;/recent-shared-context&gt;")
+        .replace("<recent-shared-context>", "&lt;recent-shared-context&gt;")
+    )
+
+
 def format_seed_block(turns: List[dict]) -> str:
     """Render recent shared turns into a fenced context block.
 
@@ -98,7 +108,9 @@ def format_seed_block(turns: List[dict]) -> str:
         content = str(turn.get("content", "") or "").strip()
         if not role or not content:
             continue
-        lines.append(f"{role}: {content}")
+        # Defang fence delimiters embedded in a turn so it cannot close the
+        # <recent-shared-context> block early and smuggle text out of it.
+        lines.append(f"{_neutralize_fence(role)}: {_neutralize_fence(content)}")
     if not lines:
         return ""
     body = "\n".join(lines)

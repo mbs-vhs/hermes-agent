@@ -124,7 +124,12 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
             return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
+        # We only reach here with the guard ENABLED (the disabled path returned
+        # None above).  A scanner exception must FAIL CLOSED: callers treat a
+        # non-empty return as "blocked" and roll back the write, so returning
+        # None here would silently allow an unscanned skill through (CLAWD-1676).
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
+        return f"Security scan errored (fail-closed): {e}"
     return None
 
 import yaml

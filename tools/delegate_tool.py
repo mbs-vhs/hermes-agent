@@ -2189,7 +2189,14 @@ def delegate_task(
         completed_count = 0
         spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-        with ThreadPoolExecutor(max_workers=max_children) as executor:
+        # NOTE: deliberately NOT using `with ThreadPoolExecutor(...) as executor`.
+        # The context-manager exit calls shutdown(wait=True), which can block the
+        # parent until a stuck child reaches its next interrupt boundary (up to
+        # child_timeout) — defeating /stop responsiveness (CLAWD-1673).  On the
+        # interrupt path we shut down with wait=False below and bail; the finally
+        # guarantees the executor is always torn down without re-waiting.
+        executor = ThreadPoolExecutor(max_workers=max_children)
+        try:
             futures = {}
             for i, t, child in children:
                 future = executor.submit(
@@ -2247,6 +2254,11 @@ def delegate_task(
                             }
                         results.append(entry)
                         completed_count += 1
+                    # Don't wait on the still-running children: cancel any
+                    # not-yet-started futures and return the already-built
+                    # results immediately rather than falling through to the
+                    # implicit shutdown(wait=True) (CLAWD-1673).
+                    executor.shutdown(wait=False, cancel_futures=True)
                     break
 
                 from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
@@ -2299,6 +2311,11 @@ def delegate_task(
                             )
                         except Exception as e:
                             logger.debug("Spinner update_text failed: %s", e)
+        finally:
+            # Always tear the executor down without re-waiting.  On the normal
+            # path `pending` is already empty (every future collected), so this
+            # is a no-op wait; on the interrupt path it must not re-block.
+            executor.shutdown(wait=False)
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])

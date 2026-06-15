@@ -72,11 +72,17 @@ class TestSchema:
 
     def test_action_enum_lists_all_verbs(self):
         enum = WORKFLOW_AUTHORING_SCHEMA["parameters"]["properties"]["action"]["enum"]
-        assert set(enum) == {"define", "run", "revise", "show", "tail"}
+        assert set(enum) == {
+            "define", "run", "revise", "show", "tail",
+            "schedule", "trigger", "emit", "schedules", "triggers",
+        }
 
     def test_properties_cover_all_params(self):
         props = WORKFLOW_AUTHORING_SCHEMA["parameters"]["properties"]
-        for key in ("action", "name", "steps", "input", "run_id", "version", "status", "limit"):
+        for key in (
+            "action", "name", "steps", "input", "run_id", "version", "status", "limit",
+            "cron_expr", "event_pattern", "event", "payload",
+        ):
             assert key in props
 
 
@@ -295,6 +301,123 @@ class TestTail:
         assert kwargs["params"] == {"name": "enrich", "status": "done", "limit": 5}
         assert result["count"] == 1
         assert result["runs"][0]["run_id"] == "r1"
+
+
+# =========================================================================
+# 6b. Ignition verbs (CLAWD-1710): schedule / trigger / emit / lists
+# =========================================================================
+class TestSchedule:
+    def test_post_to_schedule_with_cron_and_input(self):
+        resp = _mock_response(200, {
+            "schedule_id": "s1", "name": "enrich", "cron_expr": "0 6 * * *",
+            "next_run_at": "2026-06-16T06:00:00-06:00",
+        })
+        factory = _patched_client(resp)
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(
+                action="schedule", name="enrich", cron_expr="0 6 * * *", input={"x": 1},
+            ))
+        args, kwargs = factory.client.request.call_args
+        assert args[0] == "POST"
+        assert args[1].endswith("/workflows/schedule")
+        assert kwargs["json"] == {"name": "enrich", "cron_expr": "0 6 * * *", "input": {"x": 1}}
+        assert result["success"] is True
+        assert result["schedule_id"] == "s1"
+
+    def test_missing_name_no_http(self):
+        factory = _patched_client(_mock_response())
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(action="schedule", cron_expr="* * * * *"))
+        assert result["success"] is False
+        factory.assert_not_called()
+
+    def test_missing_cron_no_http(self):
+        factory = _patched_client(_mock_response())
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(action="schedule", name="enrich"))
+        assert result["success"] is False
+        factory.assert_not_called()
+
+
+class TestTrigger:
+    def test_post_to_trigger_with_input_template(self):
+        resp = _mock_response(200, {
+            "trigger_id": "t1", "name": "enrich", "event_pattern": "plane_*",
+        })
+        factory = _patched_client(resp)
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(
+                action="trigger", name="enrich", event_pattern="plane_*", input={"base": 1},
+            ))
+        args, kwargs = factory.client.request.call_args
+        assert args[0] == "POST"
+        assert args[1].endswith("/workflows/trigger")
+        assert kwargs["json"] == {
+            "name": "enrich", "event_pattern": "plane_*", "input_template": {"base": 1},
+        }
+        assert result["trigger_id"] == "t1"
+
+    def test_missing_event_pattern_no_http(self):
+        factory = _patched_client(_mock_response())
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(action="trigger", name="enrich"))
+        assert result["success"] is False
+        factory.assert_not_called()
+
+
+class TestEmit:
+    def test_post_to_events_with_payload(self):
+        resp = _mock_response(200, {
+            "event": "council_ruling", "count": 1,
+            "started": [{"name": "council_execution", "run_id": "r9"}],
+        })
+        factory = _patched_client(resp)
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(
+                action="emit", event="council_ruling", payload={"meeting_id": "m1"},
+            ))
+        args, kwargs = factory.client.request.call_args
+        assert args[0] == "POST"
+        assert args[1].endswith("/workflows/events")
+        assert kwargs["json"] == {"event": "council_ruling", "payload": {"meeting_id": "m1"}}
+        assert result["count"] == 1
+        assert result["started"][0]["run_id"] == "r9"
+
+    def test_missing_event_no_http(self):
+        factory = _patched_client(_mock_response())
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(action="emit"))
+        assert result["success"] is False
+        factory.assert_not_called()
+
+
+class TestLists:
+    def test_schedules_get_with_optional_name(self):
+        resp = _mock_response(200, {"count": 1, "schedules": [
+            {"schedule_id": "s1", "name": "enrich", "cron_expr": "0 6 * * *",
+             "enabled": True, "next_run_at": "2026-06-16T06:00:00-06:00"},
+        ]})
+        factory = _patched_client(resp)
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(action="schedules", name="enrich"))
+        args, kwargs = factory.client.request.call_args
+        assert args[0] == "GET"
+        assert args[1].endswith("/workflows/schedules")
+        assert kwargs["params"] == {"name": "enrich"}
+        assert result["schedules"][0]["schedule_id"] == "s1"
+
+    def test_triggers_get(self):
+        resp = _mock_response(200, {"count": 1, "triggers": [
+            {"trigger_id": "t1", "name": "council_execution",
+             "event_pattern": "council_ruling", "enabled": True},
+        ]})
+        factory = _patched_client(resp)
+        with patch("tools.workflow_authoring_tool.httpx.Client", factory):
+            result = json.loads(workflow_authoring_tool(action="triggers"))
+        args, _ = factory.client.request.call_args
+        assert args[0] == "GET"
+        assert args[1].endswith("/workflows/triggers")
+        assert result["triggers"][0]["event_pattern"] == "council_ruling"
 
 
 # =========================================================================

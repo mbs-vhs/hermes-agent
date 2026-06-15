@@ -2177,21 +2177,16 @@ class AIAgent:
         # BEFORE the memory-manager guard so it is independent of whether an
         # external memory provider is configured. Shares the interrupted gate.
         try:
-            from agent.recent_seeding import (
-                append_turn_async,
-                append_turn_canonical_async,
-                thread_canonical_enabled,
-            )
-            # Either/or (CLAWD-1621 / ADR-067): when HERMES_THREAD_CANONICAL is
-            # on, land the turn in the canonical clawd thread (which carries it
-            # to convturns via the same bridge) INSTEAD of the direct convturns
-            # append. Flag OFF => byte-identical to before. Both arms no-op on an
-            # empty id / missing exchange side and run off the critical path.
+            from agent.recent_seeding import append_turn_async
+            # Mirror the completed exchange into the shared (person, agent)
+            # recent-turns window. append_turn_async self-suppresses when seeding
+            # is disabled, the id is empty, the exchange is incomplete, OR the
+            # canonical clawd-thread write owns the convturns write
+            # (HERMES_THREAD_CANONICAL on — the mnemosyne provider posts the turn
+            # to the (person,agent) thread, which bridges it into convturns;
+            # ADR-067 / CLAWD-1621). Off the critical path; never blocks return.
             _cid = getattr(self, "_shared_conversation_id", "") or ""
-            if thread_canonical_enabled():
-                append_turn_canonical_async(_cid, original_user_message, final_response)
-            else:
-                append_turn_async(_cid, original_user_message, final_response)
+            append_turn_async(_cid, original_user_message, final_response)
         except Exception:
             pass
         if not (self._memory_manager and final_response and original_user_message):

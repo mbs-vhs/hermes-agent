@@ -183,10 +183,25 @@ def append_turn_async(
 
     POSTs user then assistant (chronological) in a daemon thread so it never
     blocks the turn's return path.  No-op (returns ``None``) when disabled, the
-    id is empty, or either side of the exchange is missing.  The caller is
-    responsible for the ``interrupted`` gate (don't call on interrupted turns).
+    id is empty, either side of the exchange is missing, OR the canonical
+    clawd-thread write owns the convturns write (``HERMES_THREAD_CANONICAL`` on).
+    The caller is responsible for the ``interrupted`` gate (don't call on
+    interrupted turns).
+
+    Embodiment Phase 2a (ADR-067 / CLAWD-1621): when ``HERMES_THREAD_CANONICAL``
+    is on, the mnemosyne provider lands each turn in the canonical
+    ``(person, agent)`` thread (``POST /chat/conversation/{cid}/turn``), which
+    bridges it into convturns. This direct convturns append must then SUPPRESS
+    itself so the turn is not double-landed — the two producers are mutually
+    exclusive, gated on the SAME flag. Flag OFF (default) => unchanged direct
+    append (byte-identical to today). The READ path (``read_recent_seed``) is
+    unaffected by this flag — it reads convturns regardless of who wrote it.
     """
     if not seeding_enabled() or not conversation_id:
+        return None
+    if thread_canonical_enabled():
+        # The canonical thread-write (mnemosyne provider) owns the convturns
+        # write when the flag is on; suppress the direct append (no double-land).
         return None
     user_text = (user_message or "").strip() if isinstance(user_message, str) else ""
     assistant_text = (assistant_response or "").strip() if isinstance(assistant_response, str) else ""
@@ -203,97 +218,33 @@ def append_turn_async(
 
 
 # ---------------------------------------------------------------------------
-# Thread-canonical append (Embodiment Phase 2a / CLAWD-1621, ADR-067).
+# Thread-canonical SUPPRESS gate (Embodiment Phase 2a / CLAWD-1621, ADR-067).
 #
-# When HERMES_THREAD_CANONICAL is truthy the gateway lands the completed turn in
-# the canonical clawd (person, agent) chat thread via the new
-# POST /chat/conversation/{cid}/turn endpoint INSTEAD of writing the Redis
-# recent-turns window directly. The endpoint runs the same recent-turns bridge
-# voice/Control use, so the turn still reaches convturns -- through the thread,
-# not around it. This is the EITHER/OR design (flag ON => thread-write; OFF =>
-# direct convturns append) -- so there is no double-land.
+# The canonical thread-write itself was RELOCATED out of Hermes core into the
+# mnemosyne provider (~/dev/hermes-mnemosyne-provider, which we own) — its
+# sync_turn lands each completed turn in the clawd (person, agent) thread via
+# POST /chat/conversation/{cid}/turn, which bridges the turn into convturns. The
+# provider is the right plugin seam (no core edit) and its role-aware write fixes
+# the CLAWD-1686 partial-success double-land that the old in-core fallback caused.
 #
-# Fail-OPEN: a turn must never be lost. If the canonical write fails for ANY
-# reason (exception or non-2xx on either POST) the worker falls back to the
-# existing direct convturns append (_append_worker), so a slow/broken clawd
-# thread-write degrades to today's behaviour rather than dropping the turn.
+# All that remains here is the SUPPRESS gate: when HERMES_THREAD_CANONICAL is on,
+# the provider owns the convturns write, so ``append_turn_async`` (the direct
+# convturns append) must no-op to avoid double-landing the turn. The two
+# producers are mutually exclusive, keyed on this SAME flag.
 # ---------------------------------------------------------------------------
 
 
 def thread_canonical_enabled() -> bool:
-    """Gate for landing turns in the canonical clawd thread (default OFF).
+    """Suppress gate for the direct convturns append (default OFF).
 
-    When OFF the gateway behaves byte-identically to today (direct convturns
-    append via ``append_turn_async``). Mirrors ``seeding_enabled()``.
+    When ON, the mnemosyne provider's canonical thread-write owns the convturns
+    write (via the clawd thread + bridge), so ``append_turn_async`` suppresses
+    its direct append to avoid a double-land. When OFF the gateway behaves
+    byte-identically to today (direct convturns append). Mirrors
+    ``seeding_enabled()``; reads the SAME ``HERMES_THREAD_CANONICAL`` env the
+    provider keys its canonical write on.
     """
     return os.environ.get("HERMES_THREAD_CANONICAL", "").strip().lower() in _TRUTHY
-
-
-def _canonical_post_turn(client: "object", base_url: str, conversation_id: str,
-                         role: str, content: str) -> None:
-    """POST one turn to the cid-keyed canonical-thread endpoint.
-
-    Raises on a non-2xx so the worker can fall back to the direct convturns
-    append (fail-open). Mirrors ``_post_turn`` but targets the new endpoint and
-    sends the ``{role, content}`` body the route expects (privacy_class defaults
-    to ``work_videotape`` server-side, matching the voice/Control thread class).
-    """
-    url = f"{base_url}/chat/conversation/{conversation_id}/turn"
-    resp = client.post(url, json={"role": role, "content": content})  # type: ignore[attr-defined]
-    status = getattr(resp, "status_code", 0)
-    if not (200 <= status < 300):
-        raise RuntimeError(f"canonical thread-write non-2xx ({status})")
-
-
-def _append_canonical_worker(conversation_id: str, user_text: str,
-                             assistant_text: str) -> None:
-    """Land the completed turn in the canonical clawd thread; fall back to the
-    direct convturns append on ANY failure (fail-open -- never drop the turn)."""
-    try:
-        import httpx
-
-        base_url = _base_url()
-        with httpx.Client(timeout=_write_timeout(), headers=_auth_headers()) as client:
-            # Chronological order: user turn first, then assistant turn.
-            _canonical_post_turn(client, base_url, conversation_id, "user", user_text)
-            _canonical_post_turn(client, base_url, conversation_id, "assistant", assistant_text)
-    except Exception as exc:  # noqa: BLE001 -- fail open: fall back to direct convturns.
-        logger.debug(
-            "canonical thread-write failed (%s); falling back to direct convturns append",
-            exc,
-        )
-        _append_worker(conversation_id, user_text, assistant_text)
-
-
-def append_turn_canonical_async(
-    conversation_id: str,
-    user_message: Optional[str],
-    assistant_response: Optional[str],
-) -> Optional[threading.Thread]:
-    """Fire-and-forget land of a completed turn in the canonical clawd thread.
-
-    Same daemon-thread / off-critical-path / no-op gating contract as
-    ``append_turn_async`` (the OTHER arm of the either/or), but writes the
-    clawd thread via ``POST /chat/conversation/{cid}/turn`` and fails OPEN to
-    the direct convturns append. Gated on ``thread_canonical_enabled()`` -- the
-    caller selects this OR ``append_turn_async`` per the flag, never both.
-    No-op (returns ``None``) when the flag is off, the id is empty, or either
-    side of the exchange is missing.
-    """
-    if not thread_canonical_enabled() or not conversation_id:
-        return None
-    user_text = (user_message or "").strip() if isinstance(user_message, str) else ""
-    assistant_text = (assistant_response or "").strip() if isinstance(assistant_response, str) else ""
-    if not user_text or not assistant_text:
-        return None
-    thread = threading.Thread(
-        target=_append_canonical_worker,
-        args=(conversation_id, user_text, assistant_text),
-        daemon=True,
-        name="thread-canonical-append",
-    )
-    thread.start()
-    return thread
 
 
 __all__ = [
@@ -302,5 +253,4 @@ __all__ = [
     "read_recent_seed",
     "append_turn_async",
     "thread_canonical_enabled",
-    "append_turn_canonical_async",
 ]

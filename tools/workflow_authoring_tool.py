@@ -133,8 +133,12 @@ def workflow_authoring_tool(
     version: int | None = None,
     status: str | None = None,
     limit: int | None = None,
+    cron_expr: str | None = None,
+    event_pattern: str | None = None,
+    event: str | None = None,
+    payload: Any = None,
 ) -> str:
-    """Author / run / inspect / self-correct a durable clawd workflow. Returns JSON."""
+    """Author / run / inspect / self-correct / IGNITE a durable clawd workflow. Returns JSON."""
     action = (action or "").strip().lower()
 
     if action == "define":
@@ -268,8 +272,133 @@ def workflow_authoring_tool(
             ],
         })
 
+    # --- P2 ignition verbs (CLAWD-1710): schedule / trigger / emit / lists -------
+    if action == "schedule":
+        if not name or not str(name).strip():
+            return _err("'name' is required for schedule")
+        if not cron_expr or not str(cron_expr).strip():
+            return _err("'cron_expr' (a 5-field cron expression) is required for schedule")
+        body: dict[str, Any] = {"name": str(name).strip(), "cron_expr": str(cron_expr).strip()}
+        coerced = _coerce_input(input)
+        if coerced is not None:
+            body["input"] = coerced
+        data, error = _request("POST", "/workflows/schedule", json_body=body)
+        if error:
+            return error
+        return json.dumps({
+            "success": True,
+            "action": "schedule",
+            "schedule_id": data.get("schedule_id"),
+            "name": data.get("name"),
+            "cron_expr": data.get("cron_expr"),
+            "next_run_at": data.get("next_run_at"),
+            "message": (
+                f"Scheduled {data.get('name')!r} on cron {data.get('cron_expr')!r}; "
+                f"next run {data.get('next_run_at')}."
+            ),
+        })
+
+    if action == "trigger":
+        if not name or not str(name).strip():
+            return _err("'name' is required for trigger")
+        if not event_pattern or not str(event_pattern).strip():
+            return _err(
+                "'event_pattern' (an exact clawd event name or a trailing-'*' prefix) "
+                "is required for trigger"
+            )
+        body = {"name": str(name).strip(), "event_pattern": str(event_pattern).strip()}
+        coerced = _coerce_input(input)
+        if coerced is not None:
+            body["input_template"] = coerced
+        data, error = _request("POST", "/workflows/trigger", json_body=body)
+        if error:
+            return error
+        return json.dumps({
+            "success": True,
+            "action": "trigger",
+            "trigger_id": data.get("trigger_id"),
+            "name": data.get("name"),
+            "event_pattern": data.get("event_pattern"),
+            "message": (
+                f"Trigger registered: clawd event {data.get('event_pattern')!r} now starts "
+                f"workflow {data.get('name')!r}."
+            ),
+        })
+
+    if action == "emit":
+        if not event or not str(event).strip():
+            return _err("'event' (the clawd event name to fire) is required for emit")
+        body = {"event": str(event).strip()}
+        coerced_payload = _coerce_input(payload)
+        if coerced_payload is not None:
+            body["payload"] = coerced_payload
+        data, error = _request("POST", "/workflows/events", json_body=body)
+        if error:
+            return error
+        started = data.get("started") or []
+        return json.dumps({
+            "success": True,
+            "action": "emit",
+            "event": data.get("event"),
+            "count": data.get("count"),
+            "started": [
+                {"name": s.get("name"), "run_id": s.get("run_id"), "error": s.get("error")}
+                for s in started
+            ],
+            "message": (
+                f"Fired event {data.get('event')!r}; started {data.get('count')} run(s). "
+                "Use action='show' with a run_id to follow one."
+            ),
+        })
+
+    if action == "schedules":
+        params: dict[str, Any] = {}
+        if name and str(name).strip():
+            params["name"] = str(name).strip()
+        data, error = _request("GET", "/workflows/schedules", params=params or None)
+        if error:
+            return error
+        return json.dumps({
+            "success": True,
+            "action": "schedules",
+            "count": data.get("count"),
+            "schedules": [
+                {
+                    "schedule_id": s.get("schedule_id"),
+                    "name": s.get("name"),
+                    "cron_expr": s.get("cron_expr"),
+                    "enabled": s.get("enabled"),
+                    "next_run_at": s.get("next_run_at"),
+                }
+                for s in (data.get("schedules") or [])
+            ],
+        })
+
+    if action == "triggers":
+        params = {}
+        if name and str(name).strip():
+            params["name"] = str(name).strip()
+        data, error = _request("GET", "/workflows/triggers", params=params or None)
+        if error:
+            return error
+        return json.dumps({
+            "success": True,
+            "action": "triggers",
+            "count": data.get("count"),
+            "triggers": [
+                {
+                    "trigger_id": t.get("trigger_id"),
+                    "name": t.get("name"),
+                    "event_pattern": t.get("event_pattern"),
+                    "enabled": t.get("enabled"),
+                }
+                for t in (data.get("triggers") or [])
+            ],
+        })
+
     return _err(
-        f"unknown action {action!r}; expected one of: define, run, revise, show, tail"
+        f"unknown action {action!r}; expected one of: define, run, revise, show, tail, "
+        "schedule, trigger, emit, schedules, triggers"
     )
 
 
@@ -290,15 +419,27 @@ WORKFLOW_AUTHORING_SCHEMA = {
         "- show: inspect one run. Provide 'run_id'. Returns status, current step, each "
         "step's checkpoint (status/cost/latency), and the result or error.\n"
         "- tail: list recent runs. Optional 'name' and/or 'status' to scope.\n"
-        "Runs execute durably in the background — after 'run' or 'revise', use 'show' "
-        "to follow progress to done."
+        "IGNITION (how a run starts beyond a manual 'run'):\n"
+        "- schedule: run a workflow on a cron. Provide 'name' and 'cron_expr' (5-field, "
+        "Denver-local, e.g. '0 6 * * *'); optional 'input'.\n"
+        "- trigger: start a workflow when a clawd event fires. Provide 'name' and "
+        "'event_pattern' (an exact event name or a trailing-'*' prefix); optional 'input' "
+        "as the default payload.\n"
+        "- emit: fire a clawd event now (starts any matching triggered workflow). Provide "
+        "'event' and optional 'payload'.\n"
+        "- schedules / triggers: list the registered schedules / triggers (optional 'name').\n"
+        "Runs execute durably in the background — after 'run', 'revise', 'schedule', or "
+        "'emit', use 'show' to follow a run to done."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["define", "run", "revise", "show", "tail"],
+                "enum": [
+                    "define", "run", "revise", "show", "tail",
+                    "schedule", "trigger", "emit", "schedules", "triggers",
+                ],
                 "description": "Which verb to perform.",
             },
             "name": {
@@ -324,7 +465,10 @@ WORKFLOW_AUTHORING_SCHEMA = {
             },
             "input": {
                 "type": "object",
-                "description": "Run input payload (for run) — the first step's input.",
+                "description": (
+                    "A data object: the first step's input (for run / schedule), or the "
+                    "default payload merged under the event (for trigger)."
+                ),
             },
             "run_id": {
                 "type": "string",
@@ -341,6 +485,25 @@ WORKFLOW_AUTHORING_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": "Optional: max runs to return for tail (default 20).",
+            },
+            "cron_expr": {
+                "type": "string",
+                "description": "5-field cron expression for schedule (Denver-local, e.g. '0 6 * * *').",
+            },
+            "event_pattern": {
+                "type": "string",
+                "description": (
+                    "For trigger: the clawd event that starts the workflow — an exact event "
+                    "name or a trailing-'*' prefix (e.g. 'plane_*')."
+                ),
+            },
+            "event": {
+                "type": "string",
+                "description": "For emit: the clawd event name to fire now.",
+            },
+            "payload": {
+                "type": "object",
+                "description": "For emit: the event payload (becomes the started runs' input).",
             },
         },
         "required": ["action"],
@@ -361,6 +524,10 @@ registry.register(
         version=args.get("version"),
         status=args.get("status"),
         limit=args.get("limit"),
+        cron_expr=args.get("cron_expr"),
+        event_pattern=args.get("event_pattern"),
+        event=args.get("event"),
+        payload=args.get("payload"),
     ),
     check_fn=check_workflow_authoring_requirements,
     requires_env=["CLAWD_API_AUTH_TOKEN"],

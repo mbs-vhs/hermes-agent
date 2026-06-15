@@ -61,6 +61,9 @@ _HERMES_CORE_TOOLS = [
     # Mail compose — draft a new outbound email into Control (gated on the clawd
     # mail tokens via check_fn; approve-before-send, the agent never sends). CLAWD-1527.
     "mail_compose",
+    # Workflow authoring — define/run/revise/show/tail a durable clawd workflow
+    # from chat (gated on CLAWD_API_AUTH_TOKEN via check_fn). CLAWD-1709.
+    "workflow_authoring",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is

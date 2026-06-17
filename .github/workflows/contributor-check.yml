@@ -36,9 +36,13 @@ jobs:
           # Check each email against AUTHOR_MAP in release.py
           MISSING=""
           while IFS= read -r email; do
-            # Skip teknium and bot emails
+            # Skip teknium and bot emails. Minerva-fork: also skip our own
+            # operator/mesh domains — this is an upstream (Nous) release-
+            # attribution check; OUR commit emails will never be in their
+            # AUTHOR_MAP, so without this every fork PR authored as
+            # morgan@videotape.ai (etc.) fails the check and emails the operator.
             case "$email" in
-              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
+              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*|*videotape.ai*|*vhs.dev*|*vhs.box*|*stempf*)
                 continue ;;
             esac
 

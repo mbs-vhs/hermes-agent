@@ -197,6 +197,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "mail": {
+        "description": "Mail compose: draft an outbound email into Control for approve-before-send (the agent drafts, never sends). Gated on clawd mail tokens via check_fn. CLAWD-1527.",
+        "tools": ["mail_compose"],
+        "includes": []
+    },
+
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",

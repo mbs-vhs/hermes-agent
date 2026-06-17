@@ -85,6 +85,29 @@ def test_get_platform_tools_default_telegram_includes_messaging():
     assert "messaging" in enabled
 
 
+def test_configurable_toolsets_include_mail():
+    assert any(ts_key == "mail" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
+
+
+def test_mail_toolset_resolves_to_mail_compose():
+    # Regression (CLAWD-1527): mail_compose lives in _HERMES_CORE_TOOLS but had
+    # no TOOLSETS group, so _get_platform_tools could never surface it. The
+    # "mail" group must resolve to exactly the mail_compose tool.
+    from toolsets import resolve_toolset
+
+    assert "mail_compose" in set(resolve_toolset("mail"))
+
+
+def test_get_platform_tools_default_telegram_includes_mail():
+    # Symmetric to messaging: mail_compose is in the hermes-telegram composite
+    # (_HERMES_CORE_TOOLS), so the "mail" toolset reverse-maps to enabled on the
+    # default telegram config. Runtime availability still gates on check_fn
+    # (CLAWD_API_AUTH_TOKEN + MAIL_AGENT_TOKEN).
+    enabled = _get_platform_tools({}, "telegram")
+
+    assert "mail" in enabled
+
+
 def test_get_platform_tools_default_whatsapp_includes_web():
     enabled = _get_platform_tools({}, "whatsapp")
 

@@ -108,6 +108,56 @@ def test_get_platform_tools_default_telegram_includes_mail():
     assert "mail" in enabled
 
 
+class TestMailComposeCheckFnGate:
+    """End-to-end gate: the mail_compose SCHEMA only reaches the model when
+    check_fn passes, even when the "mail" toolset key is enabled.
+
+    Scope note: these do NOT flip when the CLAWD-1527 TOOLSETS/CONFIGURABLE_
+    TOOLSETS change is reverted (mail_compose registration + its check_fn are
+    independent of the toolset wiring). They guard the *other half* of the
+    commit's correctness claim — "still gated at runtime by check_fn ... only
+    profiles with CLAWD_API_AUTH_TOKEN + MAIL_AGENT_TOKEN get the schema". The
+    per-token predicate is unit-tested in
+    tests/tools/test_mail_compose_tool.py::TestCheckRequirements; nothing else
+    proves that predicate is actually wired into registry schema emission
+    (registry.get_definitions → check_fn). This is that integration guard.
+    """
+
+    @staticmethod
+    def _mail_schema_emitted() -> bool:
+        # Importing the tool module triggers its registry.register side-effect
+        # (same pattern the tool's own TestRegistration relies on).
+        import tools.mail_compose_tool  # noqa: F401
+        from tools.registry import registry, invalidate_check_fn_cache
+
+        # The check_fn result is TTL-cached (~30s); drop it so the env flip
+        # this test just made is observed deterministically.
+        invalidate_check_fn_cache()
+        defs = registry.get_definitions({"mail_compose"}, quiet=True)
+        emitted = {d["function"]["name"] for d in defs}
+        return "mail_compose" in emitted
+
+    def test_schema_emitted_when_both_tokens_present(self, monkeypatch):
+        monkeypatch.setenv("CLAWD_API_AUTH_TOKEN", "bearer-token")
+        monkeypatch.setenv("MAIL_AGENT_TOKEN", "agent-token")
+
+        assert self._mail_schema_emitted() is True
+
+    def test_schema_suppressed_when_tokens_absent(self, monkeypatch):
+        monkeypatch.delenv("CLAWD_API_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("MAIL_AGENT_TOKEN", raising=False)
+
+        assert self._mail_schema_emitted() is False
+
+    def test_schema_suppressed_when_only_bearer_present(self, monkeypatch):
+        # The "mail" toolset key can be enabled, but a half-configured profile
+        # (bearer only, no MAIL_AGENT_TOKEN) must still get no schema.
+        monkeypatch.setenv("CLAWD_API_AUTH_TOKEN", "bearer-token")
+        monkeypatch.delenv("MAIL_AGENT_TOKEN", raising=False)
+
+        assert self._mail_schema_emitted() is False
+
+
 def test_get_platform_tools_default_whatsapp_includes_web():
     enabled = _get_platform_tools({}, "whatsapp")
 

@@ -203,7 +203,12 @@ TOOLSETS = {
         "includes": []
     },
 
-    
+    "workflow": {
+        "description": "Workflow authoring: define/run/revise/show/tail a durable clawd workflow from chat. Gated on CLAWD_API_AUTH_TOKEN via check_fn. CLAWD-1709/1758.",
+        "tools": ["workflow_authoring"],
+        "includes": []
+    },
+
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
         "tools": ["read_file", "write_file", "patch", "search_files"],

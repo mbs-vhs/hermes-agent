@@ -108,6 +108,30 @@ def test_get_platform_tools_default_telegram_includes_mail():
     assert "mail" in enabled
 
 
+def test_configurable_toolsets_include_workflow():
+    assert any(ts_key == "workflow" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
+
+
+def test_workflow_toolset_resolves_to_workflow_authoring():
+    # Regression (CLAWD-1758): workflow_authoring lives in _HERMES_CORE_TOOLS but
+    # had no TOOLSETS group, so _get_platform_tools could never surface it (same
+    # orphan bug as mail_compose/CLAWD-1527). The "workflow" group must resolve to
+    # exactly the workflow_authoring tool.
+    from toolsets import resolve_toolset
+
+    assert "workflow_authoring" in set(resolve_toolset("workflow"))
+
+
+def test_get_platform_tools_default_telegram_includes_workflow():
+    # Symmetric to mail: workflow_authoring is in the hermes-telegram composite
+    # (_HERMES_CORE_TOOLS), so the "workflow" toolset reverse-maps to enabled on
+    # the default telegram config. Runtime availability still gates on check_fn
+    # (CLAWD_API_AUTH_TOKEN).
+    enabled = _get_platform_tools({}, "telegram")
+
+    assert "workflow" in enabled
+
+
 class TestMailComposeCheckFnGate:
     """End-to-end gate: the mail_compose SCHEMA only reaches the model when
     check_fn passes, even when the "mail" toolset key is enabled.

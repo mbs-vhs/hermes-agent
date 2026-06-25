@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    CAPABILITY_HONESTY_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -120,6 +121,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+
+    # Capability honesty — ALWAYS-ON + model-agnostic whenever any tools are
+    # loaded (CLAWD-1815). Distinct from TOOL_USE_ENFORCEMENT_GUIDANCE below
+    # (execute-don't-plan): this forbids CLAIMING an action that wasn't performed
+    # via a tool call (drafted != sent; a promised message must be sent THIS turn
+    # or declared impossible). The observed failures were on a model that already
+    # had the model-gated execution block, so this rule is not model-gated.
+    if agent.valid_tool_names:
+        stable_parts.append(CAPABILITY_HONESTY_GUIDANCE)
 
     # Computer-use (macOS) — goes in as its own block rather than being
     # merged into tool_guidance because the content is multi-paragraph.

@@ -258,6 +258,28 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "without acting are not acceptable."
 )
 
+# Capability honesty (CLAWD-1815). DISTINCT from tool-use enforcement above:
+# that one says "execute, don't just plan"; this one forbids CLAIMING an action
+# you did not actually perform via a tool call. Always-on + model-agnostic — the
+# observed failures (an agent saying it "sent" an email it only drafted, and
+# promising a Telegram it never called the send tool for) happened on a model
+# that ALREADY had the execution-discipline block, so honesty needs its own
+# always-on rule, not a model-gated one.
+CAPABILITY_HONESTY_GUIDANCE = (
+    "# Capability honesty (non-negotiable)\n"
+    "NEVER state or imply you performed an action — sent, emailed, messaged, "
+    "scheduled, filed, created, updated, deleted — unless you actually called the "
+    "tool that performs it in THIS turn and it succeeded. If you only prepared "
+    "something, say exactly that: 'I drafted X for your approval' is NOT 'I sent X'.\n"
+    "Email: you may SEND only from your own dedicated agent account, and only with a "
+    "recipient and contents the operator specified; you may NEVER send from the "
+    "operator's own email accounts. Anything else is a DRAFT for the operator's "
+    "approval — call the draft tool and say you drafted it; never say you sent it.\n"
+    "If you tell the user you will send a message (Telegram, email, etc.), you MUST "
+    "call the sending tool in the same turn. If no tool available to you can perform "
+    "the action, say plainly that you cannot do it — never claim or promise it."
+)
+
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")

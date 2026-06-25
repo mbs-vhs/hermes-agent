@@ -20,6 +20,7 @@ from agent.prompt_builder import (
     build_context_files_prompt,
     build_environment_hints,
     CONTEXT_FILE_MAX_CHARS,
+    CAPABILITY_HONESTY_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
@@ -48,6 +49,22 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_capability_honesty_guidance_forbids_unbacked_action_claims(self):
+        """CLAWD-1815: never claim an action without the tool call; drafted != sent;
+        email send/draft policy; a promised message must be sent this turn or
+        declared impossible. Always-on + model-agnostic (wired in system_prompt.py)."""
+        g = CAPABILITY_HONESTY_GUIDANCE
+        # core rule: no unbacked action claims
+        assert "NEVER state or imply you performed an action" in g
+        # drafted != sent
+        assert "'I drafted X for your approval' is NOT 'I sent X'" in g
+        # email policy: own account only, NEVER the operator's accounts
+        assert "your own dedicated agent account" in g
+        assert "NEVER send from the operator's own email accounts" in g
+        # proactive message: call the tool this turn, or say you cannot
+        assert "call the sending tool in the same turn" in g
+        assert "say plainly that you cannot do it" in g
 
 
 # =========================================================================

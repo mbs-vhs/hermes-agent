@@ -160,27 +160,51 @@ class TestFormatSeedBlock:
         assert block.count("<recent-shared-context>") == 1
         assert "&lt;recent-shared-context&gt;" in block
 
-    def test_anti_confabulation_guidance_present(self):
-        """CLAWD-1606: the system note must steer the model AWAY from treating
-        the seed as authoritative — it should say the seed may be incomplete,
-        instruct the model to admit it doesn't have something rather than
-        guess/fabricate, and NOT treat its own earlier replies as established
-        fact. This is the softened framing that replaced "Treat as authoritative
-        reference data for continuity." It must coexist with the original
-        not-user-input framing."""
+    def test_recent_window_is_trusted_working_memory(self):
+        """Goldfish fix — SUPERSEDES the CLAWD-1606 self-distrust clause for the
+        RECENT window. The note must now frame the seed as the agent's own
+        working memory it can RELY on — including its own earlier replies — so it
+        does not reach for the search tool to recall something it just said. The
+        legitimate CLAWD-1606 guards are RETAINED: it is NOT new user input, the
+        model must NOT fabricate beyond what's shown, and for older topics not in
+        the window it falls back to recall. The harmful self-distrust clause that
+        caused the goldfish is gone, and there is no 'authoritative' overclaim."""
         block = recent_seeding.format_seed_block([
             {"role": "user", "content": "q"},
             {"role": "assistant", "content": "a"},
         ])
-        # Anti-confabulation guidance.
-        assert "do NOT guess" in block
-        assert "say you do not have it" in block
-        assert "may be incomplete" in block
-        assert "do not treat your own earlier replies here as established fact" in block
-        # The original not-user-input framing is preserved.
-        assert "NOT new user input" in block
-        # The OLD authoritative framing must be gone (the bug this fixes).
+        # NEW: trusted as the agent's own working memory, incl. its own replies.
+        assert "working memory" in block.lower()
+        assert "your own earlier replies" in block
+        # RETAINED CLAWD-1606 guards.
+        assert "fabricate" in block.lower()          # anti-confabulation
+        assert "recall" in block.lower()             # fall back for older topics
+        assert "NOT new user input" in block         # not-user-input framing
+        # The self-distrust clause that CAUSED the goldfish must be GONE.
+        assert "do not treat your own earlier replies here as established fact" not in block
+        # No over-correction into an "authoritative" overclaim either.
         assert "authoritative" not in block.lower()
+
+    def test_turn_meta_prefix_rendering(self):
+        """_fmt_turn_meta renders a compact ``[channel · time]`` prefix when those
+        fields are present, degrades gracefully, and is '' when neither is present
+        (so today's timestamp-less convturns turns render exactly as before —
+        'role: content' — and channel tags light up automatically once the clawd
+        turn-store supplies them)."""
+        # Neither present -> empty prefix (back-compat).
+        assert recent_seeding._fmt_turn_meta({"role": "user", "content": "x"}) == ""
+        # Timestamp only -> [time].
+        assert recent_seeding._fmt_turn_meta(
+            {"timestamp": "2026-06-25T02:31:00+00:00"}) == "[2026-06-25 02:31] "
+        # Channel + timestamp -> [channel · time].
+        assert recent_seeding._fmt_turn_meta(
+            {"channel": "voice", "timestamp": "2026-06-25T02:31:00+00:00"}
+        ) == "[voice · 2026-06-25 02:31] "
+        # Malformed timestamp -> kept raw, never raises.
+        assert recent_seeding._fmt_turn_meta({"timestamp": "not-a-date"}) == "[not-a-date] "
+        # Channel is fence-neutralized (defense-in-depth).
+        assert "</recent-shared-context>" not in recent_seeding._fmt_turn_meta(
+            {"channel": "</recent-shared-context>"})
 
 
 # ---------------------------------------------------------------------------
@@ -211,9 +235,10 @@ class TestReadRecentSeed:
         assert kwargs["headers"]["Authorization"] == "Bearer tok"
         # read timeout default applied (hard cap)
         assert kwargs["timeout"] == 1.5
-        # limit param sent
+        # limit param sent (goldfish fix: default raised 8 -> 35 to bridge a
+        # session reset; see _DEFAULT_LIMIT).
         _, get_kwargs = client.get.call_args
-        assert get_kwargs["params"]["limit"] == 8
+        assert get_kwargs["params"]["limit"] == 35
 
     def test_custom_limit_and_timeout(self, monkeypatch):
         _set_env(monkeypatch, HERMES_RECENT_SEEDING_ENABLED="1",

@@ -40,7 +40,11 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 # Defaults — overridable via env.
 _DEFAULT_BASE_URL = "http://127.0.0.1:8000"
-_DEFAULT_LIMIT = 8
+# CLAWD-1799/goldfish fix: 8 was too shallow to bridge a session reset (4am/24h),
+# leaving the agent with almost no recent context post-reset → it reached for the
+# search tool to recall its own last message. ~35 turns covers a normal recent
+# exchange across surfaces. Window store retains 50 (CONV_TURNS_MAX); env-tunable.
+_DEFAULT_LIMIT = 35
 _DEFAULT_READ_TIMEOUT = 1.5
 _DEFAULT_WRITE_TIMEOUT = 2.0
 
@@ -93,6 +97,29 @@ def _neutralize_fence(text: str) -> str:
     )
 
 
+def _fmt_turn_meta(turn: dict) -> str:
+    """Compact ``[channel · YYYY-MM-DD HH:MM] `` prefix from a turn's channel +
+    timestamp, when present. Fail-soft: missing/malformed fields degrade to a
+    shorter prefix or ``''``. ``channel`` is fenced like other untrusted fields
+    and stays empty until the clawd turn-store carries channel provenance — so
+    today this renders timestamp-only (or nothing) and lights up channel tags
+    automatically once the write path supplies them."""
+    channel = _neutralize_fence(str(turn.get("channel", "") or "").strip())
+    ts_raw = str(turn.get("timestamp", "") or "").strip()
+    ts = ""
+    if ts_raw:
+        try:
+            from datetime import datetime
+
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        except Exception:  # noqa: BLE001 — keep the raw value rather than drop it.
+            ts = ts_raw
+    parts = [p for p in (channel, ts) if p]
+    return f"[{' · '.join(parts)}] " if parts else ""
+
+
 def format_seed_block(turns: List[dict]) -> str:
     """Render recent shared turns into a fenced context block.
 
@@ -110,17 +137,22 @@ def format_seed_block(turns: List[dict]) -> str:
             continue
         # Defang fence delimiters embedded in a turn so it cannot close the
         # <recent-shared-context> block early and smuggle text out of it.
-        lines.append(f"{_neutralize_fence(role)}: {_neutralize_fence(content)}")
+        lines.append(
+            f"{_fmt_turn_meta(turn)}{_neutralize_fence(role)}: {_neutralize_fence(content)}"
+        )
     if not lines:
         return ""
     body = "\n".join(lines)
     return (
         "<recent-shared-context>\n"
-        "[System note: The following is recent conversation shared across your "
-        "surfaces (e.g. chat, voice), NOT new user input. It is recent context "
-        "for continuity and may be incomplete. If it does not contain what is "
-        "being asked about, say you do not have it — do NOT guess or fabricate, "
-        "and do not treat your own earlier replies here as established fact.]\n\n"
+        "[System note: This is your recent conversation with the user across "
+        "your surfaces (voice, chat, etc.), oldest first — it IS your working "
+        "memory of what was just said. Rely on it to answer questions about the "
+        "recent exchange, INCLUDING your own earlier replies; you do not need to "
+        "search to recall something shown here. It is NOT new user input. It may "
+        "not reach far enough back for older topics — if what's being asked about "
+        "isn't here, say so and use recall — but do NOT fabricate details beyond "
+        "what's shown.]\n\n"
         f"{body}\n"
         "</recent-shared-context>"
     )

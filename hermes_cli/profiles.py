@@ -425,6 +425,15 @@ class ProfileInfo:
     # surfaces a "review" badge in this case so the user can edit or
     # accept.
     description_auto: bool = False
+    # Canonical persona name + role for this profile, synced from the
+    # clawd ``agent_registry`` roster SSOT (CLAWD-1828 P3). Persisted in
+    # ``<profile_dir>/profile.yaml``. ``None`` when the profile has not
+    # been synced (legacy profiles, fresh installs) — consumers fall back
+    # to the profile id. Lets surfaces (e.g. hermes-webui / chat.vhs.box)
+    # render "Quasimodo — Engineer" instead of the bare profile id
+    # "engineer".
+    display_name: Optional[str] = None
+    role: Optional[str] = None
 
 
 def _read_distribution_meta(profile_dir: Path) -> tuple:
@@ -514,25 +523,37 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
-    Returns ``{"description": "", "description_auto": False}`` when the
-    file is missing or unreadable. Never raises — a corrupt
-    profile.yaml on an unrelated profile must not break
+    Returns the empty defaults
+    (``{"description": "", "description_auto": False, "display_name": None,
+    "role": None}``) when the file is missing or unreadable. Never raises —
+    a corrupt profile.yaml on an unrelated profile must not break
     ``hermes profile list``.
+
+    ``display_name`` / ``role`` are the canonical persona name + role synced
+    from the clawd roster SSOT (CLAWD-1828 P3); ``None`` when unset.
     """
+    empty = {
+        "description": "",
+        "description_auto": False,
+        "display_name": None,
+        "role": None,
+    }
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False}
+        return dict(empty)
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return {"description": "", "description_auto": False}
+        return dict(empty)
     if not isinstance(data, dict):
-        return {"description": "", "description_auto": False}
+        return dict(empty)
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
+        "display_name": (str(data.get("display_name") or "").strip() or None),
+        "role": (str(data.get("role") or "").strip() or None),
     }
 
 
@@ -541,12 +562,17 @@ def write_profile_meta(
     *,
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
+    display_name: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
     Only the explicitly passed fields are overwritten; unspecified
     fields preserve existing values. Creates the file if missing.
     Profile directory itself must exist.
+
+    ``display_name`` / ``role`` are the canonical persona name + role
+    synced from the clawd roster SSOT (CLAWD-1828 P3).
     """
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
@@ -565,6 +591,10 @@ def write_profile_meta(
         existing["description"] = description.strip()
     if description_auto is not None:
         existing["description_auto"] = bool(description_auto)
+    if display_name is not None:
+        existing["display_name"] = display_name.strip()
+    if role is not None:
+        existing["role"] = role.strip()
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(existing, f, sort_keys=False, default_flow_style=False)
 
@@ -598,6 +628,8 @@ def list_profiles() -> List[ProfileInfo]:
             distribution_source=dist_source,
             description=meta.get("description", ""),
             description_auto=meta.get("description_auto", False),
+            display_name=meta.get("display_name"),
+            role=meta.get("role"),
         ))
 
     # Named profiles
@@ -628,6 +660,8 @@ def list_profiles() -> List[ProfileInfo]:
                 distribution_source=dist_source,
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
+                display_name=meta.get("display_name"),
+                role=meta.get("role"),
             ))
 
     return profiles

@@ -372,8 +372,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
-                    agent._rebuild_anthropic_client()
+                    agent._close_or_abort_anthropic_client(reason="stale_call_kill")
                 else:
                     _close_request_client_once("stale_call_kill")
             except Exception:
@@ -403,8 +402,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # seed future retries.
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
-                    agent._rebuild_anthropic_client()
+                    agent._close_or_abort_anthropic_client(reason="interrupt_abort")
                 else:
                     _close_request_client_once("interrupt_abort")
             except Exception:
@@ -1915,7 +1913,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 try:
                     if agent.api_mode == "anthropic_messages":
                         agent._try_refresh_anthropic_client_credentials()
-                        result["response"] = _call_anthropic()
+                        # #29507: stamp the owning thread for the shared
+                        # Anthropic client so the stranger-thread interrupt /
+                        # stale-stream watchdog aborts (shutdown-only) instead
+                        # of racing this worker for FD ownership in close().
+                        agent._anthropic_request_owner_tid = threading.get_ident()
+                        try:
+                            result["response"] = _call_anthropic()
+                        finally:
+                            agent._anthropic_request_owner_tid = None
                     else:
                         result["response"] = _call_chat_completions()
                     return  # success
@@ -2231,8 +2237,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if agent._interrupt_requested:
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
-                    agent._rebuild_anthropic_client()
+                    agent._close_or_abort_anthropic_client(reason="stream_interrupt_abort")
                 else:
                     _close_request_client_once("stream_interrupt_abort")
             except Exception:

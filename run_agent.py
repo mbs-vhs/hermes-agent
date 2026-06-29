@@ -2970,10 +2970,12 @@ class AIAgent:
         if new_token == self._anthropic_api_key:
             return False
 
-        try:
-            self._anthropic_client.close()
-        except Exception:
-            pass
+        # #29507: route through the thread-aware dispatch (real close only on
+        # the owner thread / when no request is in flight). rebuild=False —
+        # we install a freshly-credentialed client below.
+        self._close_or_abort_anthropic_client(
+            reason="anthropic_credential_refresh", rebuild=False
+        )
 
         try:
             self._anthropic_client = build_anthropic_client(
@@ -3044,10 +3046,12 @@ class AIAgent:
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
 
-            try:
-                self._anthropic_client.close()
-            except Exception:
-                pass
+            # #29507: thread-aware close (real close only on the owner thread /
+            # when no request is in flight). rebuild=False — we install a
+            # freshly-credentialed client below.
+            self._close_or_abort_anthropic_client(
+                reason="anthropic_credential_swap", rebuild=False
+            )
 
             self._anthropic_api_key = runtime_key
             self._anthropic_base_url = runtime_base
@@ -3097,7 +3101,14 @@ class AIAgent:
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
-        return self._anthropic_client.messages.create(**api_kwargs)
+        # #29507: stamp the owning thread so a stranger-thread stale/interrupt
+        # watchdog only shuts the shared client's sockets down rather than
+        # racing this worker for FD ownership during ``client.close()``.
+        self._anthropic_request_owner_tid = threading.get_ident()
+        try:
+            return self._anthropic_client.messages.create(**api_kwargs)
+        finally:
+            self._anthropic_request_owner_tid = None
 
     def _rebuild_anthropic_client(self) -> None:
         """Rebuild the Anthropic client after an interrupt or stale call.
@@ -3124,6 +3135,86 @@ class AIAgent:
                 timeout=get_provider_request_timeout(self.provider, self.model),
                 drop_context_1m_beta=_drop_1m,
             )
+
+    def _abort_anthropic_client(self, client: Any, *, reason: str) -> None:
+        """Cross-thread abort for the Anthropic client: shut sockets down
+        without releasing FDs.
+
+        Companion to :meth:`_abort_request_openai_client` for the Anthropic
+        transport. The shared ``_anthropic_client`` is closed by the
+        stale-call / interrupt watchdog, which runs on a *different* thread
+        than the worker driving ``messages.create`` / ``messages.stream``.
+        Calling ``client.close()`` from that stranger thread raced the
+        still-live OpenSSL BIO and could release a TLS socket FD that the
+        kernel then recycled into a concurrent ``open()`` of ``kanban.db``,
+        clobbering the SQLite header (#29507).
+
+        Here we only ``shutdown(SHUT_RDWR)`` the pool's sockets (via the
+        transport-agnostic ``force_close_tcp_sockets``). That unblocks the
+        worker thread's pending ``recv``/``send`` with EOF / ``EPIPE`` so it
+        unwinds and releases the FD from its own thread context — which is
+        where the FD release belongs.
+        """
+        if client is None:
+            return
+        try:
+            shutdown_count = self._force_close_tcp_sockets(client)
+            logger.info(
+                "Anthropic client aborted (%s, tcp_force_closed=%d, "
+                "deferred_close=stranger_thread) %s",
+                reason,
+                shutdown_count,
+                self._client_log_context(),
+            )
+        except Exception as exc:
+            logger.debug(
+                "Anthropic client abort failed (%s) %s error=%s",
+                reason,
+                self._client_log_context(),
+                exc,
+            )
+
+    def _close_or_abort_anthropic_client(self, *, reason: str, rebuild: bool = True) -> None:
+        """Thread-aware close of the shared Anthropic client (#29507).
+
+        Mirrors the per-request ``_close_request_client_once`` dispatch used
+        for the OpenAI transport, adapted to the shared, rebuilt
+        ``_anthropic_client``:
+
+        * A *stranger* thread (the stale-call / interrupt watchdog, which is
+          not the worker driving the in-flight request) only ``shutdown()``s
+          the sockets — it never calls ``client.close()``, because releasing
+          the FD while the worker's OpenSSL BIO is still live is the #29507
+          race that corrupted ``kanban.db``.
+        * The owning thread (or any caller when no request is in flight — the
+          credential-swap / OAuth-beta-retry paths) performs the real
+          ``client.close()`` from its own context, where the FD release
+          belongs.
+
+        Ownership is stamped on ``_anthropic_request_owner_tid`` by the
+        worker that starts an Anthropic request (see ``_anthropic_messages_create``
+        and the streaming ``_call_anthropic`` dispatch); only one Anthropic
+        request is in flight per agent at a time, so a single stamp on the
+        shared client suffices.
+
+        When ``rebuild`` is True the shared client is rebuilt afterward (the
+        interrupt / stale / OAuth-beta-retry callers want a fresh client for
+        the next turn); credential-swap callers pass ``rebuild=False`` because
+        they install their own freshly-credentialed client.
+        """
+        client = getattr(self, "_anthropic_client", None)
+        owner_tid = getattr(self, "_anthropic_request_owner_tid", None)
+        stranger_thread = owner_tid is not None and owner_tid != threading.get_ident()
+        if client is not None:
+            if stranger_thread:
+                self._abort_anthropic_client(client, reason=reason)
+            else:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        if rebuild:
+            self._rebuild_anthropic_client()
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""

@@ -2189,11 +2189,11 @@ def run_conversation(
                     oauth_1m_beta_retry_attempted = True
                     if not getattr(agent, "_oauth_1m_beta_disabled", False):
                         agent._oauth_1m_beta_disabled = True
-                        try:
-                            agent._anthropic_client.close()
-                        except Exception:
-                            pass
-                        agent._rebuild_anthropic_client()
+                        # #29507: thread-aware close + rebuild (real close only
+                        # on the owner thread / when no request is in flight).
+                        agent._close_or_abort_anthropic_client(
+                            reason="oauth_1m_beta_disabled_retry"
+                        )
                         agent._vprint(
                             f"{agent.log_prefix}🔕 OAuth subscription doesn't support "
                             f"the 1M-context beta — disabled for this session and retrying...",

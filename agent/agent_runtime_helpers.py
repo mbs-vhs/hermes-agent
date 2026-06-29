@@ -1938,9 +1938,25 @@ def _iter_pool_sockets(client: Any):
     transport internals and vary across httpx/httpcore releases.
     """
     try:
-        http_client = getattr(client, "_client", None)
+        # Resolve the underlying httpx client across SDK-wrapper shapes so the
+        # abort/cleanup sweep is genuinely transport-agnostic (#29507):
+        #   * OpenAI / Anthropic SDKs        → client._client (SyncHttpxClientWrapper)
+        #   * Gemini cloudcode / native      → client._http   (bare httpx.Client)
+        #   * Codex / Anthropic aux wrappers → client._real_client (re-wraps an SDK client)
+        http_client = (
+            getattr(client, "_client", None)
+            or getattr(client, "_http", None)
+            or getattr(client, "_real_client", None)
+        )
         if http_client is None:
             return
+        # Auxiliary wrappers nest a real SDK client under ``_real_client``;
+        # unwrap one level to reach its httpx client. A bare httpx.Client has
+        # no ``_client`` attribute, so the OpenAI/Anthropic/Gemini resolutions
+        # above stay put (byte-for-byte unchanged for the ``_client`` path).
+        _nested = getattr(http_client, "_client", None)
+        if _nested is not None:
+            http_client = _nested
         transport = getattr(http_client, "_transport", None)
         if transport is None:
             return

@@ -373,6 +373,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         split_idx = trimmed.rfind(":$")
         if split_idx > 0:
             return trimmed[:split_idx], trimmed[split_idx + 1 :], True
+    if platform_name == "agora":
+        trimmed = target_ref.strip()
+        if trimmed and ":" in trimmed:
+            return trimmed, None, True
     if platform_name == "weixin":
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:

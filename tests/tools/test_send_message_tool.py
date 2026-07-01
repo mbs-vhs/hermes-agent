@@ -1219,6 +1219,22 @@ class TestParseTargetRefSlack:
         assert _parse_target_ref("telegram", "C0B0QV5434G")[2] is False
 
 
+class TestParseTargetRefAgora:
+    """Agora explicit targets are clawd conversation ids/cids."""
+
+    def test_cid_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("agora", "minerva:morgan")
+        assert chat_id == "minerva:morgan"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_plain_name_is_not_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("agora", "Agora Home")
+        assert chat_id is None
+        assert thread_id is None
+        assert is_explicit is False
+
+
 class TestSendDiscordThreadId:
     """_send_discord uses thread_id when provided."""
 

@@ -71,6 +71,36 @@ class TestBuildChannelDirectoryWrites:
         assert result == previous
 
 
+    def test_configured_home_channels_are_listed_even_without_sessions(self, tmp_path):
+        from gateway.config import HomeChannel, Platform, PlatformConfig
+
+        cache_file = tmp_path / "channel_directory.json"
+        config = SimpleNamespace(
+            platforms={
+                Platform("agora"): PlatformConfig(
+                    enabled=True,
+                    home_channel=HomeChannel(
+                        platform=Platform("agora"),
+                        chat_id="minerva:morgan",
+                        name="Agora Home",
+                    ),
+                )
+            }
+        )
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), \
+             patch("gateway.config.load_gateway_config", return_value=config):
+            result = asyncio.run(build_channel_directory({}))
+
+        agora_entries = result["platforms"]["agora"]
+        assert agora_entries[0] == {
+            "id": "minerva:morgan",
+            "name": "Agora Home",
+            "type": "home",
+        }
+
+
 class TestResolveChannelName:
     def _setup(self, tmp_path, platforms):
         cache_file = _write_directory(tmp_path, platforms)

@@ -96,6 +96,11 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Include configured home channels so env-only/plugin targets with no prior
+    # session history still appear in send_message(action="list") and can be
+    # resolved by their friendly names.
+    _merge_configured_home_channels(platforms)
+
     directory = {
         "updated_at": datetime.now().isoformat(),
         "platforms": platforms,
@@ -107,6 +112,43 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         logger.warning("Channel directory: failed to write: %s", e)
 
     return directory
+
+
+def _merge_configured_home_channels(platforms: Dict[str, List[Dict[str, str]]]) -> None:
+    """Add configured home channels to a mutable channel directory map.
+
+    Some plugin/virtual platforms (for example Agora) have no inbound adapter
+    stream and no historical session until after the first send. Their config
+    home channel is still a legitimate delivery target, so list/resolve must not
+    depend on prior session discovery.
+    """
+    try:
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+    except Exception as e:
+        logger.debug("Channel directory: failed to load configured home channels: %s", e)
+        return
+
+    for platform, pconfig in getattr(config, "platforms", {}).items():
+        home = getattr(pconfig, "home_channel", None)
+        if not home or not getattr(home, "chat_id", None):
+            continue
+        plat_name = getattr(platform, "value", str(platform))
+        channels = platforms.setdefault(plat_name, [])
+        chat_id = str(home.chat_id)
+        thread_id = getattr(home, "thread_id", None)
+        entry_id = f"{chat_id}:{thread_id}" if thread_id else chat_id
+        if any(ch.get("id") == entry_id for ch in channels):
+            continue
+        entry: Dict[str, str] = {
+            "id": entry_id,
+            "name": getattr(home, "name", None) or f"{plat_name} home",
+            "type": "home",
+        }
+        if thread_id:
+            entry["thread_id"] = str(thread_id)
+        channels.insert(0, entry)
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:

@@ -1,0 +1,30 @@
+name: agora-platform
+label: Agora
+kind: platform
+version: 1.0.0
+description: >
+  Virtual Hermes messaging target for Minerva's Agora console. This platform
+  has no inbound gateway stream; outbound sends append assistant turns to
+  clawd's canonical conversation thread via POST /chat/conversation/{cid}/turn.
+author: sprmn24
+optional_env:
+  - name: AGORA_ENABLED
+    description: "Enable Agora virtual target explicitly (true/false). CLAWD_API_AUTH_TOKEN also enables it."
+    prompt: "Enable Agora virtual target? (true/false)"
+    password: false
+  - name: AGORA_HOME_CHANNEL
+    description: "Default Agora conversation id/cid (default: minerva:morgan)"
+    prompt: "Agora conversation id/cid"
+    password: false
+  - name: AGORA_HOME_CHANNEL_NAME
+    description: "Human label for the Agora home target"
+    prompt: "Agora home target display name"
+    password: false
+  - name: CLAWD_BASE_URL
+    description: "clawd base URL (default: http://127.0.0.1:8000)"
+    prompt: "clawd base URL"
+    password: false
+  - name: CLAWD_API_AUTH_TOKEN
+    description: "Bearer token for clawd API writes"
+    prompt: "clawd API auth token"
+    password: true

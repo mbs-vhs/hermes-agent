@@ -1051,11 +1051,19 @@ def get_auxiliary_models():
 
 @app.post("/api/model/set")
 async def set_model_assignment(body: ModelAssignment):
-    """Assign a model to the main slot or an auxiliary task slot.
+    """Assign a model to an auxiliary task slot.
 
-    Writes to ``~/.hermes/config.yaml`` — applies to **new** sessions only.
-    The currently running chat PTY (if any) is not affected; use the
-    ``/model`` slash command inside a chat to hot-swap that specific session.
+    The ``main`` slot (provider + default model) is **manifest-governed**
+    (ADR-072): it is declared in ``substrate-contract/roster.yaml``
+    ``provider_policy`` and generated into each profile's ``config.yaml`` by
+    ``scripts/generate_profile_provider.py``. A ``scope="main"`` request is
+    refused (HTTP 403) so the web UI can't clobber that generated config —
+    re-manufacturing the drift ADR-072 exists to end.
+
+    ``scope="auxiliary"`` still writes ``~/.hermes/config.yaml`` — applies to
+    **new** sessions only. The currently running chat PTY (if any) is not
+    affected; use the ``/model`` slash command inside a chat to hot-swap that
+    specific session.
     """
     scope = (body.scope or "").strip().lower()
     provider = (body.provider or "").strip()
@@ -1065,27 +1073,26 @@ async def set_model_assignment(body: ModelAssignment):
     if scope not in {"main", "auxiliary"}:
         raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
 
+    if scope == "main":
+        # Provider/model is manifest-governed (ADR-072): the main-slot
+        # provider/model is declared in substrate-contract/roster.yaml
+        # provider_policy and generated into each profile's config.yaml by
+        # scripts/generate_profile_provider.py. Persisting it from the web UI
+        # would clobber that generated config, re-manufacturing the drift
+        # ADR-072 ends — so the write is refused. (Auxiliary task-slot
+        # assignments below are not manifest-governed and still persist.)
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Provider/model is manifest-governed (ADR-072). Edit "
+                "substrate-contract/roster.yaml provider_policy for this "
+                "agent, then run scripts/generate_profile_provider.py + "
+                "redeploy."
+            ),
+        )
+
     try:
         cfg = load_config()
-
-        if scope == "main":
-            if not provider or not model:
-                raise HTTPException(status_code=400, detail="provider and model required for main")
-            model_cfg = cfg.get("model", {})
-            if not isinstance(model_cfg, dict):
-                model_cfg = {}
-            model_cfg["provider"] = provider
-            model_cfg["default"] = model
-            # Clear stale base_url so the resolver picks the provider's own default.
-            if "base_url" in model_cfg and model_cfg.get("base_url"):
-                model_cfg["base_url"] = ""
-            # Also clear hardcoded context_length override — new model may have
-            # a different context window.
-            if "context_length" in model_cfg:
-                model_cfg.pop("context_length", None)
-            cfg["model"] = model_cfg
-            save_config(cfg)
-            return {"ok": True, "scope": "main", "provider": provider, "model": model}
 
         # scope == "auxiliary"
         aux = cfg.get("auxiliary")

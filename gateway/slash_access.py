@@ -49,6 +49,7 @@ from typing import Any, FrozenSet, Iterable, Optional, Tuple
 # additively, never restrictively).
 _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
     "help",
+    "status",
     "whoami",
 })
 

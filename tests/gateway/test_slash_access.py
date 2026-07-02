@@ -221,10 +221,12 @@ class TestPolicyForSource:
         p = policy_for_source(cfg, grp_src)
         assert p.is_admin("222") is True
         assert p.is_admin("111") is False  # DM admin, not group admin
-        # In group scope, the only listed user command is "help"; "status"
-        # is not in the group list and should be denied for non-admins.
+        # In group scope, the only listed user command is "help"; both /help
+        # and /status are reachable for non-admins because they are in the
+        # always-allowed floor (_ALWAYS_ALLOWED_FOR_USERS), independent of the
+        # per-scope user_allowed_commands list (CLAWD-1675).
         assert p.can_run("999", "help") is True
-        assert p.can_run("999", "status") is False
+        assert p.can_run("999", "status") is True
 
     def test_channel_thread_chat_types_treated_as_group_scope(self):
         # Discord channels and threads are group-scoped, not DM-scoped.

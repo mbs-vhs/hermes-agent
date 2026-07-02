@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import yaml
 
 from hermes_cli.config import (
     DEFAULT_CONFIG,
@@ -2449,4 +2450,115 @@ class TestDashboardPluginStaticAssetAllowlist:
         # 403 traversal-blocked OR 404 (depending on URL decode order)
         # — never 200.
         assert resp.status_code in (403, 404)
+
+
+class TestModelSetManifestGoverned:
+    """POST /api/model/set — the ``main`` slot is manifest-governed (ADR-072 /
+    CLAWD-2219).
+
+    Provider/model is declared in ``substrate-contract/roster.yaml``
+    ``provider_policy`` and generated into each profile's ``config.yaml`` by
+    ``scripts/generate_profile_provider.py``. The Hermes web UI's
+    ``POST /api/model/set`` with ``scope="main"`` used to write
+    ``model.provider`` / ``model.default`` / ``model.base_url`` straight to
+    ``config.yaml`` — the same generated-config clobber ADR-072 exists to end.
+    It must now refuse the persist (HTTP 403, manifest-governed message) and
+    leave ``config.yaml`` byte-for-byte untouched. ``scope="auxiliary"`` (the
+    vision/etc. task-slot overrides — NOT manifest-governed) still persists,
+    confirming only the main-slot write was neutralized.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    def test_main_scope_refused_and_config_bytes_unchanged(self):
+        """scope="main" returns the manifest-governed refusal (403) and does
+        NOT rewrite config.yaml — proven by a byte-identical on-disk compare."""
+        from hermes_cli.config import get_config_path, save_config
+
+        save_config({
+            "model": {
+                "default": "roster-model",
+                "provider": "openai-codex",
+                "base_url": "https://roster.example/v1",
+            }
+        })
+        cfg_path = get_config_path()
+        before = cfg_path.read_text(encoding="utf-8")
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={"scope": "main", "provider": "openrouter", "model": "gpt-5.5"},
+        )
+
+        assert resp.status_code == 403
+        detail = resp.json()["detail"]
+        assert "manifest-governed" in detail
+        assert "ADR-072" in detail
+
+        # config.yaml is byte-for-byte what we wrote — the generated model
+        # block was never clobbered.
+        after = cfg_path.read_text(encoding="utf-8")
+        assert after == before
+        written = yaml.safe_load(after)
+        assert written["model"]["default"] == "roster-model"
+        assert written["model"]["provider"] == "openai-codex"
+        assert written["model"]["base_url"] == "https://roster.example/v1"
+
+    def test_main_scope_refusal_creates_no_model_block(self):
+        """When config.yaml has no ``model`` block, the refusal must not
+        create one — the persist path is short-circuited before any write."""
+        from hermes_cli.config import get_config_path, save_config
+
+        save_config({"agent": {"max_turns": 7}})
+        cfg_path = get_config_path()
+        before = cfg_path.read_text(encoding="utf-8")
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={"scope": "main", "provider": "openrouter", "model": "gpt-5.5"},
+        )
+
+        assert resp.status_code == 403
+        after = cfg_path.read_text(encoding="utf-8")
+        assert after == before
+        written = yaml.safe_load(after) or {}
+        assert "model" not in written
+
+    def test_auxiliary_scope_still_persists(self):
+        """The auxiliary task slots (vision/etc.) are NOT manifest-governed —
+        confirm only the main-slot persist was neutralized, not the whole
+        handler."""
+        from hermes_cli.config import get_config_path, save_config
+
+        save_config({"model": {"default": "roster-model", "provider": "openai-codex"}})
+        cfg_path = get_config_path()
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "auxiliary",
+                "task": "vision",
+                "provider": "openrouter",
+                "model": "gpt-5.5-vision",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        assert written["auxiliary"]["vision"]["provider"] == "openrouter"
+        assert written["auxiliary"]["vision"]["model"] == "gpt-5.5-vision"
+        # An auxiliary write leaves the manifest-governed main block intact.
+        assert written["model"]["provider"] == "openai-codex"
 

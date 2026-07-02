@@ -238,3 +238,90 @@ def test_scalar_model_is_replaced_with_mapping(tmp_path):
     data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
     assert data["model"] == {"provider": "openai-codex", "default": "gpt-5.5"}
     assert data["toolsets"] == ["hermes-cli"]
+
+
+# --- governed-field scoping (CLAWD-2216): drift is model.* only, not whole-file ---
+
+# Governed model fields already MATCH the manifest, but a federated mcp_server env
+# value is a MANUALLY LINE-FOLDED plain scalar — exactly the shape ruamel's round-trip
+# un-folds (observed live on the real engineer profile). A whole-file re-render therefore
+# differs, but NO governed field changed → this must NOT read as provider drift (ADR-072 §4:
+# toolsets / mcp_servers / ports / secrets stay federated in Hermes).
+FIXTURE_COSMETIC_FEDERATED = """\
+model:
+  provider: openai-codex
+  default: gpt-5.5
+mcp_servers:
+  meeting:
+    command: python
+    env:
+      BUS_TOKEN_FILE:
+        /home/morganstempf/.hermes/profiles/engineer/meeting-bus.secret
+      BUS_RUNNER_HANDLE: minerva
+"""
+
+
+def test_cosmetic_federated_normalization_is_not_drift(tmp_path):
+    cfg = _write_config(tmp_path, FIXTURE_COSMETIC_FEDERATED)
+    original = cfg.read_text(encoding="utf-8")
+
+    # Precondition: a whole-file re-render WOULD differ (ruamel un-folds the scalar).
+    # If this assert ever fails, the fixture no longer reproduces the federated-churn
+    # case and the test below would be vacuous — so guard it explicitly.
+    merged = GEN.render_merged(original, FIXTURE_POLICY, include_allowed=False)
+    assert merged != original, "fixture must trigger a cosmetic whole-file re-render"
+
+    # But the governed model fields already match the manifest → NOT drift.
+    result = GEN.apply_provider_policy(cfg, FIXTURE_POLICY, check=True)
+    assert result.changed is False
+    assert result.wrote is False
+
+    # And a real (non-check) run must NOT churn the federated field.
+    run = GEN.apply_provider_policy(cfg, FIXTURE_POLICY)
+    assert run.changed is False
+    assert run.wrote is False
+    assert cfg.read_text(encoding="utf-8") == original  # byte-identical, no churn
+    assert not cfg.with_name("config.yaml.bak").exists()
+
+
+def test_main_check_zero_on_cosmetic_federated_only(tmp_path, monkeypatch):
+    cfg = _write_config(tmp_path, FIXTURE_COSMETIC_FEDERATED)
+    monkeypatch.setattr(GEN, "provider_policy_for", lambda _id: FIXTURE_POLICY)
+    rc = GEN.main(["--profile", "engineer", "--config", str(cfg), "--check"])
+    assert rc == 0  # governed fields match → gate green despite cosmetic diff
+
+
+def test_model_provider_drift_still_caught_amid_federated(tmp_path, monkeypatch):
+    # Same federated shape, but the GOVERNED provider is wrong → must be drift (RED).
+    drifted = FIXTURE_COSMETIC_FEDERATED.replace(
+        "provider: openai-codex", "provider: xai-oauth"
+    )
+    cfg = _write_config(tmp_path, drifted)
+    monkeypatch.setattr(GEN, "provider_policy_for", lambda _id: FIXTURE_POLICY)
+    rc = GEN.main(["--profile", "engineer", "--config", str(cfg), "--check"])
+    assert rc == 1
+
+
+def test_include_allowed_drift_detection(tmp_path):
+    # Under --include-allowed, allowed_providers joins the governed set: the ruamel
+    # CommentedSeq is coerced to a plain list on both sides, so a matching list is NOT
+    # drift and a reordered/differing one IS (order matches the generated write order).
+    base = FIXTURE_CONFIG.replace("provider: xai-oauth", "provider: openai-codex").replace(
+        "default: grok-4", "default: gpt-5.5"
+    )
+    matching = base.replace(
+        "  base_url: ''",
+        "  base_url: ''\n  allowed_providers:\n  - openai-codex\n  - xai-oauth",
+    )
+    cfg = _write_config(tmp_path, matching)
+    # allowed_providers == manifest (openai-codex, xai-oauth) → not drift
+    r_match = GEN.apply_provider_policy(cfg, FIXTURE_POLICY, include_allowed=True, check=True)
+    assert r_match.changed is False
+
+    reordered = base.replace(
+        "  base_url: ''",
+        "  base_url: ''\n  allowed_providers:\n  - xai-oauth\n  - openai-codex",
+    )
+    _write_config(tmp_path, reordered)  # overwrite same path
+    r_reordered = GEN.apply_provider_policy(cfg, FIXTURE_POLICY, include_allowed=True, check=True)
+    assert r_reordered.changed is True

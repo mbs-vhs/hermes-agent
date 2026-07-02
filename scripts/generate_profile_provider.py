@@ -12,13 +12,21 @@ other key, value, and comment via a **ruamel.yaml round-trip** (never a
 whole-file ``safe_load`` / ``safe_dump``, which would reorder + strip comments).
 
 Behaviour:
-- **Idempotent.** The merged text is compared byte-for-byte against the current
-  file; if unchanged, nothing is written (no ``.bak`` churn). A second run with
-  no manifest change is a byte-identical no-op.
-- **Backup before write.** On a genuine change the original is copied to
+- **Governed-field scoped (ADR-072 §4).** Drift is judged on the *manifest-owned*
+  fields only — ``model.provider`` + ``model.default`` (and, with
+  ``--include-allowed``, ``model.allowed_providers``). config.yaml is only
+  *partially* generated: toolsets, mcp_servers, ports, and secrets stay federated
+  in Hermes, so a hand-edit to one of those must NOT read as provider drift. A
+  ruamel round-trip may incidentally normalize such a federated field (e.g.
+  un-fold a manually line-folded scalar); that cosmetic difference is deliberately
+  NOT drift.
+- **Idempotent.** When the governed fields already match the manifest nothing is
+  written (no ``.bak`` churn), even if a whole-file re-render would differ
+  cosmetically. A run with no governed change is a no-op.
+- **Backup before write.** On a genuine governed change the original is copied to
   ``config.yaml.bak`` before the new content is written.
-- **``--check``.** Reports drift and writes nothing; exits non-zero if the target
-  diverges from the manifest (the drift gate).
+- **``--check``.** Reports governed drift and writes nothing; exits non-zero iff a
+  governed field diverges from the manifest (the drift gate).
 
 Targeting (so hermetic tests never touch the real ``~/.hermes``):
 - ``--profile <id>`` selects the roster manifest entry (required).
@@ -108,10 +116,12 @@ def render_merged(text: str, policy: ProviderPolicy, *, include_allowed: bool) -
     return buf.getvalue()
 
 
-def _model_values(text: str) -> dict[str, object]:
-    """Read the current ``model.provider`` / ``model.default`` for reporting.
+def _model_values(text: str, *, include_allowed: bool = False) -> dict[str, object]:
+    """Read the current governed ``model.*`` fields (for drift + reporting).
 
-    Uses a throwaway round-trip load (never mutates the file).
+    Uses a throwaway round-trip load (never mutates the file). ``allowed_providers``
+    is coerced to a plain ``list`` so equality against the manifest is stable
+    (ruamel returns a ``CommentedSeq``).
     """
     try:
         data = _yaml().load(text)
@@ -120,7 +130,25 @@ def _model_values(text: str) -> dict[str, object]:
     model = data.get("model") if isinstance(data, dict) else None
     if not isinstance(model, dict):
         return {}
-    return {k: model.get(k) for k in _MODEL_KEYS}
+    keys = _MODEL_KEYS + (("allowed_providers",) if include_allowed else ())
+    out: dict[str, object] = {}
+    for k in keys:
+        v = model.get(k)
+        if k == "allowed_providers" and v is not None:
+            v = list(v)
+        out[k] = v
+    return out
+
+
+def _expected_model(policy: ProviderPolicy, *, include_allowed: bool) -> dict[str, object]:
+    """The governed ``model.*`` values the manifest requires."""
+    expected: dict[str, object] = {
+        "provider": policy.default.provider,
+        "default": policy.default.model,
+    }
+    if include_allowed:
+        expected["allowed_providers"] = list(policy.allowed_providers)
+    return expected
 
 
 @dataclass(frozen=True)
@@ -142,13 +170,20 @@ def apply_provider_policy(
 ) -> GenResult:
     """Merge ``policy`` into ``config_path``'s ``model:`` block.
 
-    In ``check`` mode nothing is written. Otherwise, on a genuine change the
-    original is backed up to ``<name>.bak`` before the merged text is written;
-    an unchanged result is a no-op (idempotent).
+    In ``check`` mode nothing is written. Otherwise, on a genuine *governed*
+    change (``model.provider`` / ``model.default`` / — when requested —
+    ``model.allowed_providers`` diverges from the manifest) the original is backed
+    up to ``<name>.bak`` before the merged text is written. When the governed
+    fields already match, it is a no-op — even if a whole-file re-render would
+    differ cosmetically (a federated field ruamel normalized) — so the tool never
+    churns hand-federated config (ADR-072 §4).
     """
     original = config_path.read_text(encoding="utf-8")
     merged = render_merged(original, policy, include_allowed=include_allowed)
-    changed = merged != original
+    # Drift is judged on the manifest-owned fields ONLY, not the whole-file render.
+    current = _model_values(original, include_allowed=include_allowed)
+    expected = _expected_model(policy, include_allowed=include_allowed)
+    changed = current != expected
 
     if check or not changed:
         return GenResult(config_path, changed, False, None, original, merged)
@@ -173,14 +208,15 @@ def _resolve_config_path(
     return get_profile_dir(profile_id) / "config.yaml"
 
 
-def _report(result: GenResult, *, check: bool) -> None:
-    before = _model_values(result.before)
-    after = _model_values(result.after)
+def _report(result: GenResult, *, check: bool, include_allowed: bool = False) -> None:
+    before = _model_values(result.before, include_allowed=include_allowed)
+    after = _model_values(result.after, include_allowed=include_allowed)
     path = result.config_path
+    keys = _MODEL_KEYS + (("allowed_providers",) if include_allowed else ())
 
     def _delta() -> str:
         parts = []
-        for key in _MODEL_KEYS:
+        for key in keys:
             if before.get(key) != after.get(key):
                 parts.append(f"model.{key} {before.get(key)!r} -> {after.get(key)!r}")
         return "; ".join(parts)
@@ -247,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         include_allowed=args.include_allowed,
         check=args.check,
     )
-    _report(result, check=args.check)
+    _report(result, check=args.check, include_allowed=args.include_allowed)
 
     if args.check and result.changed:
         return 1

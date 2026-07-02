@@ -10462,7 +10462,6 @@ class GatewayRunner:
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
-        import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
             list_authenticated_providers,
@@ -10482,7 +10481,6 @@ class GatewayRunner:
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        config_path = _hermes_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
@@ -10739,37 +10737,11 @@ class GatewayRunner:
         # override rather than relying on cache signature mismatch detection.
         self._evict_cached_agent(session_key)
 
-        # Persist to config if --global
-        if persist_global:
-            try:
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f) or {}
-                else:
-                    cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
-                model_cfg["default"] = result.new_model
-                model_cfg["provider"] = result.target_provider
-                if result.base_url:
-                    model_cfg["base_url"] = result.base_url
-                from hermes_cli.config import save_config
-                save_config(cfg)
-            except Exception as e:
-                logger.warning("Failed to persist model switch: %s", e)
+        # Provider/model is manifest-governed (ADR-072): the --global persist
+        # to config.yaml is refused so a manual /model switch can't clobber the
+        # roster-generated config. The in-session swap above (cached-agent
+        # switch_model + session override + cache evict) still applies; the
+        # refusal is surfaced in the confirmation message below.
 
         # Build confirmation message with full metadata
         provider_label = result.provider_label or result.target_provider
@@ -10820,7 +10792,15 @@ class GatewayRunner:
             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
         if persist_global:
-            lines.append(t("gateway.model.saved_global"))
+            # Manifest-governed refusal (ADR-072) — see the neutralized
+            # persist block above. The in-session switch already applied.
+            lines.append(
+                "Provider/model is manifest-governed (ADR-072). Edit "
+                "substrate-contract/roster.yaml provider_policy for this "
+                "agent, then run scripts/generate_profile_provider.py + "
+                "redeploy. The in-session switch still applied for this "
+                "session only."
+            )
         else:
             lines.append(t("gateway.model.session_only_hint"))
 

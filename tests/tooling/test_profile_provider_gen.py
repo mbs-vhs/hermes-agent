@@ -300,3 +300,28 @@ def test_model_provider_drift_still_caught_amid_federated(tmp_path, monkeypatch)
     monkeypatch.setattr(GEN, "provider_policy_for", lambda _id: FIXTURE_POLICY)
     rc = GEN.main(["--profile", "engineer", "--config", str(cfg), "--check"])
     assert rc == 1
+
+
+def test_include_allowed_drift_detection(tmp_path):
+    # Under --include-allowed, allowed_providers joins the governed set: the ruamel
+    # CommentedSeq is coerced to a plain list on both sides, so a matching list is NOT
+    # drift and a reordered/differing one IS (order matches the generated write order).
+    base = FIXTURE_CONFIG.replace("provider: xai-oauth", "provider: openai-codex").replace(
+        "default: grok-4", "default: gpt-5.5"
+    )
+    matching = base.replace(
+        "  base_url: ''",
+        "  base_url: ''\n  allowed_providers:\n  - openai-codex\n  - xai-oauth",
+    )
+    cfg = _write_config(tmp_path, matching)
+    # allowed_providers == manifest (openai-codex, xai-oauth) → not drift
+    r_match = GEN.apply_provider_policy(cfg, FIXTURE_POLICY, include_allowed=True, check=True)
+    assert r_match.changed is False
+
+    reordered = base.replace(
+        "  base_url: ''",
+        "  base_url: ''\n  allowed_providers:\n  - xai-oauth\n  - openai-codex",
+    )
+    _write_config(tmp_path, reordered)  # overwrite same path
+    r_reordered = GEN.apply_provider_policy(cfg, FIXTURE_POLICY, include_allowed=True, check=True)
+    assert r_reordered.changed is True

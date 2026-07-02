@@ -1796,7 +1796,11 @@ def test_config_set_model_uses_live_switch_path(monkeypatch):
     assert seen["args"] == ("sid", "session-key", "new/model")
 
 
-def test_config_set_model_global_persists(monkeypatch):
+def test_config_set_model_global_refuses_persist(monkeypatch):
+    """ADR-072 (CLAWD-2214): ``/model X --global`` in the TUI must NOT write
+    config.yaml (provider/model is manifest-governed) — it surfaces a refusal
+    while the in-session switch still applies.
+    """
     class _Agent:
         provider = "openrouter"
         model = "old/model"
@@ -1840,11 +1844,14 @@ def test_config_set_model_global_persists(monkeypatch):
         }
     )
 
+    # In-session switch still resolves the new model and passes is_global.
     assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
     assert seen["is_global"] is True
-    assert saved["model"]["default"] == "anthropic/claude-sonnet-4.6"
-    assert saved["model"]["provider"] == "anthropic"
-    assert saved["model"]["base_url"] == "https://api.anthropic.com"
+    # ...but the --global persist is refused: config.yaml is never written.
+    assert saved == {}
+    # The refusal is surfaced to the user as the warning.
+    assert "manifest-governed" in resp["result"]["warning"]
+    assert "ADR-072" in resp["result"]["warning"]
 
 
 def test_config_set_model_syncs_inference_provider_env(monkeypatch):

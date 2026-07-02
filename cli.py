@@ -7472,10 +7472,17 @@ class HermesCLI:
         if result.warning_message:
             _cprint(f"    ⚠ {result.warning_message}")
         if persist_global:
-            save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
-            _cprint("    Saved to config.yaml (--global)")
+            # Provider/model is manifest-governed (ADR-072): the --global
+            # persist is refused so a manual /model switch can't clobber the
+            # roster-generated config.yaml. The in-session swap above still
+            # applies for this session.
+            _cprint(
+                "    Provider/model is manifest-governed (ADR-072). Edit "
+                "substrate-contract/roster.yaml provider_policy for this "
+                "agent, then run scripts/generate_profile_provider.py + "
+                "redeploy. The in-session switch still applied for this "
+                "session only."
+            )
         else:
             _cprint("    (session only — add --global to persist)")
 
@@ -7709,10 +7716,17 @@ class HermesCLI:
 
         # Persistence
         if persist_global:
-            save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
-            _cprint("    Saved to config.yaml (--global)")
+            # Provider/model is manifest-governed (ADR-072): the --global
+            # persist is refused so a manual /model switch can't clobber the
+            # roster-generated config.yaml. The in-session swap above still
+            # applies for this session.
+            _cprint(
+                "    Provider/model is manifest-governed (ADR-072). Edit "
+                "substrate-contract/roster.yaml provider_policy for this "
+                "agent, then run scripts/generate_profile_provider.py + "
+                "redeploy. The in-session switch still applied for this "
+                "session only."
+            )
         else:
             _cprint("    (session only — add --global to persist)")
 

@@ -1090,24 +1090,6 @@ def _restart_slash_worker(session: dict):
         session["slash_worker"] = None
 
 
-def _persist_model_switch(result) -> None:
-    from hermes_cli.config import save_config
-
-    cfg = _load_cfg()
-    model_cfg = cfg.get("model")
-    if not isinstance(model_cfg, dict):
-        model_cfg = {}
-        cfg["model"] = model_cfg
-
-    model_cfg["default"] = result.new_model
-    model_cfg["provider"] = result.target_provider
-    if result.base_url:
-        model_cfg["base_url"] = result.base_url
-    else:
-        model_cfg.pop("base_url", None)
-    save_config(cfg)
-
-
 def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
     from hermes_cli.model_switch import parse_model_flags, switch_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -1192,7 +1174,22 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         os.environ["HERMES_INFERENCE_PROVIDER"] = result.target_provider
         os.environ["HERMES_TUI_PROVIDER"] = result.target_provider
     if persist_global:
-        _persist_model_switch(result)
+        # Provider/model is manifest-governed (ADR-072): the --global persist
+        # to config.yaml is refused so a manual /model switch can't clobber the
+        # roster-generated config. The in-session swap above (agent.switch_model
+        # + HERMES_* env sync) still applies; surface the refusal as a warning.
+        refusal = (
+            "Provider/model is manifest-governed (ADR-072). Edit "
+            "substrate-contract/roster.yaml provider_policy for this agent, "
+            "then run scripts/generate_profile_provider.py + redeploy. The "
+            "in-session switch still applied for this session only."
+        )
+        warning = (
+            f"{result.warning_message} {refusal}".strip()
+            if result.warning_message
+            else refusal
+        )
+        return {"value": result.new_model, "warning": warning}
     return {"value": result.new_model, "warning": result.warning_message or ""}
 
 

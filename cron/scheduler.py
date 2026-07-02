@@ -2002,12 +2002,31 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 for job in parallel_jobs:
                     _ctx = contextvars.copy_context()
                     _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
-                for f in concurrent.futures.as_completed(_futures, timeout=600):
-                    try:
-                        _results.append(f.result())
-                    except Exception as exc:
-                        logger.error("Parallel cron job future failed: %s", exc)
-                        _results.append(False)
+                try:
+                    for f in concurrent.futures.as_completed(_futures, timeout=600):
+                        try:
+                            _results.append(f.result())
+                        except Exception as exc:
+                            logger.error("Parallel cron job future failed: %s", exc)
+                            _results.append(False)
+                except concurrent.futures.TimeoutError:
+                    # The as_completed() ITERATOR itself raises TimeoutError at
+                    # the 600s wall-clock cap when one or more futures are still
+                    # running — distinct from the per-future f.result() errors
+                    # caught above. Left uncaught it propagates out of tick() and
+                    # kills the whole cron cycle. Catch it here so a slow/hung
+                    # job can't take down the tick: the futures that already
+                    # completed are in _results; count the still-running ones as
+                    # failures for this tick and let it return. (The
+                    # ThreadPoolExecutor context manager still joins outstanding
+                    # threads on __exit__.)
+                    _pending = [f for f in _futures if not f.done()]
+                    logger.error(
+                        "Parallel cron tick timed out after 600s: %d/%d jobs "
+                        "still running; counting them as failed for this tick.",
+                        len(_pending), len(_futures),
+                    )
+                    _results.extend(False for _ in _pending)
 
         # Best-effort sweep of MCP stdio subprocesses that survived their
         # session teardown during this tick.  Runs AFTER every job has

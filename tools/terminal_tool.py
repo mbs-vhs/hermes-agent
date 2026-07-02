@@ -44,6 +44,7 @@ import threading
 import atexit
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -1006,6 +1007,29 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
         )
 
 
+def _safe_getcwd() -> str:
+    """Return ``os.getcwd()``, falling back to a safe temp dir when the
+    process's current working directory has been deleted out from under it.
+
+    ``os.getcwd()`` raises ``FileNotFoundError`` when the cwd inode is gone —
+    e.g. a prior tool call ``rm -rf``'d its own working directory (issue
+    #17558). Unguarded, that exception cascades out of ``_get_env_config`` and
+    wedges every subsequent terminal/file-tool call until the gateway
+    restarts. This mirrors the recovery intent of
+    ``tools.environments.local._resolve_safe_cwd`` but guards the ``getcwd()``
+    call itself, which fails before any path is available to walk up from.
+    """
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        fallback = tempfile.gettempdir()
+        logger.warning(
+            "os.getcwd() failed (working directory deleted?); falling back to %s",
+            fallback,
+        )
+        return fallback
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1018,7 +1042,7 @@ def _get_env_config() -> Dict[str, Any]:
     # remote home, Vercel uses its documented workspace root, and everything
     # else starts in the backend's default root-like cwd.
     if env_type == "local":
-        default_cwd = os.getcwd()
+        default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
     elif env_type == "vercel_sandbox":
@@ -1036,7 +1060,7 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)

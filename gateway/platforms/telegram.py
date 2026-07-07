@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import inspect
 import dataclasses
 import json
 import logging
@@ -15,8 +16,8 @@ import os
 import tempfile
 import html as _html
 import re
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Any, Set
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,8 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.notification_actions import NotificationActionEntry, NotificationActionStore
+from hermes_constants import get_hermes_home
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -478,6 +481,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Bot-owned notification action state. Telegram callback_data carries
+        # only na:<short_id>:<verb>; this store owns the full source/chat/thread
+        # context, expiry, and idempotency state.
+        self._notification_action_store = NotificationActionStore(
+            get_hermes_home() / "gateway" / "telegram_notification_actions.json"
+        )
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -531,6 +540,311 @@ class TelegramAdapter(BasePlatformAdapter):
         if (metadata or {}).get("notify"):
             return {}
         return {"disable_notification": True}
+
+    @staticmethod
+    def _positive_chat_id_as_user_id(chat_id: str) -> Optional[str]:
+        try:
+            value = int(str(chat_id))
+        except (TypeError, ValueError):
+            return None
+        return str(value) if value > 0 else None
+
+    def _notification_action_metadata(self, metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not metadata or "notification_actions" not in metadata:
+            return None
+        raw = metadata.get("notification_actions")
+        if raw is False or raw is None:
+            return None
+        if raw is True:
+            return {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, (list, tuple, set)):
+            return {"actions": list(raw)}
+        return None
+
+    def _notification_action_reply_markup(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> Optional[Any]:
+        """Register notification actions and return Telegram inline markup.
+
+        Only metadata that explicitly opts into ``notification_actions`` gets a
+        keyboard; ordinary sends remain byte-for-byte unchanged except for the
+        absence of this optional kwarg.
+        """
+        action_meta = self._notification_action_metadata(metadata)
+        if action_meta is None:
+            return None
+        store = getattr(self, "_notification_action_store", None)
+        if store is None:
+            store = NotificationActionStore(
+                get_hermes_home() / "gateway" / "telegram_notification_actions.json"
+            )
+            self._notification_action_store = store
+
+        allowed_user = (
+            action_meta.get("user_id")
+            or action_meta.get("allowed_user_id")
+            or (metadata or {}).get("user_id")
+            or self._positive_chat_id_as_user_id(chat_id)
+        )
+        entry = store.register(
+            notification_id=action_meta.get("notification_id") or (metadata or {}).get("notification_id"),
+            source_type=action_meta.get("source_type") or (metadata or {}).get("source_type"),
+            source_id=action_meta.get("source_id") or (metadata or {}).get("source_id"),
+            chat_id=str(chat_id),
+            user_id=allowed_user,
+            thread_id=action_meta.get("thread_id") or thread_id,
+            ttl_seconds=action_meta.get("ttl_seconds") or action_meta.get("expires_in"),
+            actions=action_meta.get("actions", True),
+        )
+        rows = []
+        preferred = ["finished", "snooze", "help_me"]
+        ordered_verbs = [verb for verb in preferred if verb in entry.actions]
+        ordered_verbs.extend(verb for verb in entry.actions if verb not in ordered_verbs)
+        for verb in ordered_verbs:
+            spec = entry.actions.get(verb) or {}
+            label = spec.get("label") if isinstance(spec, dict) else None
+            rows.append([
+                InlineKeyboardButton(  # pyright: ignore[reportCallIssue]
+                    str(label or verb.replace("_", " ").title()),
+                    callback_data=entry.callback_data(verb),
+                )
+            ])
+        return InlineKeyboardMarkup(rows) if rows else None  # pyright: ignore[reportCallIssue]
+
+    def _notification_action_kwargs(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        chat_id: str,
+        thread_id: Optional[str],
+        chunk_index: int,
+    ) -> Dict[str, Any]:
+        if chunk_index != 0:
+            return {}
+        markup = self._notification_action_reply_markup(
+            metadata,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        return {"reply_markup": markup} if markup is not None else {}
+
+    async def _call_notification_action_hook(
+        self,
+        entry: NotificationActionEntry,
+        verb: str,
+        query,
+    ) -> Optional[Any]:
+        """Invoke an optional runner hook for source-specific side effects."""
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        hook = getattr(runner, "handle_notification_action", None)
+        if hook is None:
+            hook = getattr(runner, "_handle_notification_action", None)
+        if not callable(hook):
+            return None
+        result = hook(entry=entry, verb=verb, query=query)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    @staticmethod
+    def _notification_original_text(query) -> str:
+        message = getattr(query, "message", None)
+        return (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+
+    async def _edit_notification_action_message(
+        self,
+        query,
+        label: str,
+        *,
+        remove_buttons: bool = True,
+        reply_markup: Optional[Any] = None,
+    ) -> None:
+        original = self._notification_original_text(query)
+        text = f"{original}\n\n{label}" if original else label
+        try:
+            if remove_buttons:
+                markup = None
+            elif reply_markup is not None:
+                markup = reply_markup
+            else:
+                markup = getattr(query.message, "reply_markup", None)
+            await query.edit_message_text(text=text, reply_markup=markup)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _notification_snooze_preset_markup(entry: NotificationActionEntry) -> Any:
+        rows = [
+            [
+                InlineKeyboardButton("1 hour", callback_data=entry.callback_data("snooze_1h")),  # pyright: ignore[reportCallIssue]
+                InlineKeyboardButton("Tomorrow morning", callback_data=entry.callback_data("snooze_tomorrow")),  # pyright: ignore[reportCallIssue]
+            ],
+            [
+                InlineKeyboardButton("Next week", callback_data=entry.callback_data("snooze_next_week")),  # pyright: ignore[reportCallIssue]
+                InlineKeyboardButton("Custom…", callback_data=entry.callback_data("snooze_custom")),  # pyright: ignore[reportCallIssue]
+            ],
+        ]
+        return InlineKeyboardMarkup(rows)  # pyright: ignore[reportCallIssue]
+
+    @staticmethod
+    def _notification_snooze_preset(verb: str, *, now: Optional[datetime] = None) -> Optional[tuple[float, str]]:
+        if verb == "snooze_1h":
+            return 60 * 60, "1 hour"
+        current = now or datetime.now().astimezone()
+        if verb == "snooze_tomorrow":
+            tomorrow_morning = (current + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+            return max((tomorrow_morning - current).total_seconds(), 60.0), "tomorrow morning"
+        if verb == "snooze_next_week":
+            return 7 * 24 * 60 * 60, "next week"
+        return None
+
+    async def _handle_notification_action_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid notification action.")
+            return
+        short_id, verb = parts[1], parts[2]
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to act on this notification.")
+            return
+
+        store = getattr(self, "_notification_action_store", None)
+        if store is None:
+            await query.answer(text="This notification action expired or is unknown.", show_alert=True)
+            return
+        entry = store.get(short_id)
+        if entry is None:
+            await query.answer(text="This notification action expired or is unknown.", show_alert=True)
+            return
+        if not store.verify_context(entry, chat_id=query_chat_id, user_id=caller_id, thread_id=query_thread_id):
+            await query.answer(text="⛔ This button does not belong to this chat/user/thread.", show_alert=True)
+            return
+        is_snooze_preset = verb.startswith("snooze_") and "snooze" in entry.actions
+        if verb not in entry.actions and not is_snooze_preset:
+            await query.answer(text="Unknown notification action.")
+            return
+        if entry.is_expired():
+            store.mark_expired(entry)
+            await query.answer(text="This notification action expired.", show_alert=True)
+            await self._edit_notification_action_message(query, "Expired ⏳")
+            return
+        if entry.status in {"finished", "snoozed", "help_requested"}:
+            if verb == "help_me":
+                await query.answer(text=f"Help already requested: {entry.help_handle or f'help:{entry.short_id}'}")
+            else:
+                await query.answer(text=f"already {entry.status.replace('_', ' ')}")
+            return
+
+        if verb == "finished":
+            hook_result = None
+            try:
+                hook_result = await self._call_notification_action_hook(entry, verb, query)
+            except Exception as exc:
+                logger.error("[%s] notification action hook failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"❌ action failed: {str(exc)[:80]}", show_alert=True)
+                return
+            changed, label = store.finish(entry, user_id=caller_id)
+            if not changed:
+                await query.answer(text=label)
+                return
+            await query.answer(text="Finished ✅")
+            await self._edit_notification_action_message(query, "Finished ✅")
+            return
+        if verb == "snooze":
+            await query.answer(text="Choose a snooze duration.")
+            await self._edit_notification_action_message(
+                query,
+                "Choose a snooze duration:",
+                remove_buttons=False,
+                reply_markup=self._notification_snooze_preset_markup(entry),
+            )
+            return
+        if verb.startswith("snooze_"):
+            if verb == "snooze_custom":
+                await query.answer(text="Reply in chat with the snooze time you want.", show_alert=True)
+                await self._edit_notification_action_message(
+                    query,
+                    "Custom snooze requested — reply in chat with the snooze time you want.",
+                    remove_buttons=False,
+                    reply_markup=self._notification_snooze_preset_markup(entry),
+                )
+                return
+            preset = self._notification_snooze_preset(verb)
+            if preset is None:
+                await query.answer(text="Unknown snooze duration.")
+                return
+            seconds, duration_label = preset
+            try:
+                await self._call_notification_action_hook(entry, verb, query)
+            except Exception as exc:
+                logger.error("[%s] notification action hook failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"❌ action failed: {str(exc)[:80]}", show_alert=True)
+                return
+            changed, label = store.snooze(entry, seconds=seconds, user_id=caller_id)
+            if not changed:
+                await query.answer(text=label)
+                return
+            await query.answer(text=f"Snoozed for {duration_label} ⏰")
+            await self._edit_notification_action_message(query, f"Snoozed for {duration_label} ⏰")
+            return
+        if verb == "help_me":
+            hook_result = None
+            try:
+                hook_result = await self._call_notification_action_hook(entry, verb, query)
+            except Exception as exc:
+                logger.error("[%s] notification action hook failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"❌ action failed: {str(exc)[:80]}", show_alert=True)
+                return
+            changed, handle = store.request_help(entry, user_id=caller_id)
+            if hook_result:
+                if isinstance(hook_result, dict):
+                    handle = str(hook_result.get("handle") or hook_result.get("id") or handle)
+                else:
+                    handle = str(hook_result)
+                store.set_help_handle(entry, handle)
+            if not changed:
+                await query.answer(text=f"Help already requested: {handle}")
+                return
+            await query.answer(text=f"Help requested: {handle}")
+            await self._edit_notification_action_message(query, f"Help requested 🆘 {handle}")
+            return
+
+        # Custom verbs are persisted as a generic terminal action after the
+        # optional hook runs. This gives integrations a safe extension point
+        # without adding another Telegram callback loop.
+        try:
+            await self._call_notification_action_hook(entry, verb, query)
+        except Exception as exc:
+            logger.error("[%s] notification action hook failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text=f"❌ action failed: {str(exc)[:80]}", show_alert=True)
+            return
+        changed, label = store.finish(entry, user_id=caller_id)
+        await query.answer(text=f"{verb} recorded" if changed else label)
+        if changed:
+            await self._edit_notification_action_message(query, f"{verb.replace('_', ' ').title()} recorded ✅")
 
     def _is_callback_user_authorized(
         self,
@@ -1923,6 +2237,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_kwargs = dict(thread_kwargs)
                     thread_kwargs["message_thread_id"] = None
                 effective_thread_id = thread_kwargs.get("message_thread_id")
+                notification_action_kwargs = self._notification_action_kwargs(
+                    metadata,
+                    chat_id=str(chat_id),
+                    thread_id=str(effective_thread_id) if effective_thread_id is not None else thread_id,
+                    chunk_index=i,
+                )
 
                 msg = None
                 for _send_attempt in range(3):
@@ -1937,6 +2257,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **notification_action_kwargs,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -1951,6 +2272,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **notification_action_kwargs,
                                 )
                             else:
                                 raise
@@ -3173,6 +3495,18 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Notification action callbacks (na:short_id:verb) ---
+        if data.startswith("na:"):
+            await self._handle_notification_action_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---

@@ -1814,7 +1814,10 @@ class BasePlatformAdapter(ABC):
             chat_id: The chat/channel ID to send to
             content: Message content (may be markdown)
             reply_to: Optional message ID to reply to
-            metadata: Additional platform-specific options
+            metadata: Additional platform-specific options. Telegram recognizes
+                ``notification_actions`` on bot-owned notification sends; when
+                present, the first chunk gets inline action buttons and the
+                callback payload stores only a short server-side registry id.
         
         Returns:
             SendResult with success status and message ID

@@ -3183,6 +3183,69 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _codex_shared_store_path() -> Optional[Path]:
+    """Absolute path to the fleet's shared read-only Codex OAuth store, or None.
+
+    Returns the path set in ``HERMES_CODEX_SHARED_STORE`` (an absolute path to a
+    single ``auth.json``), or ``None`` when the env var is unset/blank. This is
+    the Minerva-fork-local shared-token override for per-user *hardened* gateways
+    (CLAWD-2378): when set, the gateway resolves the fleet's single shared Codex
+    OAuth token READ-ONLY from this file and NEVER self-refreshes/rotates it. The
+    sole-writer refresher (``devops-process/scripts/refresh-codex-oauth.py``) owns
+    rotation. Env UNSET → ``None`` → zero behavior change from upstream.
+
+    Intentional divergences from the Nous shared store (``_nous_shared_auth_dir``
+    / ``_read_shared_nous_state``): this is a single FILE path (not a directory),
+    and there is no cross-profile lock — the shared store has a single writer (the
+    refresher) that publishes via atomic ``os.replace``, so readers never need a
+    lock. Fork-local, env-gated, and deliberately narrow so it re-applies cleanly
+    on manual upstream merges (mirrors the ADR-072 fork edits).
+    """
+    raw = os.getenv("HERMES_CODEX_SHARED_STORE", "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _read_codex_shared_store() -> Optional[Dict[str, Any]]:
+    """Return the shared Codex OAuth state if present and well-formed, else None.
+
+    Parses the refresher-written shape
+    ``{"tokens": {"access_token", "refresh_token"}, "last_refresh"}``. Returns
+    ``None`` when the env var is unset, the file is missing, unreadable, or
+    malformed (missing/blank ``access_token``) — callers then fall through to the
+    normal local-store resolution. Retries once on ``JSONDecodeError`` as a belt
+    against reading mid-write; the sole writer publishes via atomic ``os.replace``
+    so a torn read should never actually occur, but the retry costs nothing and
+    removes the theoretical race.
+    """
+    path = _codex_shared_store_path()
+    if path is None or not path.is_file():
+        return None
+    payload = None
+    for attempt in range(2):
+        try:
+            payload = json.loads(path.read_text())
+            break
+        except json.JSONDecodeError as exc:
+            if attempt == 0:
+                continue
+            logger.debug("Shared Codex auth store at %s is not valid JSON: %s", path, exc)
+            return None
+        except OSError as exc:
+            logger.debug("Shared Codex auth store at %s is unreadable: %s", path, exc)
+            return None
+    if not isinstance(payload, dict):
+        return None
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    access_token = tokens.get("access_token")
+    if not (isinstance(access_token, str) and access_token.strip()):
+        return None
+    return payload
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -3412,6 +3475,33 @@ def resolve_codex_runtime_credentials(
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store."""
+    # Shared-store override (CLAWD-2378). When HERMES_CODEX_SHARED_STORE points a
+    # per-user hardened gateway at the fleet's single shared Codex OAuth token,
+    # resolve it READ-ONLY and never touch the local pool/global store or the
+    # refresh endpoint. This is an OVERRIDE (shared wins), NOT a fallback-below-
+    # pool: a fallback would re-create the CLAWD-1665 stale-shadow bug where a
+    # self-refreshed token lands where the sole-writer refresher's correction loop
+    # can't see it, invalidating the single-use token for the rest of the fleet.
+    # force_refresh / refresh_if_expiring are intentionally IGNORED here — agents
+    # are readers; the refresher is the sole writer. Env UNSET → this block is
+    # skipped and the resolution below is byte-identical to upstream.
+    shared_state = _read_codex_shared_store()
+    if shared_state is not None:
+        shared_tokens = shared_state.get("tokens") or {}
+        shared_access_token = str(shared_tokens.get("access_token", "") or "").strip()
+        shared_base_url = (
+            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            or DEFAULT_CODEX_BASE_URL
+        )
+        return {
+            "provider": "openai-codex",
+            "base_url": shared_base_url,
+            "api_key": shared_access_token,
+            "source": "hermes-codex-shared-store",
+            "last_refresh": shared_state.get("last_refresh"),
+            "auth_mode": "chatgpt",
+        }
+
     data = _read_codex_tokens()
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()

@@ -3483,10 +3483,29 @@ def resolve_codex_runtime_credentials(
     # self-refreshed token lands where the sole-writer refresher's correction loop
     # can't see it, invalidating the single-use token for the rest of the fleet.
     # force_refresh / refresh_if_expiring are intentionally IGNORED here — agents
-    # are readers; the refresher is the sole writer. Env UNSET → this block is
-    # skipped and the resolution below is byte-identical to upstream.
-    shared_state = _read_codex_shared_store()
-    if shared_state is not None:
+    # are readers; the refresher is the sole writer.
+    #
+    # Gate on ENV PRESENCE (not on the read result), matching the load_pool gate,
+    # so this FAILS CLOSED: once a gateway is configured as a hardened shared-store
+    # reader, a missing/unreadable/malformed shared file RAISES rather than falling
+    # through to _read_codex_tokens() + a network refresh that would rotate the
+    # fleet's single-use token (the exact catastrophe this feature prevents). Env
+    # UNSET → this block is skipped and the resolution below is byte-identical to
+    # upstream.
+    shared_path = _codex_shared_store_path()
+    if shared_path is not None:
+        shared_state = _read_codex_shared_store()
+        if shared_state is None:
+            raise AuthError(
+                "HERMES_CODEX_SHARED_STORE is set but the shared Codex store at "
+                f"{shared_path} is missing or malformed. Refusing to fall back to "
+                "the local store + refresh, which would rotate the fleet's "
+                "single-use token; the refresher must publish a valid shared "
+                "store first.",
+                provider="openai-codex",
+                code="codex_shared_store_unavailable",
+                relogin_required=False,
+            )
         shared_tokens = shared_state.get("tokens") or {}
         shared_access_token = str(shared_tokens.get("access_token", "") or "").strip()
         shared_base_url = (

@@ -16,8 +16,11 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
+    AuthError,
     DEFAULT_CODEX_BASE_URL,
     resolve_codex_runtime_credentials,
 )
@@ -248,23 +251,36 @@ def test_read_hook_none_on_missing_access_token(tmp_path, monkeypatch):
     assert auth_mod._read_codex_shared_store() is None
 
 
-def test_env_set_but_malformed_shared_falls_through_to_local(tmp_path, monkeypatch):
-    # Env set but the shared file is unparseable → read hook returns None →
-    # resolution falls through to the normal local-store path (fail-open to the
-    # local store; a hardened profile with an empty local store fails closed).
+@pytest.mark.parametrize("kind", ["missing", "malformed"])
+def test_env_set_but_shared_unavailable_fails_closed(tmp_path, monkeypatch, kind):
+    # Env SET (hardened gateway) but the shared file is missing/malformed → FAIL
+    # CLOSED: raise AuthError and NEVER touch the local store or the refresh
+    # endpoint. This is the one real catastrophic rotation path, now closed —
+    # the fix gates on env presence, not on the read result, so it can't fall
+    # through to _read_codex_tokens() + a network refresh even with refresh_if_
+    # expiring=True and a seed-able local store present.
     shared = tmp_path / "shared" / "auth.json"
-    shared.parent.mkdir(parents=True, exist_ok=True)
-    shared.write_text("garbage-not-json")
+    if kind == "malformed":
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_text("garbage-not-json")
+    # "missing" → do not create the file at all.
     monkeypatch.setenv("HERMES_CODEX_SHARED_STORE", str(shared))
 
     hermes_home = tmp_path / "hermes"
     _setup_local_codex_auth(hermes_home, access_token="local-access", refresh_token="local-refresh")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+    def _boom(*args, **kwargs):
+        raise AssertionError("hardened gateway must not read the local store or refresh")
 
-    assert creds["api_key"] == "local-access"
-    assert creds["source"] == "hermes-auth-store"
+    monkeypatch.setattr(auth_mod, "_read_codex_tokens", _boom)
+    monkeypatch.setattr(auth_mod, "_refresh_codex_auth_tokens", _boom)
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _boom)
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials(refresh_if_expiring=True)
+
+    assert exc.value.code == "codex_shared_store_unavailable"
 
 
 # =============================================================================

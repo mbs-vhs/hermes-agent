@@ -2035,6 +2035,23 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    # Shared-store override (CLAWD-2378). When HERMES_CODEX_SHARED_STORE points a
+    # per-user hardened gateway at the fleet's single read-only Codex token, the
+    # local Codex pool MUST stay empty. Runtime resolution consults this pool
+    # first (hermes_cli/runtime_provider.py: load_pool -> has_credentials()), and
+    # ANY seeded entry re-opens the refresh_codex_oauth_pure() rotation path in
+    # this module — which would rotate the single-use token where the sole-writer
+    # refresher's correction loop can't see it (the CLAWD-1665 stale-shadow
+    # failure that invalidates the token for the rest of the fleet). An empty pool
+    # makes resolution fall through to resolve_codex_runtime_credentials(), whose
+    # env-gate returns the shared token read-only. This is defense-in-depth for
+    # the empty-local-pool deploy invariant: even a stray leftover Codex pool row
+    # cannot rotate when the shared store is the configured source. Env UNSET →
+    # byte-identical to upstream (the branch is not taken).
+    if provider == "openai-codex":
+        from hermes_cli.auth import _codex_shared_store_path
+        if _codex_shared_store_path() is not None:
+            return CredentialPool(provider, [])
     raw_entries = read_credential_pool(provider)
     raw_needs_sanitization = any(
         isinstance(payload, dict)

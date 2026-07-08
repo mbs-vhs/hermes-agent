@@ -1,16 +1,14 @@
-"""Tests for the gateway ``/model X --global`` persist path after ADR-072
-(CLAWD-2214) neutralized it.
+"""Regression tests for gateway /model --global persistence when config.yaml
+has a flat-string ``model:`` value instead of a nested dict.
 
-Provider/model is manifest-governed: ``substrate-contract/roster.yaml``
-``provider_policy`` → ``scripts/generate_profile_provider.py`` → each profile's
-``config.yaml``. A manual ``/model X --global`` from Telegram/Discord must NOT
-write ``config.yaml`` (that would clobber the roster-generated config), and must
-surface a refusal instead. The in-session switch (the session override the next
-turn reads) still applies.
+Before fix: ``cfg.setdefault("model", {})`` returned the existing string and
+the next assignment raised ``TypeError: 'str' object does not support item
+assignment``, so every ``/model X --global`` from Telegram/Discord crashed
+silently and the user-visible result was "switch failed" with no persist.
 
-These cases exercise the three ``model:`` config shapes the old persist branch
-had to coerce (flat string / missing / proper dict) and assert that *regardless
-of shape* the file is left untouched.
+After fix: the persist block coerces a scalar ``model:`` into a nested dict
+before mutation, so ``--global`` succeeds and the config is rewritten in
+the proper ``model: {default: ..., provider: ...}`` form.
 """
 
 import yaml
@@ -80,46 +78,38 @@ def _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value):
     return cfg_path
 
 
-def _assert_session_switch_applied(runner):
-    """The in-session swap must still populate the session override the next
-    turn reads, even though the --global persist is refused."""
-    overrides = list(runner._session_model_overrides.values())
-    assert len(overrides) == 1, (
-        "session-only switch should have set exactly one override, got %r"
-        % (runner._session_model_overrides,)
-    )
-    assert overrides[0]["model"] == "gpt-5.5"
-    assert overrides[0]["provider"] == "openrouter"
-
-
 @pytest.mark.asyncio
-async def test_model_global_refuses_persist_with_flat_string_model(tmp_path, monkeypatch):
-    """``model: deepseek-v4-flash`` (flat string): ``/model X --global`` must
-    refuse to persist and leave the flat string untouched.
+async def test_model_global_persists_when_config_has_flat_string_model(tmp_path, monkeypatch):
+    """Regression: ``model: deepseek-v4-flash`` (flat string) used to crash
+    the gateway ``/model X --global`` persist branch with TypeError. After
+    the fix, the flat string is coerced to ``{"default": ...}`` and the new
+    model+provider are persisted on top.
     """
     cfg_path = _setup_isolated_home(tmp_path, monkeypatch, "deepseek-v4-flash")
 
-    runner = _make_runner()
-    result = await runner._handle_model_command(
+    result = await _make_runner()._handle_model_command(
         _make_event("/model gpt-5.5 --global")
     )
 
-    # The confirmation surfaces the manifest-governed refusal.
+    # Sanity: the handler returned a success-looking message (not a crash log).
     assert result is not None
     assert "gpt-5.5" in result
-    assert "manifest-governed" in result
-    assert "ADR-072" in result
 
-    # config.yaml is left exactly as written — no persist.
+    # The persist block must have rewritten config.yaml as a nested dict.
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert written["model"] == "deepseek-v4-flash"
-
-    _assert_session_switch_applied(runner)
+    assert isinstance(written["model"], dict), (
+        "model: should be coerced to a dict, got %r" % (written["model"],)
+    )
+    assert written["model"]["default"] == "gpt-5.5"
+    assert written["model"]["provider"] == "openrouter"
+    assert "base_url" not in written["model"]
 
 
 @pytest.mark.asyncio
-async def test_model_global_refuses_persist_with_missing_model(tmp_path, monkeypatch):
-    """``model:`` key absent entirely: the refusal must not create it."""
+async def test_model_global_persists_when_config_has_missing_model(tmp_path, monkeypatch):
+    """Companion case: ``model:`` key absent entirely. setdefault would have
+    worked here, but the coercion branch also has to handle this cleanly.
+    """
     import gateway.run as gateway_run
 
     hermes_home = tmp_path / ".hermes"
@@ -136,24 +126,21 @@ async def test_model_global_refuses_persist_with_missing_model(tmp_path, monkeyp
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_home)
     monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: hermes_home)
 
-    runner = _make_runner()
-    result = await runner._handle_model_command(
+    result = await _make_runner()._handle_model_command(
         _make_event("/model gpt-5.5 --global")
     )
 
     assert result is not None
-    assert "manifest-governed" in result
-
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert "model" not in written
-
-    _assert_session_switch_applied(runner)
+    assert isinstance(written["model"], dict)
+    assert written["model"]["default"] == "gpt-5.5"
+    assert written["model"]["provider"] == "openrouter"
 
 
 @pytest.mark.asyncio
-async def test_model_global_refuses_persist_with_proper_dict_model(tmp_path, monkeypatch):
-    """Already-nested ``model: {default, provider}``: the refusal must leave the
-    existing dict untouched (no clobber of the roster-generated block).
+async def test_model_global_persists_when_config_has_proper_dict_model(tmp_path, monkeypatch):
+    """Already-correct nested dict must still work — no regression on the
+    common case.
     """
     cfg_path = _setup_isolated_home(
         tmp_path,
@@ -161,16 +148,54 @@ async def test_model_global_refuses_persist_with_proper_dict_model(tmp_path, mon
         {"default": "old-model", "provider": "openai-codex"},
     )
 
-    runner = _make_runner()
-    result = await runner._handle_model_command(
+    result = await _make_runner()._handle_model_command(
         _make_event("/model gpt-5.5 --global")
     )
 
     assert result is not None
-    assert "manifest-governed" in result
-
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert written["model"]["default"] == "old-model"
-    assert written["model"]["provider"] == "openai-codex"
+    assert written["model"]["default"] == "gpt-5.5"
+    assert written["model"]["provider"] == "openrouter"
 
-    _assert_session_switch_applied(runner)
+
+@pytest.mark.asyncio
+async def test_model_no_flag_persists_by_default(tmp_path, monkeypatch):
+    """A plain ``/model X`` (no --global) now persists to config.yaml.
+
+    This is the user-facing fix: switching models in one session survives
+    into the next without re-typing the switch every time.
+    """
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5")
+    )
+
+    assert result is not None
+    assert "gpt-5.5" in result
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_model_session_flag_does_not_persist(tmp_path, monkeypatch):
+    """``/model X --session`` opts out of persistence even under the new default."""
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --session")
+    )
+
+    assert result is not None
+    assert "gpt-5.5" in result
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    # Config untouched — the session override is in-memory only.
+    assert written["model"]["default"] == "old-model"

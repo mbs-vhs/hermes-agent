@@ -4,3 +4,23 @@
 # false positives; never blanket-allowlist a path holding live runtime config.
 [extend]
 useDefault = true
+
+# --- Allowlists (CLAWD-2481, v0.18 merge of upstream v2026.7.1) ---
+# The v0.18 merge stages all of upstream's test fixtures + docs at once, tripping
+# 45 findings that are ALL verified false positives (fake/placeholder secrets in
+# test fixtures, a docs example, and GitHub Copilot's PUBLIC OAuth client id).
+# None are live runtime config. Scoped deliberately: tests/ + website/docs/ hold
+# no runtime secrets; the copilot id is allowlisted by its exact public value, not
+# by whitelisting the whole production file.
+
+[[allowlists]]
+description = "Test fixtures: tests/ legitimately carries fake/placeholder secret-shaped strings (redaction tests, auth stubs, sample keys). No live runtime config lives under tests/."
+paths = ['''(^|/)tests/''']
+
+[[allowlists]]
+description = "Docs example placeholder secrets (website/docs)."
+paths = ['''(^|/)website/docs/''']
+
+[[allowlists]]
+description = "GitHub Copilot PUBLIC OAuth client id (Iv1.b507a08c87ecfe98) — a public identifier shipped in the Copilot CLI, not a secret. hermes_cli/copilot_auth.py."
+regexes = ['''Iv1\.b507a08c87ecfe98''']

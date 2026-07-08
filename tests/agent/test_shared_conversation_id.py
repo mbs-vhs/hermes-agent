@@ -42,6 +42,7 @@ class _CidRecordingProvider(MemoryProvider):
     def __init__(self, name="rec"):
         self._name = name
         self.sync_calls: list[dict] = []
+        self._conversation_id = ""
 
     @property
     def name(self) -> str:
@@ -50,19 +51,32 @@ class _CidRecordingProvider(MemoryProvider):
     def is_available(self) -> bool:  # pragma: no cover - unused
         return True
 
-    def initialize(self, session_id, **kwargs):  # pragma: no cover - unused
-        pass
+    def initialize(self, session_id, **kwargs):
+        # v0.18 exfil: conversation_id is self-sourced from the initialize kwarg
+        # (agent_init threads the derived (person,agent) key here), NOT forwarded
+        # per-turn through sync_all. Mirror the real mnemosyne provider.
+        self._conversation_id = kwargs.get("conversation_id", "") or ""
 
     def get_tool_schemas(self):
         return []
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", conversation_id=""):
+    def sync_turn(
+        self,
+        user_content,
+        assistant_content,
+        *,
+        session_id="",
+        messages=None,
+        conversation_id="",
+        **_ignored,
+    ):
         self.sync_calls.append(
             {
                 "user": user_content,
                 "asst": assistant_content,
                 "session_id": session_id,
-                "conversation_id": conversation_id,
+                # explicit kwarg (legacy) wins; else the self-sourced value.
+                "conversation_id": conversation_id or self._conversation_id,
             }
         )
 
@@ -119,12 +133,15 @@ class TestConversationIdDerivation:
 
 
 class TestSyncAllPropagatesConversationId:
-    def test_sync_all_forwards_conversation_id_to_provider(self):
+    def test_provider_self_sources_conversation_id_from_initialize(self):
+        # v0.18 exfil: the derived (person,agent) key is threaded via initialize;
+        # sync_all no longer carries it. The provider self-sources it.
         mm = MemoryManager()
         p = _CidRecordingProvider()
         mm.add_provider(p)
+        p.initialize("sess-1", conversation_id="minerva:tg_111")
 
-        mm.sync_all("hi", "there", session_id="sess-1", conversation_id="minerva:tg_111")
+        mm.sync_all("hi", "there", session_id="sess-1")
 
         assert p.sync_calls == [
             {
@@ -144,14 +161,16 @@ class TestSyncAllPropagatesConversationId:
         mm.sync_all("hi", "there", session_id="sess-1")
         assert p.sync_calls[0]["conversation_id"] == ""
 
-    def test_sync_all_fans_conversation_id_to_all_providers(self):
+    def test_all_providers_self_source_conversation_id(self):
         mm = MemoryManager()
         builtin = _CidRecordingProvider("builtin")
         external = _CidRecordingProvider("mnemosyne")
         mm.add_provider(builtin)
         mm.add_provider(external)
+        builtin.initialize("s", conversation_id="minerva:abc")
+        external.initialize("s", conversation_id="minerva:abc")
 
-        mm.sync_all("u", "a", session_id="s", conversation_id="minerva:abc")
+        mm.sync_all("u", "a", session_id="s")
         assert builtin.sync_calls[0]["conversation_id"] == "minerva:abc"
         assert external.sync_calls[0]["conversation_id"] == "minerva:abc"
 
@@ -182,22 +201,23 @@ class TestCrossSurfaceConversationIdEquality:
         p_tg = _CidRecordingProvider("mnemosyne")
         mm_tg.add_provider(p_tg)
         # Telegram surface: per-surface session id is the gateway session key.
+        # The derived id is threaded via initialize (v0.18 exfil), self-sourced.
+        p_tg.initialize("minerva:main:telegram:dm:123", conversation_id=cid_telegram)
         mm_tg.sync_all(
             "what did I say earlier?",
             "...",
             session_id="minerva:main:telegram:dm:123",
-            conversation_id=cid_telegram,
         )
 
         mm_voice = MemoryManager()
         p_voice = _CidRecordingProvider("mnemosyne")
         mm_voice.add_provider(p_voice)
         # Voice-delegate surface: a totally different per-surface session id.
+        p_voice.initialize("voice-delegate-7f42", conversation_id=cid_voice)
         mm_voice.sync_all(
             "what did I say earlier?",
             "...",
             session_id="voice-delegate-7f42",
-            conversation_id=cid_voice,
         )
 
         tg_fwd = p_tg.sync_calls[0]["conversation_id"]

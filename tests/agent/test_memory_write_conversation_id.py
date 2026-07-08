@@ -234,14 +234,18 @@ class _CidSyncRecorder(MemoryProvider):
     def is_available(self) -> bool:  # pragma: no cover
         return True
 
-    def initialize(self, session_id, **kwargs):  # pragma: no cover
-        pass
+    def initialize(self, session_id, **kwargs):
+        # v0.18 exfil: self-source conversation_id from the initialize kwarg.
+        self._conversation_id = kwargs.get("conversation_id", "") or ""
 
     def get_tool_schemas(self):
         return []
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", conversation_id=""):
-        self.sync_calls.append({"conversation_id": conversation_id})
+    def sync_turn(self, user_content, assistant_content, *, session_id="",
+                  messages=None, conversation_id="", **_ignored):
+        self.sync_calls.append(
+            {"conversation_id": conversation_id or getattr(self, "_conversation_id", "")}
+        )
 
 
 class TestExplicitAndAutoCaptureConverge:
@@ -252,13 +256,13 @@ class TestExplicitAndAutoCaptureConverge:
         meta = build_memory_write_metadata(agent)
         explicit_cid = meta["conversation_id"]
 
-        # Auto-capture path: run_agent forwards the same agent attribute as the
-        # conversation_id kwarg to sync_all -> sync_turn.
+        # Auto-capture path (v0.18 exfil): the same agent attribute is threaded
+        # via initialize; the provider self-sources it (sync_all no longer carries it).
         mgr = MemoryManager()
         rec = _CidSyncRecorder("mnemosyne")
         mgr.add_provider(rec)
-        mgr.sync_all("u", "a", session_id="sess-1",
-                     conversation_id=getattr(agent, "_shared_conversation_id", "") or "")
+        rec.initialize("sess-1", conversation_id=getattr(agent, "_shared_conversation_id", "") or "")
+        mgr.sync_all("u", "a", session_id="sess-1")
         sync_cid = rec.sync_calls[0]["conversation_id"]
 
         assert explicit_cid == sync_cid == "minerva:morgan"

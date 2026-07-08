@@ -3755,7 +3755,20 @@ class APIServerAdapter(BasePlatformAdapter):
         limit = self._max_concurrent_runs
         if limit <= 0:
             return None
-        inflight = self._inflight_agent_runs + len(self._run_streams)
+        # CLAWD-1923: count IN-FLIGHT streaming runs (tasks not yet done), NOT
+        # retained ``_run_streams`` entries. A completed run keeps its
+        # ``_run_streams`` entry until its SSE stream is consumed or the 300s
+        # orphan reaper sweeps it, while its task is popped from
+        # ``_active_run_tasks`` on completion. Counting ``len(_run_streams)``
+        # would let a fire-and-forget client (the agent-meeting-space bus, which
+        # POSTs /v1/runs and tracks completion out-of-band, never draining
+        # /events) wedge the gateway at 429 after ``_max_concurrent_runs``
+        # *completed* runs within the TTL window. ``_inflight_agent_runs``
+        # (non-streaming chat/responses) and ``_active_run_tasks`` (streaming
+        # /v1/runs) are disjoint, so summing them is the true in-flight total.
+        inflight = self._inflight_agent_runs + sum(
+            1 for t in self._active_run_tasks.values() if not t.done()
+        )
         if inflight >= limit:
             return web.json_response(
                 _openai_error(

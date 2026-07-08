@@ -7,7 +7,7 @@ whose ``.done()`` is False), NOT retained result streams
 reaper sweeps it, while its task is popped from ``_active_run_tasks`` in
 ``_run_and_close``'s ``finally``. A fire-and-forget client (the
 agent-meeting-space bus) that never drains the stream would otherwise wedge
-the gateway at 429 after ``_MAX_CONCURRENT_RUNS`` *completed* runs.
+the gateway at 429 after ``_max_concurrent_runs`` *completed* runs.
 
 These tests seed the internal dicts directly with fake task objects so the
 admission branch is exercised in isolation — no real agent runs are started.
@@ -89,8 +89,8 @@ def adapter():
 class TestConcurrencyAdmission:
     @pytest.mark.asyncio
     async def test_max_inflight_runs_returns_429(self, adapter):
-        """With _MAX_CONCURRENT_RUNS not-done tasks present, a new run is rejected."""
-        limit = adapter._MAX_CONCURRENT_RUNS
+        """With _max_concurrent_runs not-done tasks present, a new run is rejected."""
+        limit = adapter._max_concurrent_runs
         for i in range(limit):
             adapter._active_run_tasks[f"run_inflight_{i}"] = _FakeTask(done=False)
 
@@ -112,7 +112,7 @@ class TestConcurrencyAdmission:
     @pytest.mark.asyncio
     async def test_just_under_limit_is_admitted(self, adapter):
         """With limit-1 in-flight tasks, a new run is admitted (boundary check)."""
-        limit = adapter._MAX_CONCURRENT_RUNS
+        limit = adapter._max_concurrent_runs
         for i in range(limit - 1):
             adapter._active_run_tasks[f"run_inflight_{i}"] = _FakeTask(done=False)
 
@@ -130,12 +130,12 @@ class TestConcurrencyAdmission:
         Simulate many COMPLETED fire-and-forget runs: their _run_streams
         entries are retained (never drained), but their tasks were popped
         from _active_run_tasks in _run_and_close's finally. A new run MUST
-        be admitted even though len(_run_streams) >= _MAX_CONCURRENT_RUNS.
+        be admitted even though len(_run_streams) >= _max_concurrent_runs.
 
         Under the OLD check (len(self._run_streams) >= limit) this would
         return 429 and wedge the gateway. Under the fix it is admitted.
         """
-        limit = adapter._MAX_CONCURRENT_RUNS
+        limit = adapter._max_concurrent_runs
         # Far more retained streams than the limit; tasks are absent
         # (popped on completion) — i.e. zero in-flight runs.
         for i in range(limit * 3):
@@ -159,7 +159,7 @@ class TestConcurrencyAdmission:
         """A done task still present in _active_run_tasks must not count (the
         ``not t.done()`` guard). Even with limit+ DONE tasks plus retained
         streams, a new run is admitted because zero tasks are in-flight."""
-        limit = adapter._MAX_CONCURRENT_RUNS
+        limit = adapter._max_concurrent_runs
         for i in range(limit + 2):
             adapter._active_run_tasks[f"run_done_{i}"] = _FakeTask(done=True)
             adapter._run_streams[f"run_done_{i}"] = MagicMock()
@@ -177,7 +177,7 @@ class TestConcurrencyAdmission:
         """With limit-1 in-flight + several done tasks, a new run is admitted;
         the done tasks are ignored. Adding one more in-flight would reach the
         limit (verified separately) — here we confirm done entries don't tip it."""
-        limit = adapter._MAX_CONCURRENT_RUNS
+        limit = adapter._max_concurrent_runs
         for i in range(limit - 1):
             adapter._active_run_tasks[f"run_inflight_{i}"] = _FakeTask(done=False)
         for i in range(limit):

@@ -51,8 +51,19 @@ class _PinAdapter:
         self.pins: list = []
         self.last_send_silent = None
 
+    def set_topic_recovery_fn(self, fn):
+        # No-op stub: upstream's reconnect path sets a topic-recovery callback on
+        # real adapters (BasePlatformAdapter.set_topic_recovery_fn, base.py); this
+        # lightweight stub just accepts it so the reconnect path doesn't AttributeError.
+        self._topic_recovery_fn = fn
+
+    def set_authorization_check(self, fn):
+        # No-op stub — upstream's reconnect path also wires an authorization check
+        # on real adapters (BasePlatformAdapter.set_authorization_check, base.py).
+        self._authorization_check = fn
+
     def _send_disable_notification(self, metadata):
-        from gateway.platforms.telegram import TelegramAdapter
+        from plugins.platforms.telegram.adapter import TelegramAdapter
 
         return TelegramAdapter._notification_kwargs(self, metadata).get(
             "disable_notification", False
@@ -211,7 +222,7 @@ def test_reconnect_success_edits_pin_online_without_badge(monkeypatch, tmp_path)
     # Stub the reconnect collaborators so the success branch runs deterministically.
     monkeypatch.setattr(runner, "_create_adapter", lambda platform, cfg: new_adapter)
     monkeypatch.setattr(runner, "_connect_adapter_with_timeout",
-                        lambda adapter, platform: _async_true())
+                        lambda adapter, platform, **kw: _async_true())
     monkeypatch.setattr(runner, "_sync_voice_mode_state_to_adapter", lambda adapter: None)
     monkeypatch.setattr(runner, "_update_platform_runtime_status",
                         lambda *a, **k: None)

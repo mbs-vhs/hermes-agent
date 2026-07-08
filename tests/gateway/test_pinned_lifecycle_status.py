@@ -48,7 +48,7 @@ class _PinAdapter:
         self.pins: list = []
 
     def _send_disable_notification(self, metadata):
-        from gateway.platforms.telegram import TelegramAdapter
+        from plugins.platforms.telegram.adapter import TelegramAdapter
 
         return TelegramAdapter._notification_kwargs(self, metadata).get(
             "disable_notification", False

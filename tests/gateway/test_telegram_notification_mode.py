@@ -9,7 +9,7 @@ avoids constructing a full adapter + bot client.
 """
 import types
 
-from gateway.platforms.telegram import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _nk(mode, metadata):

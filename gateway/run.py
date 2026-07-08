@@ -7615,6 +7615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Non-retryable failures (bad auth, etc.) still drop out immediately.
         """
         _BACKOFF_CAP = 300  # 5 minutes max between retries
+        _PAUSE_AFTER_FAILURES = 10  # circuit-breaker threshold
 
         await asyncio.sleep(10)  # initial delay — let startup finish
         while self._running:

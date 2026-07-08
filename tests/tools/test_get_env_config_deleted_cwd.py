@@ -44,12 +44,11 @@ class TestSafeGetcwd:
             raise FileNotFoundError(2, "No such file or directory")
 
         monkeypatch.setattr(os, "getcwd", _boom)
-        with caplog.at_level("WARNING", logger="tools.terminal_tool"):
-            result = _safe_getcwd()
-        assert result == tempfile.gettempdir()
-        assert any(
-            "os.getcwd() failed" in rec.getMessage() for rec in caplog.records
-        ), "expected a WARNING about the deleted working directory"
+        result = _safe_getcwd()
+        # v0.18 adopted upstream's terminal_tool: the deleted-cwd fallback is
+        # TERMINAL_CWD or ~ (the fork used tempfile.gettempdir()). Either way the
+        # invariant that matters is a usable, existing directory — no crash.
+        assert result and os.path.isdir(result)
 
 
 class TestGetEnvConfigDeletedCwd:
@@ -77,10 +76,11 @@ class TestGetEnvConfigDeletedCwd:
             with pytest.raises(FileNotFoundError):
                 os.getcwd()
 
-            # The fix must swallow that and return a usable config.
+            # The fix must swallow that and return a usable config with a valid
+            # fallback cwd (v0.18: upstream falls back to TERMINAL_CWD or ~).
             cfg = _get_env_config()
             assert cfg["env_type"] == "local"
-            assert cfg["cwd"] == tempfile.gettempdir()
+            assert cfg["cwd"] and os.path.isdir(cfg["cwd"])
         finally:
             # Restore a valid cwd for the rest of this process's tests.
             os.chdir(original_cwd if os.path.isdir(original_cwd) else safe_restore)

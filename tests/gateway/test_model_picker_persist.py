@@ -154,26 +154,26 @@ async def _drive_picker(runner, event):
     ],
     ids=["nested-dict", "flat-string"],
 )
-async def test_picker_tap_persists_by_default(tmp_path, monkeypatch, seed_model):
-    """Tapping a model in the picker (bare /model) persists to config.yaml,
-    matching the typed ``/model`` default — this is the #49176 fix. The written
-    ``model:`` must always end up a nested dict regardless of the seed shape."""
+async def test_picker_tap_refuses_persist_manifest_governed(tmp_path, monkeypatch, seed_model):
+    """ADR-072: tapping a model in the picker (bare /model) switches for the
+    session but must NOT persist to config.yaml — provider/model is
+    manifest-governed. Upstream #49176 made the gateway picker persist by
+    default; the fork's GatewayRunner._govern_model_persist neutralizes that at
+    the gateway surface (see test_model_switch_manifest_governed_lockin). The
+    switch confirmation surfaces the manifest-governed notice; config is
+    unchanged regardless of the seed shape."""
     adapter = _FakePickerAdapter()
     cfg_path = _setup_isolated_home(tmp_path, monkeypatch, seed_model)
+    seeded = cfg_path.read_text(encoding="utf-8")
 
     confirmation = await _drive_picker(_make_runner(adapter), _make_event("/model"))
 
     assert confirmation is not None
-    assert "gpt-5.5" in confirmation
-    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert isinstance(written["model"], dict), (
-        "model: should be coerced to a dict, got %r" % (written["model"],)
-    )
-    assert written["model"]["default"] == "gpt-5.5"
-    assert written["model"]["provider"] == "openrouter"
-    assert "base_url" not in written["model"]
-    assert "api_key" not in written["model"]
-    assert "api_mode" not in written["model"]
+    assert "gpt-5.5" in confirmation            # in-session switch applied
+    assert "manifest-governed" in confirmation  # ADR-072 notice surfaced
+    assert "ADR-072" in confirmation
+    # config.yaml unchanged — the switch did NOT persist.
+    assert cfg_path.read_text(encoding="utf-8") == seeded
 
 
 @pytest.mark.asyncio

@@ -1368,6 +1368,14 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    def _govern_model_persist(self, persist_global: bool):
+        """Hook: allow a manifest-governed subclass to refuse config.yaml
+        persistence of a /model switch (ADR-072). Returns
+        ``(persist_global, notice)``. Default: honor the computed behavior with
+        no notice (upstream persist-by-default). Overridden by the gateway runner
+        to force session-only + surface the manifest-governed notice."""
+        return persist_global, ""
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 
@@ -1400,6 +1408,13 @@ class GatewaySlashCommandsMixin:
             is_session,
         ) = parse_model_flags(raw_args)
         persist_global = resolve_persist_behavior(is_global_flag, is_session)
+        # ADR-072 governance hook: a manifest-governed subclass (the gateway
+        # runner) can refuse config.yaml persistence so a manual /model switch
+        # can't clobber the roster-generated config; the in-session switch still
+        # applies. Default: honor the computed persist with no notice.
+        persist_global, _persist_governance_notice = self._govern_model_persist(
+            persist_global
+        )
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1667,6 +1682,8 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
                         if persist_global:
                             lines.append(t("gateway.model.saved_global"))
+                        elif _persist_governance_notice:
+                            lines.append(_persist_governance_notice)
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
@@ -1917,6 +1934,8 @@ class GatewaySlashCommandsMixin:
 
             if persist_global:
                 lines.append(t("gateway.model.saved_global"))
+            elif _persist_governance_notice:
+                lines.append(_persist_governance_notice)
             else:
                 lines.append(t("gateway.model.session_only_hint"))
 

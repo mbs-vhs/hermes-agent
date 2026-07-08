@@ -82,6 +82,12 @@ class _StubCLI:
         self.api_mode = ""
         self._pending_model_switch_note = ""
 
+    def _confirm_expensive_model_switch(self, result):
+        # Stub: upstream's cli.py gates an expensive-model switch behind this
+        # confirmation; these ADR-072 persist tests aren't about the cost prompt,
+        # so always confirm so the switch proceeds to the persist decision.
+        return True
+
 
 # --------------------------------------------------------------------------- #
 # Surface 1 — CLI picker: _apply_model_switch_result
@@ -233,7 +239,7 @@ def test_lockin_tui_refuses_persist(monkeypatch):
     )
 
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: result)
-    monkeypatch.setattr(server, "_restart_slash_worker", lambda session: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda sid, session: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
     monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
 

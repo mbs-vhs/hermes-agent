@@ -94,7 +94,11 @@ class AgoraAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform("agora"))
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # ``is_reconnect`` is forwarded by the gateway's reconnect loop (v0.18+);
+        # Agora is outbound-only and stateless per connect, so the flag is
+        # accepted for interface parity with the other platform adapters and
+        # otherwise ignored — connect is idempotent (validate + mark connected).
         if not validate_config(self.config):
             return False
         self._mark_connected()

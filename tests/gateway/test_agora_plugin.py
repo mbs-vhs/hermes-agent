@@ -96,6 +96,18 @@ def test_adapter_connect_marks_virtual_target_connected():
     assert adapter.is_connected is False
 
 
+def test_adapter_connect_accepts_is_reconnect_kwarg():
+    # v0.18 gateway.run forwards ``is_reconnect`` to every platform adapter's
+    # connect(); the fork-custom Agora adapter must accept it (interface parity)
+    # or the reconnect loop wedges with a TypeError every cycle. Regression guard
+    # for the canary-caught "AgoraAdapter.connect() got an unexpected keyword
+    # argument 'is_reconnect'" error.
+    adapter = AgoraAdapter(PlatformConfig(enabled=True, extra={"token": "tok"}))
+    assert _run(adapter.connect(is_reconnect=True)) is True
+    assert adapter.is_connected is True
+    _run(adapter.disconnect())
+
+
 def test_standalone_send_posts_assistant_turn_to_clawd(monkeypatch):
     monkeypatch.setattr(_agora, "HTTPX_AVAILABLE", True)
     monkeypatch.setattr(_agora, "httpx", SimpleNamespace(AsyncClient=_AsyncClient))

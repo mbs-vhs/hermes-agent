@@ -213,17 +213,10 @@ class TestProfileScopedMcp:
 
 
 class TestProfileScopedModel:
-    @pytest.mark.xfail(
-        reason="v0.18 DESIGN QUESTION: the merged web_server refuses main-scope "
-        "/api/model/set with HTTP 403 (ADR-072: provider/model is manifest-governed, "
-        "don't clobber the roster-generated config). This test expects the "
-        "profile-unification behavior where the operator sets a managed profile's "
-        "model via the dashboard (200 + persist). These conflict — is dashboard "
-        "profile-model-set a sanctioned ADR-072 override, or governed? Operator "
-        "decision needed before resolving (do not silently flip the test).",
-        strict=False,
-    )
     def test_model_set_main_scoped(self, client, isolated_profiles):
+        worker_config_path = isolated_profiles["worker_beta"] / "config.yaml"
+        worker_config_before = worker_config_path.read_text(encoding="utf-8")
+
         resp = client.post(
             "/api/model/set",
             json={
@@ -234,14 +227,12 @@ class TestProfileScopedModel:
                 "profile": "worker_beta",
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 403
+        assert worker_config_path.read_text(encoding="utf-8") == worker_config_before
         worker_cfg = _cfg(isolated_profiles["worker_beta"])
         model_cfg = worker_cfg.get("model", {})
-        assert isinstance(model_cfg, dict)
-        assert model_cfg.get("provider") == "openrouter"
-        default_model = _cfg(isolated_profiles["default"]).get("model", {})
-        if isinstance(default_model, dict):
-            assert default_model.get("default") != "test/model-1"
+        if isinstance(model_cfg, dict):
+            assert model_cfg.get("provider") != "openrouter"
 
     def test_auxiliary_read_scoped_matches_write_target(
         self, client, isolated_profiles

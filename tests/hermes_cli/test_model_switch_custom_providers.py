@@ -18,6 +18,12 @@ _MOCK_VALIDATION = {
 }
 
 
+def _stub_empty_model_catalogs(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.models.get_curated_nous_model_ids", lambda: [])
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *a, **kw: [])
+
+
 def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
     """No-args /model menus should include saved custom_providers entries."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
@@ -345,7 +351,7 @@ def test_list_dedupes_dict_model_matching_singular_default(monkeypatch):
 def test_list_authenticated_providers_groups_same_endpoint(monkeypatch):
     """Multiple custom_providers entries sharing a base_url+api_key must be
     returned as a single picker row with all their models merged."""
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    _stub_empty_model_catalogs(monkeypatch)
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
 
     providers = list_authenticated_providers(
@@ -431,7 +437,7 @@ def test_list_authenticated_providers_bare_custom_slug_recovers(monkeypatch):
 def test_list_authenticated_providers_distinct_endpoints_stay_separate(monkeypatch):
     """Entries with different base_urls must produce separate picker rows
     even if some display names happen to be similar."""
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    _stub_empty_model_catalogs(monkeypatch)
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
 
     providers = list_authenticated_providers(
@@ -526,7 +532,7 @@ def test_list_authenticated_providers_same_url_different_key_env_and_api_mode_st
 def test_list_authenticated_providers_total_models_reflects_grouped_count(monkeypatch):
     """After grouping six entries into one row, total_models must reflect
     the full count, and every grouped model appears in the list."""
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    _stub_empty_model_catalogs(monkeypatch)
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
 
     entries = [

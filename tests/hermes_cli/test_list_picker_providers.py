@@ -19,6 +19,12 @@ import pytest
 from hermes_cli import model_switch
 
 
+def _stub_empty_model_catalogs(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.models.get_curated_nous_model_ids", lambda: [])
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *a, **kw: [])
+
+
 def _make_provider(slug, name=None, models=None, *, is_current=False,
                    is_user_defined=False, source="built-in", api_url=None):
     """Build a dict shaped like ``list_authenticated_providers`` output."""
@@ -259,7 +265,7 @@ def test_passthrough_kwargs_to_base(monkeypatch):
 
 def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
     """Interactive picker should preserve current custom endpoint semantics."""
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    _stub_empty_model_catalogs(monkeypatch)
     monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {})
     monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
     monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",

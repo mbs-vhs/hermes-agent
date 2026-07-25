@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
 # deploy-to-runtime.sh — deploy this fork's `main` to the LIVE Hermes runtime.
 #
-# The 10 Hermes gateways run from the RUNTIME checkout (~/.hermes/hermes-agent),
-# NOT this dev fork. Editing the fork does nothing until the runtime is advanced
-# and the gateways reload. This script makes that the ONLY supported path, so the
-# runtime can never silently drift from `main` (the CLAWD-1008 failure mode).
+# TOPOLOGY (re-baselined 2026-07-25 — the old comment here was STALE and the
+# staleness made this script dangerous; see the preflight in step 1b):
+# There are now TWO live Hermes populations, and this script only serves (b):
+#   (a) THE FLEET — 12 per-user accounts (/home/hermes-<profile>), 11 of which
+#       run ai.hermes.gateway-<profile>.service under THEIR OWN systemd --user
+#       manager (hermes-cc has no gateway unit), executing from
+#       /opt/hermes-agent/venv — an EDITABLE install rooted at the (non-git)
+#       /opt/hermes-agent source tree. Editing that tree IS a live fleet
+#       mutation. This script does NOT reach that population at all.
+#   (b) THE ~/.hermes RUNTIME CHECKOUT — serves chat.vhs.box (hermes-webui) +
+#       research. hermes-agent is installed EDITABLE into
+#       ~/.hermes/hermes-agent/venv, and hermes-webui SPAWNS SUBPROCESSES with
+#       that venv's python (it does not import hermes_agent into the webui
+#       parent). So advancing this checkout takes effect on the NEXT SPAWNED
+#       AGENT — live, unstaged, without any unit restart. Restarting
+#       ai.minerva.chat-ui.service does NOT gate that; it only recycles the
+#       parent. That is exactly why a half-applied deploy here is unsafe.
+# The 11 ai.hermes.gateway-*.service units under the operator's own manager are
+# LEGACY LEFTOVERS and are all MASKED (the fleet relocated to per-user accounts).
 #
 # It advances the runtime to origin/<branch> by a strict fast-forward and then
-# (optionally, gated) restarts the gateways.
+# (optionally, gated) restarts the gateway units it validated up front.
 #
 # DRIFT GUARD (the important part): if the runtime working tree is DIRTY, this
 # refuses to run. A dirty runtime means someone hot-fixed in place and never
@@ -19,8 +34,11 @@
 #
 # Flags:
 #   --dry-run            Show what would happen; make no mutating changes.
-#   --no-restart         Fast-forward the runtime but do NOT restart gateways
-#                        (note: file changes do not take effect until reload).
+#   --no-restart         Fast-forward the runtime but do NOT restart gateways.
+#                        (Skips the step-1b preflight. Because the runtime venv
+#                        is an EDITABLE install that hermes-webui spawns agents
+#                        from, the new code still takes effect on the NEXT
+#                        SPAWNED AGENT — this does not stage the change.)
 #   --parallel-restart   Restart all gateways at once (brief full-fleet blip).
 #                        Default is a rolling restart (<=1 gateway down at a time).
 #   --yes, -y            Skip the interactive restart confirmation.
@@ -40,7 +58,11 @@ for arg in "$@"; do
     --no-restart)       NO_RESTART=1 ;;
     --parallel-restart) PARALLEL=1 ;;
     --yes|-y)           ASSUME_YES=1 ;;
-    -h|--help)          sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    # NOTE: keep this range in sync with the header block above — it ends at the
+    # last "#" line before `set -euo pipefail`. A stale range silently truncates
+    # --help (it once cut off every flag, including the --no-restart that the
+    # step-1b die() tells operators to use).
+    -h|--help)          sed -n '2,48p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "deploy-to-runtime: unknown arg: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -57,6 +79,35 @@ if [ -n "$dirty" ]; then
   log "runtime working tree is DIRTY — refusing to deploy over uncommitted work:"
   printf '%s\n' "$dirty" | sed 's/^/    /'
   die "reconcile this to the fork first (commit + push to origin/$BRANCH), then re-run. See CLAWD-1008 for the pattern."
+fi
+
+# 1b) RESTART-TARGET PREFLIGHT — validate BEFORE mutating anything.
+#
+# ORDERING IS LOAD-BEARING. This script used to fast-forward the runtime FIRST
+# and only discover at the restart step that it had nothing valid to restart.
+# Because the runtime venv installs hermes-agent EDITABLE, that left the live
+# chat runtime advanced by thousands of commits on disk while the script exited
+# with a message about gateways that reads like "nothing was deployed". Mutate
+# only after we know the restart half can actually succeed.
+units=()
+if [ "$NO_RESTART" = "0" ]; then
+  mapfile -t units < <(systemctl --user list-unit-files 'ai.hermes.gateway-*.service' --no-legend 2>/dev/null | awk '{print $1}' | sort)
+  [ "${#units[@]}" -gt 0 ] || die "no ai.hermes.gateway-*.service units found under this user manager. If the fleet has moved (it now runs per-user from /opt/hermes-agent), this script cannot deploy it — use --no-restart to advance ONLY the ~/.hermes checkout, and restart its consumers (chat-ui) yourself."
+  # Reject anything not cleanly loadable, not just `masked`. LoadState collapses
+  # masked/masked-runtime, but `error` / `bad-setting` (unparseable unit) would
+  # also sail past a masked-only check and then fail at restart — reaching the
+  # same half-deployed state through a different door.
+  bad=()
+  for u in "${units[@]}"; do
+    state="$(systemctl --user show "$u" -p LoadState --value 2>/dev/null || true)"
+    [ "$state" = "loaded" ] || bad+=("$u ($state)")
+  done
+  if [ "${#bad[@]}" -gt 0 ]; then
+    log "${#bad[@]}/${#units[@]} gateway unit(s) are not loadable and cannot be restarted:"
+    printf '%s\n' "${bad[@]}" | sed 's/^/    /'
+    log "masked ones are legacy leftovers; the live fleet runs per-user from /opt/hermes-agent."
+    die "refusing to deploy: nothing was mutated. Restarting a masked/unloadable unit always fails, and advancing the runtime first would leave the live chat runtime half-deployed. To advance ONLY the ~/.hermes checkout (chat.vhs.box / research), re-run with --no-restart — and note that takes effect on the NEXT SPAWNED AGENT, so there is no restart that stages it."
+  fi
 fi
 
 # 2) Fetch the target (read-only to the working tree).
@@ -85,13 +136,12 @@ fi
 
 # 4) Gateway restart (gated).
 if [ "$NO_RESTART" = "1" ]; then
-  log "--no-restart: gateways NOT restarted. On-disk changes take effect only on reload."
+  log "--no-restart: gateways NOT restarted. NOTE the runtime venv is an EDITABLE install and hermes-webui SPAWNS agents from it, so the ~/.hermes population picks this up on its NEXT SPAWNED AGENT — already-running gateway processes keep their loaded modules until restarted."
   exit 0
 fi
 
-mapfile -t units < <(systemctl --user list-unit-files 'ai.hermes.gateway-*.service' --no-legend 2>/dev/null | awk '{print $1}' | sort)
-[ "${#units[@]}" -gt 0 ] || die "no ai.hermes.gateway-*.service units found (is this the right host?)"
-
+# units[] was collected AND validated (non-empty, none masked) by the step-1b
+# preflight, before any mutation. Do not re-derive it here.
 mode=$([ "$PARALLEL" = "1" ] && echo "parallel" || echo "rolling")
 log "${#units[@]} gateways to restart ($mode): ${units[*]}"
 

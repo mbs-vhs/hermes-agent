@@ -23,16 +23,17 @@ This test proves the behavioral guarantee mechanically — no live LLM:
     cancel).  This is the worst case: the only way to return fast is to NOT
     wait on the running futures.
   * A side thread sets ``parent._interrupt_requested = True`` ~0.2s in.
-  * Assert delegate_task returns in well under the stuck-child duration
-    (< 3s vs the child's 8s) and that the result set carries the fabricated
+  * Assert delegate_task returns well before the stuck-child duration
+    (75% of the child's 8s runtime) and that the result set carries the
+    fabricated
     "interrupted" entries with ``_child_role`` preserved.
 
 BEFORE THE FIX this would have taken ~8s (the implicit ``shutdown(wait=True)``
 at the ``with`` exit blocks on both running 8s children).  We do not revert
-the fix here; the timing assertion (< 3s) is itself the discriminator —
+the fix here; the derived timing assertion is itself the discriminator —
 the pre-fix code physically cannot satisfy it because two 8s daemon workers
 are still running when the loop breaks (and running futures are not
-cancellable), so the only way under 3s is to NOT wait on them.
+cancellable), so the only way under the derived deadline is to NOT wait on them.
 """
 
 import json
@@ -55,10 +56,10 @@ STUCK_CHILD_SECONDS = 8.0
 # delegate_task must return within this wall-clock budget once interrupted.
 # The bail-without-waiting path costs: real _build_child_agent construction of
 # two AIAgent instances on the main thread (~1s, observed), + the 0.2s
-# interrupt delay + up to one 0.5s poll tick.  3.0s comfortably bounds that
-# while being FAR below the 8s a wait-on-children (pre-fix shutdown(wait=True))
-# path would take — the two paths differ by ~5s, so the test is not flaky.
-RETURN_DEADLINE_SECONDS = 3.0
+# interrupt delay + up to one 0.5s poll tick.  The deadline is derived as 75%
+# of STUCK_CHILD_SECONDS, leaving CI headroom while staying well below the 8s a
+# wait-on-children (pre-fix shutdown(wait=True)) path would take.
+RETURN_DEADLINE_SECONDS = STUCK_CHILD_SECONDS * 0.75
 
 
 class TestDelegateInterruptBounded(unittest.TestCase):

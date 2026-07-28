@@ -129,6 +129,87 @@ def test_does_not_write_to_inspected_tree(tree: Path, repo: Path):
     assert after == before, f"tool wrote into the inspected tree: {after - before}"
 
 
+def test_origin_containment_filter_rejects_outside_and_sibling_prefix(tmp_path: Path):
+    """Directly guard the tree-containment predicate. A review mutation that
+    replaced this filter with `if True:` survived every other test in this file —
+    without a direct test, the tool would happily report stdlib and
+    site-packages modules as orphans of the inspected tree."""
+    tree = tmp_path / "opt" / "hermes-agent"
+    (tree / "gateway").mkdir(parents=True)
+    inside = tree / "gateway" / "x.py"
+    inside.write_text("", encoding="utf-8")
+
+    assert prov.origin_is_inside(str(inside), tree) is True
+
+    # A SIBLING sharing the tree's path prefix must be rejected — this is what
+    # the explicit os.sep in the predicate buys.
+    sibling_root = tmp_path / "opt" / "hermes-agent-evil"
+    sibling_root.mkdir(parents=True)
+    sibling = sibling_root / "x.py"
+    sibling.write_text("", encoding="utf-8")
+    assert prov.origin_is_inside(str(sibling), tree) is False
+
+    # Wholly outside, plus the sentinel/empty cases the probe can emit.
+    outside = tmp_path / "elsewhere.py"
+    outside.write_text("", encoding="utf-8")
+    assert prov.origin_is_inside(str(outside), tree) is False
+    assert prov.origin_is_inside("", tree) is False
+    assert prov.origin_is_inside(None, tree) is False
+    assert prov.origin_is_inside("!error: ImportError: boom", tree) is False
+
+    # `..` must be NORMALIZED, not taken literally. tree/gateway/../x.py
+    # normalizes to tree/x.py, which IS inside; tree/../elsewhere.py escapes.
+    (tree / "x.py").write_text("", encoding="utf-8")
+    assert prov.origin_is_inside(str(tree / "gateway" / ".." / "x.py"), tree) is True
+    assert prov.origin_is_inside(str(tree / ".." / "elsewhere.py"), tree) is False
+
+    # The tree root itself is not "inside" the tree — only paths beneath it.
+    assert prov.origin_is_inside(str(tree), tree) is False
+
+
+def test_probe_failure_is_loud_not_a_clean_report(tmp_path: Path, tree: Path, repo: Path):
+    """THE headline regression for this tool. If the resolution subprocess cannot
+    run, the orphan set is UNMEASURED — which must never be reported as "no
+    orphans". The default interpreter is the root-owned fleet venv, the thing
+    most likely to be broken or relocated, and deploy-to-runtime.sh points
+    operators straight at --strict. A false clean there reads as "safe to deploy"."""
+    broken = tmp_path / "broken-python"
+    broken.write_text("#!/bin/sh\necho boom >&2\nexit 3\n", encoding="utf-8")
+    broken.chmod(0o755)
+
+    with pytest.raises(prov.ProbeFailure) as excinfo:
+        prov.build_report(tree, repo, "HEAD", prov.DEFAULT_EXCLUDES, python=str(broken))
+    assert "boom" in str(excinfo.value), "probe stderr must be surfaced, not swallowed"
+
+    # And the CLI must exit non-zero rather than print a clean report.
+    rc = prov.main(["--tree", str(tree), "--repo", str(repo), "--ref", "HEAD",
+                    "--python", str(broken), "--strict"])
+    assert rc == 3
+    rc_nonstrict = prov.main(["--tree", str(tree), "--repo", str(repo), "--ref", "HEAD",
+                              "--python", str(broken)])
+    assert rc_nonstrict == 3, "even without --strict, an unmeasured probe is not success"
+
+
+def test_probe_does_not_use_the_live_hermes_home(tree: Path, repo: Path, monkeypatch):
+    """Popping HERMES_HOME is NOT enough: unset, hermes_constants falls back to
+    Path.home()/'.hermes' — the operator's LIVE profile tree. The probe must be
+    handed a throwaway dir instead."""
+    captured = {}
+    real_run = prov.subprocess.run
+
+    def _spy(cmd, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(prov.subprocess, "run", _spy)
+    prov.build_report(tree, repo, "HEAD", prov.DEFAULT_EXCLUDES, python=sys.executable)
+
+    assert "HERMES_HOME" in captured, "probe env must SET HERMES_HOME, not just unset it"
+    home = Path(captured["HERMES_HOME"])
+    assert home != Path.home() / ".hermes"
+    assert str(home) not in str(Path.home() / ".hermes")
+
+
 def test_strict_exit_code_only_with_flag(tree: Path, repo: Path, capsys):
     """Default exit is 0 even with drift — a permanently non-zero tool in
     scripts/ is a footgun once someone wires it to a gate. --strict opts in."""

@@ -60,7 +60,7 @@ Address root causes, not symptoms. **NEVER** swallow exceptions, comment out fai
 
 ## What is this repo
 
-`hermes-agent-fork` is the Minerva-mesh **fork** of the [NousResearch Hermes Agent](https://github.com/NousResearch/hermes-agent) framework — the agent/CLI/gateway codebase that powers the live 10-profile Minerva agent fleet.
+`hermes-agent-fork` is the Minerva-mesh **fork** of the [NousResearch Hermes Agent](https://github.com/NousResearch/hermes-agent) framework — the agent/CLI/gateway codebase that powers the live Minerva agent fleet (11 gateway units across 12 per-user accounts).
 
 - **Remotes:** `origin = git@github.com:mbs-vhs/hermes-agent.git` (the Minerva fork), `upstream = https://github.com/NousResearch/hermes-agent.git`. Default branch `main`. Package `hermes-agent` v0.18.0 (`pyproject.toml`); `requires-python >=3.11`; entry point `hermes = hermes_cli.main:main`.
 - **What it provides:** the `AIAgent` conversation loop (`run_agent.py`), the interactive CLI + Ink TUI (`cli.py`, `ui-tui/`, `tui_gateway/`), the messaging **gateway** (`gateway/` + per-platform adapters), tool orchestration (`model_tools.py`, `toolsets.py`, `tools/`), the plugin systems (`plugins/`), skills (`skills/`, `optional-skills/`), cron/kanban/curator subsystems, and the **ACP adapter** (`acp_adapter/` — VS Code / Zed / JetBrains integration).
@@ -188,7 +188,7 @@ nix develop                       # see flake.nix + nix/devShell.nix
 
 Stop and ask if:
 
-- **(a) Deploy / fleet mutation.** The change would deploy code to the **runtime checkout** (`~/.hermes/hermes-agent/`) or **restart any `ai.hermes.gateway-<id>.service`**. Editing this repo is in-lane; touching the running fleet is operator-coordinated (10 live gateways, blast radius = whole mesh).
+- **(a) Deploy / fleet mutation.** The change would deploy code to the **runtime checkout** (`~/.hermes/hermes-agent/`) or **restart any `ai.hermes.gateway-<id>.service`**. Editing this repo is in-lane; touching either live population is operator-coordinated (11 live gateway units, blast radius = whole mesh).
 - **(b) Shared-OAuth / credential pool.** The change would modify `~/.hermes/auth.json`, the credential pool, or any profile's `auth.json` / `.env`. This is the fleet-wide SPOF and is gated behind the 2026-06-01 OAuth-cap timeline. State the action and ask inline.
 - **(c) Live profile config.** The change would hand-edit a live profile's `config.yaml` or runtime state under `~/.hermes/profiles/<id>/` (including the mnemosyne plugin install or `memory.provider` flips). The ADR-058 rollout is complete (2026-06-02, all 10 profiles live); provider state remains operator-gated — do not flip it from a doc-driven session.
 - **(d) Plugin touches core.** The change would put plugin-specific logic into a core file (`run_agent.py`, `cli.py`, `gateway/run.py`, `hermes_cli/main.py`) — violates the Teknium rule. Expand the generic plugin surface instead.
@@ -212,7 +212,7 @@ Never echo secret values in chat, commit messages, or logs. Reference the source
 ## Cross-references
 
 - `AGENTS.md` (this repo) — upstream codebase-internals dev guide (the shared body for *how the code works*).
-- `~/.hermes/hermes-agent/` — the **runtime checkout** the 10 gateways actually run (separate from this dev fork).
+- `~/.hermes/hermes-agent/` — the **runtime checkout** serving `chat.vhs.box` + research. NOT the fleet: the 11 fleet gateway units exec from `/opt/hermes-agent/venv` (see the topology re-baseline above).
 - `~/.hermes/profiles/<id>/` — per-profile runtime state (config, auth, sessions, plugins, logs); not in this repo.
 - `~/dev/clawd/` — evidence + context service the mnemosyne plugin memorializes to (`POST /admin/memory-items`) and recalls from. Has its own `AGENTS.md` / `CLAUDE.md` pair.
 - `~/dev/mnemosyne/` — memory service / `compose_context` algorithm owner (recall transport for the ADR-058 plugin).

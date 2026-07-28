@@ -58,8 +58,10 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -190,12 +192,45 @@ def _module_name(rel: str) -> Optional[str]:
     return ".".join(parts)
 
 
+def origin_is_inside(origin: str, tree: Path) -> bool:
+    """True iff ``origin`` resolves to a path inside ``tree``.
+
+    Factored out so it is directly testable. The ``os.sep`` suffix is load-bearing:
+    without it a sibling like ``/opt/hermes-agent-evil/x.py`` would pass a bare
+    prefix check. ``resolve()`` also normalizes ``..`` and follows symlinks, so a
+    link pointing out of the tree resolves out and is (conservatively) dropped.
+    """
+    if not origin or origin.startswith("!error:"):
+        return False
+    try:
+        resolved = str(Path(origin).resolve())
+    except OSError:
+        return False
+    return resolved.startswith(str(tree.resolve()) + os.sep)
+
+
+class ProbeFailure(RuntimeError):
+    """The module-resolution subprocess could not be run or did not answer.
+
+    This must never be reported as "no orphans found". The whole point of this
+    tool is to make a runtime's drift *visible*; a probe that silently returns
+    an empty set turns a broken interpreter into a clean bill of health — and the
+    default interpreter is the root-owned fleet venv, exactly the thing most
+    likely to be relocated or broken. ``deploy-to-runtime.sh`` points operators at
+    ``--strict``, so a false clean here would read as "safe to deploy".
+    """
+
+
 def resolve_importable(
     tree: Path, only_in_tree: Sequence[str], python: Optional[str] = None
 ) -> Dict[str, str]:
     """Of the tree-only files, report those Python still resolves *inside the
     tree*. A resolution pointing anywhere else (site-packages, stdlib) is not an
-    orphan of this tree and is dropped."""
+    orphan of this tree and is dropped.
+
+    Raises ``ProbeFailure`` if the probe could not run — never returns ``{}`` to
+    mean "the probe broke".
+    """
     candidates = {}
     for rel in only_in_tree:
         mod = _module_name(rel)
@@ -210,36 +245,49 @@ def resolve_importable(
 
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    # A throwaway HERMES_HOME: importing gateway packages must never read or
-    # write a live profile. Never hardcode ~/.hermes here (profile-safety rule).
-    env.pop("HERMES_HOME", None)
-    proc = subprocess.run(
-        [interpreter, "-c", _FIND_SPEC_PROBE, json.dumps(sorted(candidates))],
-        cwd=str(tree),
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return {}
+    # A REAL throwaway HERMES_HOME. Popping the var is not enough: with it unset,
+    # hermes_constants falls back to Path.home()/".hermes" — the operator's LIVE
+    # profile tree (the chat.vhs.box population). Importing gateway packages must
+    # never be able to read or write that. Point it at a temp dir instead, and
+    # never hardcode ~/.hermes here (fork profile-safety rule).
+    probe_home = tempfile.mkdtemp(prefix="opt-provenance-hermes-home-")
+    env["HERMES_HOME"] = probe_home
+    try:
+        proc = subprocess.run(
+            [interpreter, "-c", _FIND_SPEC_PROBE, json.dumps(sorted(candidates))],
+            cwd=str(tree),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+    except OSError as exc:
+        raise ProbeFailure(f"could not run the probe interpreter {interpreter}: {exc}") from exc
+    finally:
+        shutil.rmtree(probe_home, ignore_errors=True)
+
+    if proc.returncode != 0:
+        raise ProbeFailure(
+            f"probe interpreter {interpreter} exited {proc.returncode}; "
+            f"stderr: {proc.stderr.strip()[:2000] or '(empty)'}"
+        )
+    if not proc.stdout.strip():
+        raise ProbeFailure(
+            f"probe interpreter {interpreter} produced no output; "
+            f"stderr: {proc.stderr.strip()[:2000] or '(empty)'}"
+        )
     try:
         resolved = json.loads(proc.stdout.strip().splitlines()[-1])
-    except json.JSONDecodeError:
-        return {}
+    except json.JSONDecodeError as exc:
+        raise ProbeFailure(
+            f"probe output was not JSON: {exc}; stdout tail: {proc.stdout.strip()[-500:]!r}"
+        ) from exc
 
-    tree_str = str(tree.resolve())
-    out: Dict[str, str] = {}
-    for mod, origin in resolved.items():
-        if not origin or origin.startswith("!error:"):
-            continue
-        try:
-            resolved_origin = str(Path(origin).resolve())
-        except OSError:
-            continue
-        if resolved_origin.startswith(tree_str + os.sep):
-            out[candidates[mod]] = resolved_origin
-    return out
+    return {
+        candidates[mod]: str(Path(origin).resolve())
+        for mod, origin in resolved.items()
+        if origin_is_inside(origin, tree)
+    }
 
 
 def build_report(
@@ -339,7 +387,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     repo = Path(args.repo) if args.repo else Path(__file__).resolve().parent.parent
     excludes = list(DEFAULT_EXCLUDES) + list(args.exclude)
 
-    report = build_report(tree, repo, args.ref, excludes, python=args.python)
+    try:
+        report = build_report(tree, repo, args.ref, excludes, python=args.python)
+    except ProbeFailure as exc:
+        # Loud failure, never a clean report. A broken probe means the orphan set
+        # is UNMEASURED, which is not the same as empty.
+        print(f"error: module-resolution probe failed: {exc}", file=sys.stderr)
+        print("error: orphan set is UNMEASURED — do not treat this as 'no drift'", file=sys.stderr)
+        return 3
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))

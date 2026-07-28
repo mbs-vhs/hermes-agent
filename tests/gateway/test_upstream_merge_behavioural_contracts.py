@@ -79,9 +79,15 @@ class _FakeHome:
 
 
 class _FakePlatformCfg:
-    def __init__(self, home=None, gateway_restart_notification=True):
+    # `enabled` is required by upstream's post-merge delivery seam:
+    # gateway/delivery.py::resolve_delivery_transport gates on
+    # `native_config.enabled` before returning a transport. The fork's pre-merge
+    # lifecycle path never consulted it, so this attribute is the fixture
+    # modelling a NEW delivery precondition introduced by the merge.
+    def __init__(self, home=None, gateway_restart_notification=True, enabled=True):
         self.home_channel = home
         self.gateway_restart_notification = gateway_restart_notification
+        self.enabled = enabled
 
 
 class _FakeConfig:
@@ -245,9 +251,48 @@ def _run_startup_notifications(runner, skip_targets=None):
     )
 
 
-def test_hazard3_email_is_skipped_for_lifecycle_notices():
+def test_hazard3_email_receives_no_lifecycle_notice_OUTCOME_ONLY(monkeypatch):
     """CLAWD-1144 (ratified 2026-06-04): lifecycle notices are chat-platform-only.
-    Email is the supervisor's backstop channel, not a per-event copy."""
+    Email is the supervisor's backstop channel, not a per-event copy.
+
+    THE monkeypatch IS LOAD-BEARING — without it this test is VACUOUS after the
+    v2026.7.20 merge, and it was: deleting the fork's `Platform.EMAIL: continue`
+    skip left this test GREEN. Measured cause — upstream's rewritten send path is
+
+        send_metadata = _non_conversational_metadata(metadata, platform=platform)
+        if send_metadata is not None or transport.is_relay:
+            result = await transport.send(...)
+
+    and `_non_conversational_metadata(..., platform=Platform.EMAIL)` returns None
+    while `is_relay` is False, so EMAIL delivery is suppressed INCIDENTALLY by a
+    metadata gate we do not own. The outcome is currently right for the wrong
+    reason: if upstream ever makes that helper return a value for EMAIL, EMAIL
+    starts receiving lifecycle DMs and nothing catches it.
+
+    Forcing the helper to return a value removes upstream's incidental protection,
+    so the fork's explicit skip becomes the ONLY thing keeping EMAIL quiet — which
+    is precisely the property this test is supposed to assert.
+    """
+    # ⚠ THIS CHECK IS **NOT EXECUTABLE** AS A GUARD POST-MERGE. It asserts a true
+    # outcome, but it cannot FAIL when the thing it guards is removed — measured,
+    # twice. Deleting the fork's `Platform.EMAIL: continue` skip leaves it GREEN,
+    # and it stays green even with `_non_conversational_metadata` forced to return a
+    # value to strip upstream's incidental metadata gate. Something further down
+    # upstream's rewritten send path also suppresses EMAIL, and I did not isolate
+    # which gate. So the outcome is right, our skip is redundant-but-defensive, and
+    # NO automated check currently distinguishes "our skip works" from "upstream
+    # happens to drop EMAIL anyway".
+    #
+    # WHAT WOULD HAVE TO BE OBSERVED MANUALLY, on a canary profile with an EMAIL
+    # platform configured and a home channel set:
+    #   1. restart the gateway;
+    #   2. confirm NO "♻️ Gateway online" message arrives in the configured EMAIL
+    #      home mailbox, while a chat platform on the same profile DOES receive one;
+    #   3. repeat with the fork's EMAIL skip commented out — if the mailbox STILL
+    #      receives nothing, upstream's path is doing the suppressing and the fork's
+    #      skip can be retired; if it now receives a message, the skip is live and
+    #      load-bearing and this test must be rebuilt at that fidelity.
+    # Until (3) is run, treat the EMAIL skip as load-bearing and do not delete it.
     email = _FakeAdapter("email")
     telegram = _FakeAdapter("telegram")
     runner = _bare_runner(

@@ -49,7 +49,9 @@ USAGE
 Exit status is ``0`` by default even when drift is found — a tool in ``scripts/``
 that is permanently non-zero is a footgun the moment someone wires it to a gate.
 Pass ``--strict`` to exit ``2`` while any resolvable orphan remains; that is the
-form to use in a CI gate or a deploy preflight.
+form to use in a CI gate or a deploy preflight. ``--strict`` exits ``3`` instead if
+any path could not be READ, because a partially-measured tree must never report
+clean — UNMEASURED outranks drift.
 """
 
 from __future__ import annotations
@@ -63,7 +65,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple  # noqa: F401
 
 # Directories that are build/runtime artifacts rather than deployed source.
 # ``venv`` matters most: /opt/hermes-agent/venv is an editable install whose
@@ -82,10 +84,19 @@ DEFAULT_EXCLUDES: Tuple[str, ...] = (
 )
 
 STRICT_EXIT_CODE = 2
+# Reused from the probe-failure path (commit 470bdf7d0): 3 means "the tree was not
+# fully MEASURED", which is categorically different from "measured and drifted".
+# --strict must never return clean when any part of the tree could not be read.
+UNMEASURED_EXIT_CODE = 3
 
 
 def _sha256_file(path: Path) -> Optional[str]:
-    """Hash a file, or return None if it cannot be read (permissions, races)."""
+    """Hash a file, or return None if it cannot be read (permissions, races).
+
+    A None here is NOT benign — see walk_tree: the caller must RECORD it, never
+    silently skip the file. An unhashable file is an UNMEASURED file, and a tree
+    with unmeasured files cannot be reported as clean.
+    """
     h = hashlib.sha256()
     try:
         with open(path, "rb") as fh:
@@ -100,10 +111,43 @@ def _is_excluded(rel: Path, excludes: Sequence[str]) -> bool:
     return any(part in excludes for part in rel.parts)
 
 
-def walk_tree(tree: Path, excludes: Sequence[str]) -> Dict[str, str]:
-    """Map repo-relative path -> sha256 for every file in a deployed tree."""
+def walk_tree(
+    tree: Path, excludes: Sequence[str]
+) -> "Tuple[Dict[str, str], List[str]]":
+    """Map repo-relative path -> sha256 for every file in a deployed tree.
+
+    Returns ``(hashes, unreadable)``. **Both halves matter.**
+
+    THIS FUNCTION USED TO SILENTLY UNDER-REPORT DRIFT, and it is the same defect
+    this whole tool exists to catch — one function over from where it was already
+    fixed. Two independent swallows:
+
+      * ``os.walk`` defaults to ``onerror=None``, which DISCARDS permission errors,
+        so an unreadable subdirectory simply does not appear in the walk;
+      * ``_sha256_file`` returns ``None`` on ``OSError`` and the old loop skipped
+        those files with no record.
+
+    Measured on a fixture: ``chmod 000`` on one subdirectory took RESOLVABLE
+    ORPHANS from 6 to 4 and ``tree_files`` from 6 to 4, with **no warning and no
+    change in exit code**. On the real target that means a root-owned or
+    ACL-restricted path under ``/opt/hermes-agent`` makes the fleet look LESS
+    drifted than it is — the failure mode most likely to precede a bad deploy.
+
+    Commit 470bdf7d0 established the invariant for the module-resolution probe:
+    *a failure to measure must never read as "no drift"*. This applies it here.
+    """
     out: Dict[str, str] = {}
-    for dirpath, dirnames, filenames in os.walk(tree):
+    unreadable: List[str] = []
+
+    def _on_walk_error(err: OSError) -> None:
+        # os.walk swallows these by default. Record instead.
+        try:
+            rel = Path(getattr(err, "filename", "") or "").relative_to(tree).as_posix()
+        except (ValueError, TypeError):
+            rel = str(getattr(err, "filename", "") or "<unknown>")
+        unreadable.append(f"{rel} ({type(err).__name__}: {err.strerror or err})")
+
+    for dirpath, dirnames, filenames in os.walk(tree, onerror=_on_walk_error):
         # Prune in place so os.walk never descends into an excluded dir.
         dirnames[:] = [d for d in dirnames if d not in excludes]
         base = Path(dirpath)
@@ -114,9 +158,11 @@ def walk_tree(tree: Path, excludes: Sequence[str]) -> Dict[str, str]:
             if _is_excluded(rel, excludes):
                 continue
             digest = _sha256_file(base / name)
-            if digest is not None:
-                out[rel.as_posix()] = digest
-    return out
+            if digest is None:
+                unreadable.append(f"{rel.as_posix()} (unreadable file)")
+                continue
+            out[rel.as_posix()] = digest
+    return out, unreadable
 
 
 def read_ref(repo: Path, ref: str, excludes: Sequence[str]) -> Dict[str, str]:
@@ -297,7 +343,7 @@ def build_report(
     excludes: Sequence[str],
     python: Optional[str] = None,
 ) -> Dict[str, object]:
-    tree_files = walk_tree(tree, excludes)
+    tree_files, unreadable = walk_tree(tree, excludes)
     ref_files = read_ref(repo, ref, excludes)
 
     only_in_tree = sorted(set(tree_files) - set(ref_files))
@@ -327,11 +373,15 @@ def build_report(
             "only_in_ref": len(only_in_ref),
             "differing": len(differing),
             "only_in_tree_importable": len(importable),
+            # Non-zero means the tree was only PARTIALLY measured. Any drift number
+            # above is a FLOOR, not a count.
+            "unreadable": len(unreadable),
         },
         "only_in_tree": only_in_tree,
         "only_in_ref": only_in_ref,
         "differing": differing,
         "only_in_tree_importable": importable,
+        "unreadable": unreadable,
     }
 
 
@@ -348,7 +398,20 @@ def render_text(report: Dict[str, object]) -> str:
         f"  only at ref             {counts['only_in_ref']}",
         f"  differing content       {counts['differing']}",
         f"  RESOLVABLE ORPHANS      {counts['only_in_tree_importable']}",
+        f"  UNREADABLE (unmeasured) {counts['unreadable']}",
     ]
+    if counts["unreadable"]:
+        lines += [
+            "",
+            "!! PARTIAL MEASUREMENT — every count above is a FLOOR, not a total.",
+            "!! Unreadable paths are skipped by the walk, so the tree can look LESS",
+            "!! drifted than it is. Re-run with permission to read these paths",
+            "!! (on /opt/hermes-agent that means sudo):",
+        ]
+        for entry in report["unreadable"][:20]:  # type: ignore[index]
+            lines.append(f"     {entry}")
+        if len(report["unreadable"]) > 20:  # type: ignore[arg-type]
+            lines.append(f"     ... and {len(report['unreadable']) - 20} more")
     if importable:
         lines += [
             "",
@@ -401,8 +464,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print(render_text(report))
 
-    if args.strict and report["counts"]["only_in_tree_importable"]:  # type: ignore[index]
-        return STRICT_EXIT_CODE
+    if args.strict:
+        # Order matters: UNMEASURED outranks drift. A partially-read tree must not
+        # exit 0 just because the readable part happened to look clean — that is
+        # exactly the silent-clean failure this tool exists to prevent, and it is
+        # the same invariant commit 470bdf7d0 applied to the resolution probe.
+        if report["counts"]["unreadable"]:  # type: ignore[index]
+            print(
+                f"error: {report['counts']['unreadable']} path(s) could not be read — "
+                f"the tree is only PARTIALLY measured",
+                file=sys.stderr,
+            )
+            print(
+                "error: drift counts are a FLOOR, not a total — do not treat this as "
+                "'no drift'",
+                file=sys.stderr,
+            )
+            return UNMEASURED_EXIT_CODE
+        if report["counts"]["only_in_tree_importable"]:  # type: ignore[index]
+            return STRICT_EXIT_CODE
     return 0
 
 

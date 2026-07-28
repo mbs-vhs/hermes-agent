@@ -317,3 +317,104 @@ def test_deploy_to_runtime_help_range_matches_header():
         f"--help sed range ends at {match.group(1)} but the header ends at "
         f"{header_end}; bump the range (see the NOTE above that line)"
     )
+
+
+# ── unreadable paths must never read as "no drift" ──────────────────────────
+# Same invariant as test_probe_failure_is_loud_not_a_clean_report, one function
+# over. Before this, os.walk's default onerror=None discarded permission errors and
+# _sha256_file's None returns were skipped without a trace: chmod 000 on ONE
+# subdirectory took RESOLVABLE ORPHANS from 6 to 4 and tree_files from 6 to 4, with
+# no warning and no change in exit code. On /opt/hermes-agent that makes the fleet
+# look LESS drifted than it is — the failure most likely to precede a bad deploy.
+
+def _chmod_000(path: Path):
+    path.chmod(0o000)
+    return path
+
+
+def test_unreadable_directory_is_counted_not_swallowed(tmp_path, repo):
+    tree = tmp_path / "deployed2"
+    (tree / "pkg" / "sub").mkdir(parents=True)
+    (tree / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tree / "pkg" / "orphan.py").write_text("A = 1\n", encoding="utf-8")
+    (tree / "pkg" / "sub" / "__init__.py").write_text("", encoding="utf-8")
+    (tree / "pkg" / "sub" / "hidden.py").write_text("B = 1\n", encoding="utf-8")
+
+    before = prov.build_report(tree, repo, "HEAD", prov.DEFAULT_EXCLUDES,
+                               python=sys.executable)
+    assert before["counts"]["unreadable"] == 0
+    baseline_files = before["counts"]["tree_files"]
+
+    blocked = _chmod_000(tree / "pkg" / "sub")
+    try:
+        after = prov.build_report(tree, repo, "HEAD", prov.DEFAULT_EXCLUDES,
+                                  python=sys.executable)
+        assert after["counts"]["unreadable"] >= 1, (
+            "an unreadable subdirectory was SWALLOWED — os.walk's default "
+            "onerror=None discards permission errors, so the tree silently "
+            "measures smaller and looks less drifted than it is"
+        )
+        assert after["counts"]["tree_files"] < baseline_files, (
+            "sanity: the unreadable dir should reduce the measured file count; if it "
+            "does not, this fixture is not exercising the path"
+        )
+        assert after["unreadable"], "the unreadable paths must be NAMED, not just counted"
+    finally:
+        blocked.chmod(0o755)
+
+
+def test_strict_returns_UNMEASURED_not_clean_when_a_path_is_unreadable(tmp_path, repo):
+    """UNMEASURED outranks drift. A partially-read tree must not exit 0 just because
+    the readable part looked clean, and must not exit 2 either — 2 means 'measured
+    and drifted', which would understate the situation."""
+    tree = tmp_path / "deployed3"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "shared.txt").write_text("same\n", encoding="utf-8")
+    (tree / "sub" / "x.txt").write_text("y\n", encoding="utf-8")
+
+    blocked = _chmod_000(tree / "sub")
+    try:
+        rc = prov.main(["--tree", str(tree), "--repo", str(repo), "--ref", "HEAD",
+                        "--python", sys.executable, "--strict"])
+        assert rc == prov.UNMEASURED_EXIT_CODE, (
+            f"--strict returned {rc}; expected {prov.UNMEASURED_EXIT_CODE} "
+            f"(UNMEASURED). Returning 0 here is the silent-clean failure this tool "
+            f"exists to prevent; returning 2 would misreport it as merely drifted."
+        )
+    finally:
+        blocked.chmod(0o755)
+
+
+def test_strict_still_distinguishes_clean_from_drifted_when_fully_readable(tmp_path, repo):
+    """The new UNMEASURED path must not swallow the existing contract."""
+    clean = tmp_path / "clean2"
+    (clean / "pkg").mkdir(parents=True)
+    (clean / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (clean / "pkg" / "kept.py").write_text("VALUE = 1\n", encoding="utf-8")
+    argv = ["--tree", str(clean), "--repo", str(repo), "--ref", "HEAD",
+            "--python", sys.executable, "--strict"]
+    assert prov.main(argv) == 0, "a fully-readable, orphan-free tree must exit 0"
+
+
+def test_script_is_executable_because_operators_are_told_to_invoke_it_directly(tmp_path):
+    """scripts/deploy-to-runtime.sh instructs the operator to run this script by
+    path. It carries a shebang, so if the committed mode lacks +x the invocation
+    exits 126 — which, piped without capturing PIPESTATUS, reads as a PASS.
+
+    That is the CLAWD-3078 shape (check-windows-footguns.py, mode 0644), reproduced
+    in this file's own tooling. Guarded here so it cannot regress.
+    """
+    import stat
+    import subprocess as sp
+
+    script = Path(prov.__file__)
+    mode = script.stat().st_mode
+    assert mode & stat.S_IXUSR, (
+        f"{script.name} is not executable (mode {oct(mode & 0o777)}) but has a "
+        f"shebang and is documented as directly invokable — direct invocation would "
+        f"exit 126, which reads as a pass through a pipe"
+    )
+    proc = sp.run([str(script), "--help"], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, (
+        f"direct invocation exited {proc.returncode} (126 = not executable)"
+    )

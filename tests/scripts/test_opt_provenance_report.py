@@ -119,10 +119,23 @@ def test_excluded_paths_never_appear(tree: Path, repo: Path):
     assert "stale.pyc" not in joined
 
 
-def test_does_not_write_to_inspected_tree(tree: Path, repo: Path):
+def test_does_not_write_to_inspected_tree(tree: Path, repo: Path, monkeypatch):
     """Read-only is a contract, not a filesystem accident. find_spec imports
-    parent packages; without PYTHONDONTWRITEBYTECODE that drops __pycache__
-    into the tree."""
+    parent packages; without bytecode suppression that drops __pycache__ into the
+    tree.
+
+    THE delenv IS LOAD-BEARING — without it this test passes vacuously.
+    `scripts/run_tests.sh` exports PYTHONDONTWRITEBYTECODE=1 itself, and
+    `resolve_importable` builds the probe env with `dict(os.environ)`, so the
+    harness silently supplies a THIRD guard from outside the code under test.
+    Measured: with the env var inherited, deleting BOTH in-code guards
+    (env["PYTHONDONTWRITEBYTECODE"] and the probe's sys.dont_write_bytecode) still
+    passed 12/12. An operator running the tool from a normal shell has no such
+    harness, so the in-code guards are exactly what protects them — and this test
+    could not see their loss. Clearing the inherited var makes the guards
+    observable.
+    """
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
     before = {p.relative_to(tree) for p in tree.rglob("*")}
     _report(tree, repo)
     after = {p.relative_to(tree) for p in tree.rglob("*")}

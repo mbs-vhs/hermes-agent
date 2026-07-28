@@ -19,15 +19,36 @@ read from the environment at call time:
 - ``HERMES_OPERATOR_API_SERVER`` — truthy flag marking the API server as an
   operator-only surface (its caller has no per-user id).
 .. note::
-   ``HERMES_OPERATOR_WEBUI`` and the ``"webui"`` platform were REMOVED 2026-07-28
-   (CLAWD-2803). They existed solely for the hermes-webui browser surface at
-   ``chat.vhs.box``, which was decommissioned. The flag had readers here and a
-   guard test, but **no producer anywhere** — it was set in neither a systemd
-   unit nor ``/etc/chat-ui/.env`` — so the branch was already dead code. A
+   ``HERMES_OPERATOR_WEBUI`` was removed from the operator-predicate map on
+   2026-07-28 (CLAWD-2803) along with the ``"webui"`` entry in
+   ``_OPERATOR_PREDICATES``. It existed solely for the hermes-webui browser
+   surface at ``chat.vhs.box``, which was decommissioned.
+
+   **It DID have producers** — an earlier version of this note claimed "no
+   producer anywhere", which was wrong: it is set in
+   ``~/.hermes/profiles/minerva/.env`` and in the contained fleet gateway's
+   ``/home/hermes-minerva/.hermes/profiles/minerva/.env``. The search behind
+   that claim covered only systemd units and ``/etc/chat-ui/.env`` (the latter
+   already deleted, so it could only come back empty) and never looked at
+   profile ``.env`` files.
+
+   Removing the branch is nonetheless safe, for a different reason than
+   originally stated: ``_operator_person_id()`` short-circuits on the explicit
+   ``HERMES_OPERATOR_PERSON_ID``, which the minerva profile sets, so the WEBUI
+   fallback could never change its result; and ``_webui_matches`` was reachable
+   only via ``platform="webui"``, which only hermes-webui ever emitted. A
    ``platform="webui"`` call now falls through to the fail-safe below and
-   returns ``""``, which is the correct answer for a surface that no longer
-   exists. Control's ``/chat`` embeds agora (CLAWD-1971), and agora resolves the
-   canonical thread through its own path.
+   returns ``""``.
+
+   The two ``.env`` lines are now orphan writers-without-readers. They are NOT
+   edited here — ``~/.hermes/profiles/*/.env`` is an HR7 stop-condition surface
+   needing per-change operator approval. Tracked separately.
+
+   Scope note: this removed the ``"webui"`` key from the OPERATOR predicate map
+   only. Upstream Hermes still ships a live ``"webui"`` entry in
+   ``PLATFORM_HINTS`` (``agent/prompt_builder.py``) — deliberately untouched.
+   Control's ``/chat`` embeds agora (CLAWD-1971), which resolves the canonical
+   thread through its own path.
 
 FAIL-SAFE by construction: strangers, unknown platforms, and the CLI never
 merge. Any unexpected error, or a matched rule with an empty person id, falls

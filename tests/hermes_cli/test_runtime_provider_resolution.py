@@ -1,4 +1,5 @@
 import base64
+from pathlib import Path
 import json
 import time
 from types import SimpleNamespace
@@ -6,6 +7,27 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import runtime_provider as rp
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path, monkeypatch):
+    """Pin HOME to a throwaway dir for every test in this module (CLAWD-3056).
+
+    Without this, provider resolution reads the OPERATOR'S REAL credential state
+    out of $HOME. That is a live-secret exposure, not just an isolation nit: test
+    output goes to CI logs, session transcripts and terminal scrollback, any of
+    which can be pasted into a card or a chat.
+
+    It is also a correctness fix. Measured 2026-07-27: this file passes 142/142
+    with HOME redirected and FAILS 2 with the real HOME
+    (test_resolve_runtime_provider_qwen_oauth,
+    test_qwen_oauth_auto_fallthrough_on_auth_failure) — i.e. two assertions were
+    reading whichever credentials the operator happened to have on disk, so the
+    result depended on the machine. Those two are among the pre-existing
+    full-suite failures tracked on CLAWD-3055.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
 
 def _fake_invoke_jwt(ttl_seconds=3600):

@@ -60,37 +60,56 @@ Address root causes, not symptoms. **NEVER** swallow exceptions, comment out fai
 
 ## What is this repo
 
-`hermes-agent-fork` is the Minerva-mesh **fork** of the [NousResearch Hermes Agent](https://github.com/NousResearch/hermes-agent) framework — the agent/CLI/gateway codebase that powers the live 10-profile Minerva agent fleet.
+`hermes-agent-fork` is the Minerva-mesh **fork** of the [NousResearch Hermes Agent](https://github.com/NousResearch/hermes-agent) framework — the agent/CLI/gateway codebase that powers the live Minerva agent fleet (11 gateway units across 12 per-user accounts).
 
-- **Remotes:** `origin = git@github.com:mbs-vhs/hermes-agent.git` (the Minerva fork), `upstream = https://github.com/NousResearch/hermes-agent.git`. Default branch `main`. Package `hermes-agent` v0.14.0 (`pyproject.toml`); `requires-python >=3.11`; entry point `hermes = hermes_cli.main:main`.
+- **Remotes:** `origin = git@github.com:mbs-vhs/hermes-agent.git` (the Minerva fork), `upstream = https://github.com/NousResearch/hermes-agent.git`. Default branch `main`. Package `hermes-agent` v0.18.0 (`pyproject.toml`); `requires-python >=3.11`; entry point `hermes = hermes_cli.main:main`.
 - **What it provides:** the `AIAgent` conversation loop (`run_agent.py`), the interactive CLI + Ink TUI (`cli.py`, `ui-tui/`, `tui_gateway/`), the messaging **gateway** (`gateway/` + per-platform adapters), tool orchestration (`model_tools.py`, `toolsets.py`, `tools/`), the plugin systems (`plugins/`), skills (`skills/`, `optional-skills/`), cron/kanban/curator subsystems, and the **ACP adapter** (`acp_adapter/` — VS Code / Zed / JetBrains integration).
 - **For codebase internals, defer to `AGENTS.md`.** This file does not duplicate the project tree, the agent loop, or the authoring guides.
 
-### This fork vs the live `~/.hermes/` runtime (the load-bearing distinction)
+### This fork vs the live runtimes (the load-bearing distinction)
+
+> **TOPOLOGY RE-BASELINED 2026-07-25 (CLAWD-2792) — read this before trusting the table below.**
+> There are now **TWO live Hermes populations**, not one:
+>
+> | Population | Runs from | Managed by | Serves |
+> |---|---|---|---|
+> | **The fleet** (12 profiles) | `/opt/hermes-agent/venv` — an **installed package** (`hermes-agent 0.18.0`), *not* a checkout | `ai.hermes.gateway-<profile>.service` under **each per-user manager** (`/home/hermes-<profile>`) | the agent fleet |
+> | **The `~/.hermes` checkout** | `~/.hermes/hermes-agent` + its venv (hermes-agent installed **editable**) | `ai.minerva.chat-ui.service` etc. under the operator's manager | `chat.vhs.box` + research |
+>
+> The 11 `ai.hermes.gateway-*.service` units under the **operator's own** manager are **legacy leftovers and are all MASKED**. The older claim "the 10 gateways run from `~/.hermes/hermes-agent`" is **no longer true** and, left uncorrected, made `scripts/deploy-to-runtime.sh` fail *dangerous* (it advanced the live chat runtime, then errored about gateways it could never restart). That script now validates restart targets **before** mutating.
+>
+> Because the `~/.hermes` venv installs hermes-agent **editable**, advancing that checkout changes the code `chat.vhs.box` imports **immediately** — treat it as a live mutation, not a staged one.
 
 **This repo is code. `~/.hermes/` is runtime state. They are two separate checkouts.**
 
 | | Dev fork (this repo) | Runtime checkout |
 |---|---|---|
 | Path | `~/dev/hermes-agent-fork/` | `~/.hermes/hermes-agent/` |
-| Role | Where you **edit code**, run tests, open PRs | What the **10 live gateways actually run** |
+| Role | Where you **edit code**, run tests, open PRs | Serves `chat.vhs.box` + research (**not** the fleet — see the re-baseline above) |
 | Remote | `origin` = mbs-vhs/hermes-agent (+ `upstream`) | `origin` = mbs-vhs/hermes-agent |
 | Venv | `.venv` / `venv` (repo-local) | `~/.hermes/hermes-agent/venv` |
 
-The systemd units launch the gateway from the **runtime checkout**, not this repo:
+**SUPERSEDED 2026-07-25 — the unit shown below is a MASKED legacy leftover, not how the fleet runs.** All 11 `ai.hermes.gateway-*.service` units under the *operator's* manager are masked. Kept only to show what the old topology looked like:
 
 ```ini
-# ~/.config/systemd/user/ai.hermes.gateway-<id>.service
+# ~/.config/systemd/user/ai.hermes.gateway-<id>.service   ← MASKED / LEGACY
 WorkingDirectory=/home/morganstempf/.hermes/hermes-agent
 ExecStart=/home/morganstempf/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main --profile <id> gateway run --replace
 Environment=HERMES_HOME=/home/morganstempf/.hermes/profiles/<id>
 ```
 
-Editing files in `~/dev/hermes-agent-fork/` does **not** change the running fleet. Deployment to the runtime checkout (and the gateway restarts that follow) is an operator-coordinated step — see **Stop conditions**. (Unverified: the exact deploy mechanism — likely `git pull` in the runtime checkout + `systemctl --user restart`; confirm before relying on it.)
+The **live** fleet units live under each per-user manager and exec from `/opt`:
 
-### The 10-profile mesh
+```ini
+# /home/hermes-<id>/.config/systemd/user/ai.hermes.gateway-<id>.service   ← LIVE
+ExecStart=/opt/hermes-agent/venv/bin/python ...
+```
 
-Ten user-level systemd services run, one per profile, all confirmed **active/running**:
+Editing files in `~/dev/hermes-agent-fork/` does **not** change either running population. Deployment is an operator-coordinated step — see **Stop conditions**. `scripts/deploy-to-runtime.sh` serves **only** the `~/.hermes` population and validates its restart targets before mutating anything; it cannot reach the `/opt` fleet.
+
+### The profile mesh
+
+Eleven gateway units run (one per profile; the 12th account `hermes-cc` has none), each under its own per-user systemd manager:
 
 `clients`, `engineer`, `finance`, `legal`, `librarian`, `marketing`, `minerva`, `research`, `sales`, `strategy` (the former `growth` profile was converted to `sales`).
 
@@ -169,7 +188,7 @@ nix develop                       # see flake.nix + nix/devShell.nix
 
 Stop and ask if:
 
-- **(a) Deploy / fleet mutation.** The change would deploy code to the **runtime checkout** (`~/.hermes/hermes-agent/`) or **restart any `ai.hermes.gateway-<id>.service`**. Editing this repo is in-lane; touching the running fleet is operator-coordinated (10 live gateways, blast radius = whole mesh).
+- **(a) Deploy / fleet mutation.** The change would deploy code to the **runtime checkout** (`~/.hermes/hermes-agent/`) or **restart any `ai.hermes.gateway-<id>.service`**. Editing this repo is in-lane; touching either live population is operator-coordinated (11 live gateway units, blast radius = whole mesh).
 - **(b) Shared-OAuth / credential pool.** The change would modify `~/.hermes/auth.json`, the credential pool, or any profile's `auth.json` / `.env`. This is the fleet-wide SPOF and is gated behind the 2026-06-01 OAuth-cap timeline. State the action and ask inline.
 - **(c) Live profile config.** The change would hand-edit a live profile's `config.yaml` or runtime state under `~/.hermes/profiles/<id>/` (including the mnemosyne plugin install or `memory.provider` flips). The ADR-058 rollout is complete (2026-06-02, all 10 profiles live); provider state remains operator-gated — do not flip it from a doc-driven session.
 - **(d) Plugin touches core.** The change would put plugin-specific logic into a core file (`run_agent.py`, `cli.py`, `gateway/run.py`, `hermes_cli/main.py`) — violates the Teknium rule. Expand the generic plugin surface instead.
@@ -193,7 +212,7 @@ Never echo secret values in chat, commit messages, or logs. Reference the source
 ## Cross-references
 
 - `AGENTS.md` (this repo) — upstream codebase-internals dev guide (the shared body for *how the code works*).
-- `~/.hermes/hermes-agent/` — the **runtime checkout** the 10 gateways actually run (separate from this dev fork).
+- `~/.hermes/hermes-agent/` — the **runtime checkout** serving `chat.vhs.box` + research. NOT the fleet: the 11 fleet gateway units exec from `/opt/hermes-agent/venv` (see the topology re-baseline above).
 - `~/.hermes/profiles/<id>/` — per-profile runtime state (config, auth, sessions, plugins, logs); not in this repo.
 - `~/dev/clawd/` — evidence + context service the mnemosyne plugin memorializes to (`POST /admin/memory-items`) and recalls from. Has its own `AGENTS.md` / `CLAUDE.md` pair.
 - `~/dev/mnemosyne/` — memory service / `compose_context` algorithm owner (recall transport for the ADR-058 plugin).
@@ -206,3 +225,5 @@ Never echo secret values in chat, commit messages, or logs. Reference the source
 | Date | Change | Ref |
 |---|---|---|
 | 2026-05-29 | Created. Initial Minerva-fork operational CLAUDE.md layered over the inherited upstream `AGENTS.md`; documents fork-vs-runtime split, 10-profile mesh, shared-OAuth SPOF, ADR-058 mnemosyne rollout, ACP adapter, stop-conditions. | CLAWD-792 |
+| 2026-07-25 | **Topology re-baseline.** Corrected the falsified "the 10 gateways run from `~/.hermes/hermes-agent`" claim: there are now TWO live populations — the fleet (11 gateway units across 12 per-user accounts, exec from `/opt/hermes-agent/venv`, an editable install on a non-git tree) and the `~/.hermes` checkout (serves `chat.vhs.box` + research; hermes-webui *spawns* agents from its venv, so a deploy lands on the next spawned agent). The operator-manager `ai.hermes.gateway-*` units are masked legacy. This staleness had made `scripts/deploy-to-runtime.sh` fail *dangerous* — it advanced the live chat runtime 4,547 commits, then errored on gateways it could never restart; that script now validates restart targets **before** mutating. | CLAWD-2792 |
+| 2026-07-27 | **`/opt/hermes-agent` made measurable; stale version corrected.** Fixed the `v0.14.0` package version (it is `0.18.0`; `0.14.0` is the *`~/.hermes`* venv, a different population). Added read-only `scripts/opt_provenance_report.py` + tests: the fleet runtime has no `.git`, so this is the only way to answer "what is running?" / "has it drifted?". Measured 251 files present in `/opt` and absent from `HEAD`, 33 still resolvable as importable modules — every one traced to a named deleting commit, so a `--delete` deploy would have removed live-tree code with no record of why. Both deploy-script refusal sites now point at the tool and the substrate proposal. GROK.md additionally received the 2026-07-25 topology re-baseline it never got — it was still asserting the falsified single-runtime topology. | CLAWD-2833 |

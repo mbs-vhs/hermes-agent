@@ -21,6 +21,16 @@
 # The 11 ai.hermes.gateway-*.service units under the operator's own manager are
 # LEGACY LEFTOVERS and are all MASKED (the fleet relocated to per-user accounts).
 #
+# WHY THE FLEET HALF IS NOT JUST UNIMPLEMENTED (CLAWD-2833): /opt/hermes-agent
+# has no .git, so there is no ref to deploy FROM and no `git status` to detect
+# drift with. It is also not a clean copy of any ref — measured 2026-07-27, 251
+# files exist in it that HEAD does not have, 33 of which Python still resolves as
+# importable modules. A ref-based deploy with --delete semantics would remove
+# those from 11 live gateways at once. Every one of the 251 now has a documented
+# provenance (see scripts/opt_provenance_report.py), but the deploy substrate
+# itself is a ratification decision, not something this script should grow
+# quietly:  devops-process/proposals/2026-07-27-opt-hermes-deploy-substrate.md
+#
 # It advances the runtime to origin/<branch> by a strict fast-forward and then
 # (optionally, gated) restarts the gateway units it validated up front.
 #
@@ -62,7 +72,7 @@ for arg in "$@"; do
     # last "#" line before `set -euo pipefail`. A stale range silently truncates
     # --help (it once cut off every flag, including the --no-restart that the
     # step-1b die() tells operators to use).
-    -h|--help)          sed -n '2,48p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)          sed -n '2,58p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "deploy-to-runtime: unknown arg: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -92,7 +102,12 @@ fi
 units=()
 if [ "$NO_RESTART" = "0" ]; then
   mapfile -t units < <(systemctl --user list-unit-files 'ai.hermes.gateway-*.service' --no-legend 2>/dev/null | awk '{print $1}' | sort)
-  [ "${#units[@]}" -gt 0 ] || die "no ai.hermes.gateway-*.service units found under this user manager. If the fleet has moved (it now runs per-user from /opt/hermes-agent), this script cannot deploy it — use --no-restart to advance ONLY the ~/.hermes checkout, and restart its consumers (chat-ui) yourself."
+  # NOTE (CLAWD-2833): on the current host this branch is DEAD CODE — 11 masked
+  # legacy units still exist under the operator's manager, so units[] is never
+  # empty and control always reaches the loadability check below. Kept for the
+  # host where those leftovers have been removed. Re-derive which branch fires:
+  #   systemctl --user list-unit-files 'ai.hermes.gateway-*.service' --no-legend
+  [ "${#units[@]}" -gt 0 ] || die "no ai.hermes.gateway-*.service units found under this user manager. If the fleet has moved (it now runs per-user from /opt/hermes-agent), this script cannot deploy it — use --no-restart to advance ONLY the ~/.hermes checkout, and restart its consumers (chat-ui) yourself. The fleet has no deploy path yet, by design: /opt/hermes-agent has no .git to deploy from — run scripts/opt_provenance_report.py --tree /opt/hermes-agent --strict to see what diverges, and see devops-process/proposals/2026-07-27-opt-hermes-deploy-substrate.md (CLAWD-2833)."
   # Reject anything not cleanly loadable, not just `masked`. LoadState collapses
   # masked/masked-runtime, but `error` / `bad-setting` (unparseable unit) would
   # also sail past a masked-only check and then fail at restart — reaching the
@@ -106,6 +121,10 @@ if [ "$NO_RESTART" = "0" ]; then
     log "${#bad[@]}/${#units[@]} gateway unit(s) are not loadable and cannot be restarted:"
     printf '%s\n' "${bad[@]}" | sed 's/^/    /'
     log "masked ones are legacy leftovers; the live fleet runs per-user from /opt/hermes-agent."
+    log "the fleet has no deploy path yet BY DESIGN: /opt/hermes-agent has no .git,"
+    log "so there is no ref to deploy from and no git status to detect drift with."
+    log "  measure the divergence: scripts/opt_provenance_report.py --tree /opt/hermes-agent --strict"
+    log "  the substrate decision:  devops-process/proposals/2026-07-27-opt-hermes-deploy-substrate.md (CLAWD-2833)"
     die "refusing to deploy: nothing was mutated. Restarting a masked/unloadable unit always fails, and advancing the runtime first would leave the live chat runtime half-deployed. To advance ONLY the ~/.hermes checkout (chat.vhs.box / research), re-run with --no-restart — and note that takes effect on the NEXT SPAWNED AGENT, so there is no restart that stages it."
   fi
 fi

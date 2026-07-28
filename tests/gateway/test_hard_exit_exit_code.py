@@ -8,7 +8,9 @@ decision so the watchdog never changes shutdown semantics.
 
 This file tests the helper exhaustively against that documented contract:
 
-  start_gateway() exit ladder (gateway/run.py ~18685-18742, mapped to codes):
+  start_gateway() exit ladder (locate with
+  ``rg -n 'signal-initiated shutdown without restart' gateway/run.py`` — do not
+  freeze a line range here; the previous one, ~18685-18742, was already stale):
     1. should_exit_with_failure truthy  -> return False -> sys.exit(1)   => 1
     2. exit_code is not None            -> raise SystemExit(exit_code)   => exit_code
     3. signal_initiated and not _restart_requested -> return False       => 1
@@ -18,12 +20,22 @@ This file tests the helper exhaustively against that documented contract:
 The helper's ladder must match branch-for-branch, including PRECEDENCE: when
 multiple flags are set, the FIRST matching rung wins.
 
-KNOWN COVERAGE BOUNDARY (CLAWD-1023): the watchdog's *timing / os._exit*
-behavior (the ``_hard_exit_watchdog`` nested closure: await wait_for_shutdown()
-+ real asyncio.sleep(grace) + os._exit) is not cleanly unit-testable — it is a
-nested closure capturing locals, performs a real sleep, and hard-exits the
-interpreter. We do not force a test around it. The exit-code helper is the
-testable, deterministic core of the watchdog and is what this file covers.
+COVERAGE BOUNDARY LIFTED (CLAWD-2837). This docstring used to state that the
+watchdog's timing / ``os._exit`` behaviour was "not cleanly unit-testable … We do
+not force a test around it", because it was a nested closure capturing
+``start_gateway`` locals. It is no longer a closure: it now lives in
+``gateway/hard_exit.py`` as ``arm_post_stop_exit_watchdog()``, and
+``tests/gateway/test_hard_exit_watchdog_arm.py`` covers exactly what this
+paragraph disclaimed — the arm/wait/grace/exit sequence, the late-binding of
+``signal_initiated``, exception swallowing, and grace resolution — with
+``os._exit`` and ``asyncio.sleep`` monkeypatched. This file remains the
+exhaustive ladder-parity contract.
+
+NOTE ON THE IMPORT BELOW: ``from gateway.run import _resolve_hung_shutdown_exit_code``
+is deliberately UNCHANGED even though the function now lives in
+``gateway.hard_exit``. ``run.py`` re-binds it, and this import is the live proof
+that re-bind holds — it also keeps this file importing ``gateway.run``, so it
+doubles as an import-health / no-cycle check. Do not "tidy" it to the new path.
 """
 
 import itertools

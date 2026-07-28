@@ -15,7 +15,7 @@ X/Twitter via xurl CLI: post, search, DM, media, v2 API.
 | | |
 |---|---|
 | Source | Bundled (installed by default) |
-| Path | `skills/devops/xurl` |
+| Path | `skills/social-media/xurl` |
 | Version | `1.1.1` |
 | Author | xdevplatform + openclaw + Hermes Agent |
 | License | MIT |
@@ -204,6 +204,15 @@ xurl read https://x.com/user/status/1234567890
 xurl search "golang"
 xurl search "from:elonmusk" -n 20
 xurl search "#buildinpublic lang:en" -n 15
+```
+
+For X Articles, use raw API mode instead of the `read` shortcut. `xurl read`
+expects a post ID or post URL; do not put `read` before a `/2/tweets/...`
+endpoint. Request the `article` tweet field and ingest `data.article.plain_text`
+from the JSON response:
+
+```bash
+xurl --app APP_NAME '/2/tweets/2057909493250539891?expansions=author_id,attachments.media_keys,referenced_tweets.id&tweet.fields=created_at,lang,public_metrics,context_annotations,entities,possibly_sensitive,conversation_id,in_reply_to_user_id,referenced_tweets,article'
 ```
 
 ### Users, Timeline, Mentions

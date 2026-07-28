@@ -64,7 +64,7 @@ We fork Hermes (rather than use upstream directly or build a runtime) because Mi
 
 ## What changed and why (recent)
 
+- 2026-07-27 — **skills delta removed** (CLAWD-2834) — `skills/`, `tests/skills/` and `website/` are now byte-identical to the upstream merge-base. `xurl` is UPSTREAM's skill: the fork had only *recategorized* it (`social-media/` → `devops/`, R100) and skipped its test, so the fix was to revert, not delete — deleting would have removed upstream capability and *grown* the delta. `tufte-data-viz` (fork-local, 19 files) deleted; its live on-disk copies are handled separately (CLAWD-2835, operator-gated). Also removed two mis-pathed v0.18 merge-conflict artifacts under `skills/autonomous-ai-agents/hermes-agent/references/`. Runtime discovery is `$HERMES_HOME/skills` + `skills.external_dirs`, so no running process changes; already-synced profile copies are left in place by design (`tools/skills_sync.py` cleans the manifest, not the disk). Known accepted consequence: the relocation does not propagate to already-synced profiles, which keep a stale `devops/xurl` copy.
 - 2026-05-29 — gitleaks pre-commit (ADR-059) — secret leak-guard
 - 2026-05-29 — fork `CLAUDE.md` added (CLAWD-792) — document fleet operations
-- 2026-05-28 — `tufte` skill added, `xurl` recategorized — local skill curation
 - 2026-05-27 — emit `session:end` from idle-expiry/auto-reset paths — correct lifecycle accounting for long-lived gateways

@@ -185,6 +185,31 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
     whoami_result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
     assert "Tier: user" in whoami_result
 
+    # ...and it must list the ENTIRE always-allowed floor. This assertion is the
+    # point of the test, and it was missing (CLAWD-2839): with
+    # `user_allowed_commands: []` the only possible source of these entries is the
+    # floor, so a floor that has drifted from
+    # slash_access._ALWAYS_ALLOWED_FOR_USERS shows up here and nowhere else.
+    #
+    # Why that mattered: the fork carried a SHADOWING COPY of
+    # _handle_whoami_command in gateway/run.py whose only difference from the
+    # mixin was a hardcoded floor list. Deleting the override without first
+    # deriving the mixin's floor from the constant would have silently dropped
+    # /status from /whoami — and the entire named test cone stayed GREEN, because
+    # the other whoami test supplies "status" via `user_allowed_commands` and so
+    # passes either way.
+    from gateway.slash_access import _ALWAYS_ALLOWED_FOR_USERS
+
+    for cmd in sorted(_ALWAYS_ALLOWED_FOR_USERS):
+        assert f"/{cmd}" in whoami_result, (
+            f"/whoami omitted the always-allowed command /{cmd} for a non-admin "
+            f"with user_allowed_commands=[]; the display floor has drifted from "
+            f"slash_access._ALWAYS_ALLOWED_FOR_USERS"
+        )
+    # Specifically pin /status: it is the entry the fork's override added and the
+    # one a revert to the old hardcoded ["help", "whoami"] literal would lose.
+    assert "/status" in whoami_result
+
 
 # ---------------------------------------------------------------------------
 # Gate ALLOW — admin and listed user

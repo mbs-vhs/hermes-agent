@@ -59,6 +59,22 @@ class TestKnownPrefixes:
         result = redact_sensitive_text("fal_abc123def456ghi789jkl")
         assert "abc123def456" not in result
 
+    def test_fireworks_keys(self):
+        samples = [
+            "fw-" + "A" * 40,
+            "fw_" + "B" * 40,
+            "fpk_" + "C" * 40,
+        ]
+
+        for token in samples:
+            result = redact_sensitive_text(f"provider error {token}")
+            assert token not in result
+            assert "..." in result
+
+    def test_short_fireworks_like_words_unchanged(self):
+        text = "fw-tooshort fw_tooshort fpk_tooshort"
+        assert redact_sensitive_text(text) == text
+
     def test_notion_internal_integration_token(self):
         result = redact_sensitive_text("ntn_abc123def456ghi789jkl")
         assert "abc123def456" not in result
@@ -122,6 +138,80 @@ class TestEnvAssignments:
         assert result.startswith("export ")
         assert "SECRET_TOKEN=" in result
         assert "mypassword" not in result
+
+
+class TestEnvLookupPreserved:
+    """Programmatic env var lookups must not be corrupted (issue #2852)."""
+
+    def test_os_getenv_single_quote_uppercase_key(self):
+        text = "MY_API_KEY=os.getenv('OPENAI_API_KEY')"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_os_getenv_lowercase_config_key(self):
+        text = "ha_token=os.getenv('HOMEASSISTANT_TOKEN')"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_os_getenv_double_quote(self):
+        text = 'API_TOKEN=os.getenv("MY_API_TOKEN")'
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_os_environ_get(self):
+        text = "HA_TOKEN=os.environ.get('HOMEASSISTANT_TOKEN')"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_os_environ_bracket(self):
+        text = "MY_SECRET=os.environ['MY_SECRET']"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_process_env(self):
+        text = "api_key=process.env.API_KEY"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_real_env_value_still_redacted(self):
+        text = "HOMEASSISTANT_TOKEN=eyJhbGciOiJIUzI1NiJ9.abc123.xyz"
+        result = redact_sensitive_text(text, force=True)
+        assert "eyJhbGciOiJIUzI1NiJ9" not in result
+
+    def test_real_lowercase_value_still_redacted(self):
+        text = "password=hunter2hunter2"
+        result = redact_sensitive_text(text, force=True)
+        assert "hunter2hunter2" not in result
+
+    def test_multiline_prose_with_code_snippet(self):
+        text = """Set it up like this:
+    HA_TOKEN=os.getenv('HOMEASSISTANT_TOKEN')
+    if not HA_TOKEN:
+        raise ValueError('Missing credentials')"""
+        result = redact_sensitive_text(text, force=True)
+        assert "os.getenv('HOMEASSISTANT_TOKEN')" in result
+
+    def test_json_field_os_getenv_preserved(self):
+        # _redact_env has the env-lookup exception; _redact_json (a separate
+        # closure, JSON key: "value" syntax) did not, and mangled this into
+        # '"apiKey": "os.get...EY')"'.
+        text = '{"apiKey": "os.getenv(\'OPENAI_API_KEY\')"}'
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_json_field_os_environ_get_preserved(self):
+        text = '{"token": "os.environ.get(\'MY_TOKEN\')"}'
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_json_field_real_value_still_redacted(self):
+        text = '{"apiKey": "sk-realSecretValue1234567890"}'
+        result = redact_sensitive_text(text, force=True)
+        assert "sk-realSecretValue1234567890" not in result
+
+    def test_yaml_field_os_getenv_preserved(self):
+        # Same exception missing from _redact_yaml (unquoted key: value
+        # syntax) — mangled 'api_key: os.getenv("OPENAI_API_KEY")' into
+        # 'api_key: os.get...EY")'.
+        text = 'api_key: os.getenv("OPENAI_API_KEY")'
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_yaml_field_real_value_still_redacted(self):
+        text = "api_key: sk-realSecretValue1234567890"
+        result = redact_sensitive_text(text, force=True)
+        assert "sk-realSecretValue1234567890" not in result
 
 
 class TestJsonFields:
@@ -496,6 +586,57 @@ class TestWebUrlsNotRedacted:
         text = "postgres://admin:dbpass@db.internal:5432/app"
         result = redact_sensitive_text(text)
         assert "dbpass" not in result
+
+
+class TestStrictUrlCredentialRedaction:
+    @pytest.mark.parametrize(
+        ("text", "secret", "expected"),
+        [
+            (
+                "https://x.test/#access_token=FRAG_SECRET&view=public",
+                "FRAG_SECRET",
+                "https://x.test/#access_token=***&view=public",
+            ),
+            (
+                "/resume?token=REL_SECRET&view=public",
+                "REL_SECRET",
+                "/resume?token=***&view=public",
+            ),
+            (
+                "https://x.test/cb?client%5Fsecret=ENC_SECRET&view=public",
+                "ENC_SECRET",
+                "https://x.test/cb?client%5Fsecret=***&view=public",
+            ),
+            (
+                "https://x.test/cb?client%255Fsecret=DOUBLE_SECRET&view=public",
+                "DOUBLE_SECRET",
+                "https://x.test/cb?client%255Fsecret=***&view=public",
+            ),
+            (
+                "/resume?token=SEMICOLON_SECRET;view=public",
+                "SEMICOLON_SECRET",
+                "/resume?token=***;view=public",
+            ),
+            (
+                "//user:NET_SECRET@x.test/path",
+                "NET_SECRET",
+                "//user:***@x.test/path",
+            ),
+        ],
+    )
+    def test_masks_all_url_reference_forms_only_when_opted_in(
+        self, text, secret, expected
+    ):
+        assert redact_sensitive_text(text) == text
+
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+
+        assert secret not in result
+        assert result == expected
+
+    def test_similarly_named_public_params_remain_unchanged(self):
+        text = "/metrics?token_count=17&session_id=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == text
 
 
 class TestBareTokenUserinfoRedaction:
@@ -956,3 +1097,96 @@ class TestRedactCdpUrl:
 
     def test_none_returns_empty(self):
         assert redact_cdp_url(None) == ""
+
+
+class TestKeywordWordBoundary:
+    """Ported from nearai/ironclaw#6129 — a secret keyword embedded inside a
+    larger prose word (``Secretary`` ⊃ ``secret``, ``tokenizer`` ⊃ ``token``,
+    ``authored`` ⊃ ``auth``) must NOT trigger the lowercase/dotted/YAML config
+    passes. Real key shapes (separators, camelCase, acronyms, plurals, common
+    concatenated compounds, all-caps env style) must keep redacting.
+    """
+
+    # ── prose words embedding a keyword are preserved ──────────────────
+
+    def test_secretary_yaml_value_preserved(self):
+        text = "Secretary: JanetYellen1234567890"
+        assert redact_sensitive_text(text) == text
+
+    def test_undersecretary_preserved(self):
+        text = "Undersecretary: RobertSmith123456789"
+        assert redact_sensitive_text(text) == text
+
+    def test_tokenizer_yaml_value_preserved(self):
+        # HuggingFace model-card style metadata.
+        text = "tokenizer: cl100k_base_long_name_x"
+        assert redact_sensitive_text(text) == text
+
+    def test_secretariat_preserved(self):
+        text = "secretariat: GenevaOffice123456789"
+        assert redact_sensitive_text(text) == text
+
+    def test_secretary_equals_assignment_preserved(self):
+        text = "secretary=JohnSmith12345678901234"
+        assert redact_sensitive_text(text) == text
+
+    def test_dotted_secretary_preserved(self):
+        text = "press.secretary=KarineJeanPierre123"
+        assert redact_sensitive_text(text) == text
+
+    def test_bibtex_author_assignment_preserved(self):
+        # ``author`` embeds the ``auth`` keyword — citation keys are prose.
+        text = "author=Smith2020LongCitationKey1"
+        assert redact_sensitive_text(text) == text
+
+    def test_credentialing_preserved(self):
+        text = "credentialing=enabled_long_value_12345"
+        assert redact_sensitive_text(text) == text
+
+    # ── real key shapes still redact ────────────────────────────────────
+
+    def test_separator_keys_still_redacted(self):
+        for text in (
+            "client_secret: abc123def456ghi789jkl",
+            "auth_token: xyz789xyz789xyz789xyz",
+            "my_secret: topvalue123456789012345",
+            "db.password=hunter2verylongpassword",
+        ):
+            result = redact_sensitive_text(text)
+            assert result != text, text
+
+    def test_camelcase_keys_still_redacted(self):
+        for text in (
+            "clientSecret: abc123def456ghi789jkl",
+            "secretKey: abc123def456ghi789jklmno",
+            "APIToken: abc123def456ghi789jklmn",
+        ):
+            result = redact_sensitive_text(text)
+            assert result != text, text
+
+    def test_concatenated_compounds_still_redacted(self):
+        # ngrok authtoken, tailscale authkey, minio secretkey, accesstoken.
+        for text in (
+            "authtoken: 2abcdefghij0123456789_ngrok",
+            "authkey=tskey-auth-abcdef123456789",
+            "secretkey: abc123def456ghi789jklmno",
+            "accesstoken: abcdefghij0123456789xyz",
+        ):
+            result = redact_sensitive_text(text)
+            assert result != text, text
+
+    def test_plural_keys_still_redacted(self):
+        text = "secrets: hunter2hunter2hunter2hh"
+        result = redact_sensitive_text(text)
+        assert "hunter2hunter2hunter2hh" not in result
+
+    def test_digit_boundary_still_redacted(self):
+        text = "oauth2_token: abcdefghij0123456789"
+        result = redact_sensitive_text(text)
+        assert "abcdefghij0123456789" not in result
+
+    def test_all_caps_embedded_keyword_still_redacted(self):
+        # All-caps keys keep legacy embedded matching (MYTOKEN=…).
+        text = "MYTOKEN=abcdefgh1234567890123456"
+        result = redact_sensitive_text(text)
+        assert "abcdefgh1234567890123456" not in result

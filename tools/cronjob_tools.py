@@ -623,8 +623,18 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
-            return {"claimed": False, "success": False,
-                    "error": "Job is already being fired by the scheduler; not run again."}
+            # claim_job_for_fire returns False for paused/disabled/missing
+            # jobs too — don't mislabel those as "already being fired"
+            # (#60703): that message sends the user chasing a phantom
+            # in-flight run when the job simply isn't runnable.
+            refreshed = get_job(job_id)
+            if refreshed is None:
+                reason = "Job no longer exists; nothing to run."
+            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+                reason = "Job is paused/disabled; resume it before running."
+            else:
+                reason = "Job is already being fired by the scheduler; not run again."
+            return {"claimed": False, "success": False, "error": reason}
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -832,12 +842,18 @@ def cronjob(
             # _execute_job_now advances next_run_at and blocks a concurrent tick
             # from double-firing.
             exec_result = _execute_job_now(job)
+            # A claimed direct run advances next_run_at and may race the
+            # external one-shot for the same occurrence. If Chronos loses that
+            # claim, its consumed fire cannot re-arm itself; reconcile from the
+            # winning direct path after the run has persisted its final state.
+            if exec_result.get("claimed", False):
+                _notify_provider_jobs_changed_safe()
             # Re-read so the response reflects the post-run last_run_at/last_status.
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
             if not exec_result.get("claimed", False):
-                result["execution_skipped"] = (
+                result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
             elif exec_result.get("error"):

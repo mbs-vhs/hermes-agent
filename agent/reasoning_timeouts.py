@@ -66,9 +66,13 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("nemotron-3-ultra", 600),
     ("nemotron-3-super", 600),
     ("nemotron-3-nano",  300),
-    # DeepSeek — R1 reasoning model on hosted NIM / DeepSeek direct.
+    # DeepSeek — R1 and V4 reasoning models on hosted NIM / DeepSeek direct.
+    # V4 series emits reasoning_content in a separate delta field before
+    # final content, requiring the same extended stale timeout floor.
     ("deepseek-r1", 600),
     ("deepseek-reasoner", 600),
+    ("deepseek-v4-flash", 600),
+    ("deepseek-v4-pro", 600),
     # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
     # preview is the stable slug; ``qwen3`` covers the family of
     # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)
@@ -98,8 +102,18 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     # ``claude-opus-4`` so non-thinking Claude 3.x or future
     # non-reasoning Claude variants don't match.
     ("claude-opus-4", 240),
+    ("claude-opus-5", 240),
+    ("claude-sonnet-5", 180),
     ("claude-sonnet-4.5", 180),
     ("claude-sonnet-4.6", 180),
+    # Anthropic Mythos-class named reasoning models (claude-fable-5, …).
+    # 1M context + 128K output — heavier thinking phase than the
+    # numbered Claude line, so the floor is in the deep-reasoning tier
+    # alongside o1 / deepseek-r1 / nemotron-3-ultra.  Without this
+    # entry the stale-stream detector kills fable-5's thinking phase
+    # at the default 180s (300s with context scaling), tripping the
+    # cross-turn circuit breaker after 5 consecutive stale kills.
+    ("claude-fable", 600),
     # xAI Grok reasoning variants.  Explicit reasoning-only keys
     # plus one for the ``non-reasoning`` variant so users picking
     # the fast variant don't get the 300s floor.  Bare ``grok-3``,
@@ -107,6 +121,7 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     # non-reasoning pairs.
     ("grok-4-fast-reasoning", 300),
     ("grok-4.20-reasoning", 300),
+    ("grok-4.5", 300),
     ("grok-4-fast-non-reasoning", 180),
 )
 
@@ -190,12 +205,18 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     300.0
     >>> get_reasoning_stale_timeout_floor("deepseek/deepseek-r1")
     600.0
+    >>> get_reasoning_stale_timeout_floor("deepseek/deepseek-v4-flash")
+    600.0
+    >>> get_reasoning_stale_timeout_floor("deepseek/deepseek-v4-pro")
+    600.0
     >>> get_reasoning_stale_timeout_floor("qwen/qwen3-235b-a22b-thinking")
     180.0
     >>> get_reasoning_stale_timeout_floor("x-ai/grok-4-fast-reasoning")
     300.0
     >>> get_reasoning_stale_timeout_floor("anthropic/claude-opus-4-6")
     240.0
+    >>> get_reasoning_stale_timeout_floor("anthropic/claude-fable-5")
+    600.0
     >>> get_reasoning_stale_timeout_floor("gpt-4o") is None
     True
     >>> get_reasoning_stale_timeout_floor("olmo-1") is None

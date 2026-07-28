@@ -635,7 +635,8 @@ class ProfileInfo:
     # clawd ``agent_registry`` roster SSOT (CLAWD-1828 P3). Persisted in
     # ``<profile_dir>/profile.yaml``. ``None`` when the profile has not
     # been synced (legacy profiles, fresh installs) — consumers fall back
-    # to the profile id. Lets surfaces (e.g. hermes-webui / chat.vhs.box)
+    # to the profile id. Lets surfaces (e.g. agora; formerly hermes-webui /
+    # chat.vhs.box, decommissioned CLAWD-2803)
     # render "Quasimodo — Engineer" instead of the bare profile id
     # "engineer".
     display_name: Optional[str] = None

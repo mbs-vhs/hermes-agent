@@ -10,14 +10,25 @@
 #       /opt/hermes-agent/venv — an EDITABLE install rooted at the (non-git)
 #       /opt/hermes-agent source tree. Editing that tree IS a live fleet
 #       mutation. This script does NOT reach that population at all.
-#   (b) THE ~/.hermes RUNTIME CHECKOUT — serves chat.vhs.box (hermes-webui) +
-#       research. hermes-agent is installed EDITABLE into
-#       ~/.hermes/hermes-agent/venv, and hermes-webui SPAWNS SUBPROCESSES with
-#       that venv's python (it does not import hermes_agent into the webui
-#       parent). So advancing this checkout takes effect on the NEXT SPAWNED
-#       AGENT — live, unstaged, without any unit restart. Restarting
-#       ai.minerva.chat-ui.service does NOT gate that; it only recycles the
-#       parent. That is exactly why a half-applied deploy here is unsafe.
+#   (b) THE ~/.hermes RUNTIME CHECKOUT. hermes-agent is installed EDITABLE into
+#       ~/.hermes/hermes-agent/venv, so advancing this checkout changes the code
+#       its consumers execute IMMEDIATELY — live, unstaged, with no unit restart
+#       gating it. That is exactly why a half-applied deploy here is unsafe.
+#
+#       CONSUMERS RE-GROUNDED 2026-07-28 (CLAWD-2803). chat.vhs.box
+#       (hermes-webui) was the surface this script's whole safety story was
+#       written around, and it is GONE — decommissioned along with
+#       ai.minerva.chat-ui.service. The remaining consumers of this venv are:
+#         - ai.hermes.oauth-refresh.service/.timer  (every 6h) — the Anthropic
+#           OAuth refresher, ~/.hermes/bin/refresh-anthropic-oauth.py
+#         - ai.hermes.codex-refresh.service/.timer  (daily)    — the Codex OAuth
+#           refresher, ~/.hermes/bin/refresh-codex-oauth.py
+#       Both are SHORT-LIVED oneshots, so they pick up new code on their NEXT
+#       FIRING rather than needing a restart. ~/.hermes itself remains
+#       load-bearing for far more than this venv (profile tree, kanban/state
+#       DBs, skills, the shared auth.json credential pool, clawd + alloy
+#       bind-mounts) — do NOT read "chat.vhs.box is gone" as "~/.hermes is
+#       retirable". See devops-process/NEMESIS.md.
 # The 11 ai.hermes.gateway-*.service units under the operator's own manager are
 # LEGACY LEFTOVERS and are all MASKED (the fleet relocated to per-user accounts).
 #
@@ -46,9 +57,9 @@
 #   --dry-run            Show what would happen; make no mutating changes.
 #   --no-restart         Fast-forward the runtime but do NOT restart gateways.
 #                        (Skips the step-1b preflight. Because the runtime venv
-#                        is an EDITABLE install that hermes-webui spawns agents
-#                        from, the new code still takes effect on the NEXT
-#                        SPAWNED AGENT — this does not stage the change.)
+#                        is an EDITABLE install, the new code still takes effect
+#                        immediately for anything spawning from it — this does
+#                        not stage the change.)
 #   --parallel-restart   Restart all gateways at once (brief full-fleet blip).
 #                        Default is a rolling restart (<=1 gateway down at a time).
 #   --yes, -y            Skip the interactive restart confirmation.
@@ -107,7 +118,7 @@ if [ "$NO_RESTART" = "0" ]; then
   # empty and control always reaches the loadability check below. Kept for the
   # host where those leftovers have been removed. Re-derive which branch fires:
   #   systemctl --user list-unit-files 'ai.hermes.gateway-*.service' --no-legend
-  [ "${#units[@]}" -gt 0 ] || die "no ai.hermes.gateway-*.service units found under this user manager. If the fleet has moved (it now runs per-user from /opt/hermes-agent), this script cannot deploy it — use --no-restart to advance ONLY the ~/.hermes checkout, and restart its consumers (chat-ui) yourself. The fleet has no deploy path yet, by design: /opt/hermes-agent has no .git to deploy from — run scripts/opt_provenance_report.py --tree /opt/hermes-agent --strict to see what diverges, and see devops-process/proposals/2026-07-27-opt-hermes-deploy-substrate.md (CLAWD-2833)."
+  [ "${#units[@]}" -gt 0 ] || die "no ai.hermes.gateway-*.service units found under this user manager. If the fleet has moved (it now runs per-user from /opt/hermes-agent), this script cannot deploy it — use --no-restart to advance ONLY the ~/.hermes checkout, and restart its consumers yourself (CLAWD-2803: chat-ui is gone; the ~/.hermes venv's consumers are now the two OAuth refresh timers, which are oneshots and pick up new code on their next firing). The fleet has no deploy path yet, by design: /opt/hermes-agent has no .git to deploy from — run scripts/opt_provenance_report.py --tree /opt/hermes-agent --strict to see what diverges, and see devops-process/proposals/2026-07-27-opt-hermes-deploy-substrate.md (CLAWD-2833)."
   # Reject anything not cleanly loadable, not just `masked`. LoadState collapses
   # masked/masked-runtime, but `error` / `bad-setting` (unparseable unit) would
   # also sail past a masked-only check and then fail at restart — reaching the
@@ -125,7 +136,7 @@ if [ "$NO_RESTART" = "0" ]; then
     log "so there is no ref to deploy from and no git status to detect drift with."
     log "  measure the divergence: scripts/opt_provenance_report.py --tree /opt/hermes-agent --strict"
     log "  the substrate decision:  devops-process/proposals/2026-07-27-opt-hermes-deploy-substrate.md (CLAWD-2833)"
-    die "refusing to deploy: nothing was mutated. Restarting a masked/unloadable unit always fails, and advancing the runtime first would leave the live chat runtime half-deployed. To advance ONLY the ~/.hermes checkout (chat.vhs.box / research), re-run with --no-restart — and note that takes effect on the NEXT SPAWNED AGENT, so there is no restart that stages it."
+    die "refusing to deploy: nothing was mutated. Restarting a masked/unloadable unit always fails, and advancing the runtime first would leave the runtime half-deployed. To advance ONLY the ~/.hermes checkout, re-run with --no-restart — and note the venv is an EDITABLE install, so the change is live immediately for anything that spawns from it (CLAWD-2803: chat.vhs.box is gone; the OAuth refresh timers pick it up on their next firing)."
   fi
 fi
 
@@ -155,7 +166,7 @@ fi
 
 # 4) Gateway restart (gated).
 if [ "$NO_RESTART" = "1" ]; then
-  log "--no-restart: gateways NOT restarted. NOTE the runtime venv is an EDITABLE install and hermes-webui SPAWNS agents from it, so the ~/.hermes population picks this up on its NEXT SPAWNED AGENT — already-running gateway processes keep their loaded modules until restarted."
+  log "--no-restart: gateways NOT restarted. NOTE the runtime venv is an EDITABLE install, so anything spawning from it picks this up immediately — the ~/.hermes OAuth refresh timers (CLAWD-2803) on their next firing; already-running gateway processes keep their loaded modules until restarted."
   exit 0
 fi
 

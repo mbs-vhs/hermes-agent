@@ -55,18 +55,32 @@ Address root causes, not symptoms. **NEVER** swallow exceptions, comment out fai
 > | Population | Runs from | Managed by | Serves |
 > |---|---|---|---|
 > | **The fleet** (12 profiles) | `/opt/hermes-agent/venv` — an **installed package** (`hermes-agent 0.18.0`), *not* a checkout | `ai.hermes.gateway-<profile>.service` under **each per-user manager** (`/home/hermes-<profile>`) | the agent fleet |
-> | **The `~/.hermes` checkout** | `~/.hermes/hermes-agent` + its venv (hermes-agent installed **editable**) | `ai.minerva.chat-ui.service` etc. under the operator's manager | `chat.vhs.box` + research |
+> | **The `~/.hermes` checkout** | `~/.hermes/hermes-agent` + its venv (hermes-agent installed **editable**) | the two OAuth-refresh timers under the operator's manager | OAuth refresh + research (**not** `chat.vhs.box` — decommissioned 2026-07-28, CLAWD-2803) |
 >
 > The 11 `ai.hermes.gateway-*.service` units under the **operator's own** manager are **legacy leftovers and are all MASKED**. The older claim "the 10 gateways run from `~/.hermes/hermes-agent`" is **no longer true** and, left uncorrected, made `scripts/deploy-to-runtime.sh` fail *dangerous* (it advanced the live chat runtime, then errored about gateways it could never restart). That script now validates restart targets **before** mutating.
 >
-> Because the `~/.hermes` venv installs hermes-agent **editable**, advancing that checkout changes the code `chat.vhs.box` imports **immediately** — treat it as a live mutation, not a staged one.
+> Because the `~/.hermes` venv installs hermes-agent **editable**, advancing that checkout changes the code its consumers execute **immediately** — treat it as a live mutation, not a staged one.
+>
+> **⚠ `~/.hermes` IS STILL LOAD-BEARING — do not read the chat.vhs.box teardown as permission to retire it (CLAWD-2803).** The old justification written here made `chat.vhs.box` the *sole* stated reason `~/.hermes` was protected. That surface is gone; the directory is not retirable. Nine independent live consumers, all verified on the host 2026-07-25:
+>
+> 1. `ai.hermes.oauth-refresh.service`/`.timer` (every 6h) — writes the shared `auth.json`
+> 2. `ai.hermes.codex-refresh.service`/`.timer` (daily)
+> 3. `ai.hermes.dashboard.service` — serves `hermes.vhs.box` on `127.0.0.1:9119`
+> 4. `clawd-app` — bind-mounts `~/.hermes/profiles` read-only (`HERMES_PROFILE_ROOT`)
+> 5. `clawd-alloy` — bind-mounts `~/.hermes/profiles` read-only; ships 5 log files x 11 profiles to Loki
+> 6. `hermes-profile-backup.timer`, `hermes-kanban-backup.timer`, `hermes-kanban-autoheal.timer`
+> 7. `dev-preflight.sh` — monitors it as a LIVE runtime checkout
+> 8. `~/.hermes/skills/` — the curator skills dir that per-profile `external_dirs` resolve through
+> 9. `~/.hermes/cron/jobs.json` — the hermes cron ticker
+>
+> Retiring `~/.hermes` is a separate, larger decision (it would require migrating the OAuth refresh path and re-homing `hermes.vhs.box`), not a follow-on of the chat teardown.
 
 **This repo is code. `~/.hermes/` is runtime state. They are two separate checkouts.**
 
 | | Dev fork (this repo) | Runtime checkout |
 |---|---|---|
 | Path | `~/dev/hermes-agent-fork/` | `~/.hermes/hermes-agent/` |
-| Role | Where you **edit code**, run tests, open PRs | Serves `chat.vhs.box` + research (**not** the fleet — see the re-baseline above) |
+| Role | Where you **edit code**, run tests, open PRs | Serves the OAuth-refresh timers + research (**not** the fleet, and **not** `chat.vhs.box` — decommissioned CLAWD-2803) |
 | Remote | `origin` = mbs-vhs/hermes-agent (+ `upstream`) | `origin` = mbs-vhs/hermes-agent |
 | Venv | `.venv` / `venv` (repo-local) | `~/.hermes/hermes-agent/venv` |
 
@@ -208,3 +222,4 @@ Never echo secret values in chat, commit messages, or logs. Reference the source
 | 2026-05-29 | Created. Initial Minerva-fork operational CLAUDE.md layered over the inherited upstream `AGENTS.md`; documents fork-vs-runtime split, 10-profile mesh, shared-OAuth SPOF, ADR-058 mnemosyne rollout, ACP adapter, stop-conditions. | CLAWD-792 |
 | 2026-07-25 | **Topology re-baseline.** Corrected the falsified "the 10 gateways run from `~/.hermes/hermes-agent`" claim: there are now TWO live populations — the fleet (11 gateway units across 12 per-user accounts, exec from `/opt/hermes-agent/venv`, an editable install on a non-git tree) and the `~/.hermes` checkout (serves `chat.vhs.box` + research; hermes-webui *spawns* agents from its venv, so a deploy lands on the next spawned agent). The operator-manager `ai.hermes.gateway-*` units are masked legacy. This staleness had made `scripts/deploy-to-runtime.sh` fail *dangerous* — it advanced the live chat runtime 4,547 commits, then errored on gateways it could never restart; that script now validates restart targets **before** mutating. | CLAWD-2792 |
 | 2026-07-27 | **`/opt/hermes-agent` made measurable; stale version corrected.** Fixed the `v0.14.0` package version (it is `0.18.0`; `0.14.0` is the *`~/.hermes`* venv, a different population). Added read-only `scripts/opt_provenance_report.py` + tests: the fleet runtime has no `.git`, so this is the only way to answer "what is running?" / "has it drifted?". Measured 251 files present in `/opt` and absent from `HEAD`, 33 still resolvable as importable modules — every one traced to a named deleting commit, so a `--delete` deploy would have removed live-tree code with no record of why. Both deploy-script refusal sites now point at the tool and the substrate proposal. GROK.md additionally received the 2026-07-25 topology re-baseline it never got — it was still asserting the falsified single-runtime topology. | CLAWD-2833 |
+| 2026-07-28 | **`chat.vhs.box` decommissioned; `~/.hermes` protection re-grounded.** hermes-webui and its two units were torn down (it ran as uid 1000 with read of the operator credential pool, while the fleet runs contained as per-user `hermes-*` uids). Two consequences recorded here: (1) `scripts/deploy-to-runtime.sh` no longer has chat-ui as its consumer — the `~/.hermes` venv's consumers are now the two OAuth-refresh timers, which are oneshots and pick up new code on their next firing; (2) the *stated reason* `~/.hermes` was protected evaporated with that surface, so the nine real consumers are now enumerated inline above. Also removed the dead `HERMES_OPERATOR_WEBUI` branch in `gateway/person_identity.py` — a readers-without-writers case (readers + a guard test, no producer anywhere); its test suite was REPLACED with removal guards, not deleted. | CLAWD-2803 |

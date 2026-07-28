@@ -7,7 +7,8 @@ truth for "PersonaName — Role" (e.g. profile ``engineer`` → "Quasimodo —
 Engineer"). This script reads that roster over HTTP and writes
 ``display_name`` + ``role`` into ``<profile_dir>/profile.yaml`` via
 ``hermes_cli.profiles.write_profile_meta`` so downstream surfaces
-(hermes-webui / chat.vhs.box) can render the canonical label instead of the
+(agora, hermes.vhs.box; formerly hermes-webui, decommissioned CLAWD-2803) can
+render the canonical label instead of the
 bare profile id.
 
 SAFETY — dry-run by default. ``profile.yaml`` lives under each profile's

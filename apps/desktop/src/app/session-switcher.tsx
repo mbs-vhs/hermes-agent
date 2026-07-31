@@ -5,7 +5,8 @@ import { useNavigate } from 'react-router-dom'
 
 import { sessionTitle } from '@/lib/chat-runtime'
 import { cn } from '@/lib/utils'
-import { $attentionSessionIds, $workingSessionIds } from '@/store/session'
+import { $unreadFinishedSessionIds } from '@/store/session'
+import { $attentionSessionIds, $workingSessionIds } from '@/store/session-states'
 import { $switcherIndex, $switcherOpen, $switcherSessions, closeSwitcher } from '@/store/session-switcher'
 
 import { HUD_ITEM, HUD_POSITION, HUD_SURFACE, HUD_TEXT } from './floating-hud'
@@ -19,6 +20,7 @@ export function SessionSwitcher() {
   const index = useStore($switcherIndex)
   const working = useStore($workingSessionIds)
   const attention = useStore($attentionSessionIds)
+  const unread = useStore($unreadFinishedSessionIds)
   const navigate = useNavigate()
 
   const activeRef = useRef<HTMLDivElement>(null)
@@ -33,6 +35,7 @@ export function SessionSwitcher() {
 
   const workingIds = new Set(working)
   const attentionIds = new Set(attention)
+  const unreadIds = new Set(unread)
 
   const pick = (sessionId: string) => {
     closeSwitcher()
@@ -43,7 +46,7 @@ export function SessionSwitcher() {
     <>
       {/* Transparent click-catcher: click-away closes, but no dim/blur. */}
       <div
-        className="fixed inset-0 z-[219]"
+        className="fixed inset-0 z-(--z-switcher-backdrop)"
         onMouseDown={e => {
           e.preventDefault()
           closeSwitcher()
@@ -53,7 +56,7 @@ export function SessionSwitcher() {
         className={cn(
           HUD_POSITION,
           HUD_SURFACE,
-          'dt-portal-scrollbar z-[220] max-h-[min(22rem,64vh)] w-[min(19rem,calc(100vw-2rem))] select-none overflow-y-auto p-1'
+          'dt-portal-scrollbar z-(--z-switcher) max-h-[min(22rem,64vh)] w-[min(19rem,calc(100vw-2rem))] select-none overflow-y-auto p-1'
         )}
       >
         {sessions.map((session, i) => {
@@ -62,12 +65,10 @@ export function SessionSwitcher() {
           return (
             <div
               className={cn(
-                'flex cursor-pointer items-center rounded leading-tight',
+                'row-hover flex items-center rounded leading-tight',
                 HUD_ITEM,
                 HUD_TEXT,
-                selected
-                  ? 'bg-accent text-accent-foreground'
-                  : 'text-(--ui-text-secondary) hover:bg-(--ui-row-hover-background)'
+                selected ? 'bg-accent text-accent-foreground' : 'text-(--ui-text-secondary)'
               )}
               key={session.id}
               onMouseDown={e => {
@@ -76,7 +77,11 @@ export function SessionSwitcher() {
               }}
               ref={selected ? activeRef : undefined}
             >
-              <SwitcherDot attention={attentionIds.has(session.id)} working={workingIds.has(session.id)} />
+              <SwitcherDot
+                attention={attentionIds.has(session.id)}
+                unread={unreadIds.has(session.id)}
+                working={workingIds.has(session.id)}
+              />
               <span className="min-w-0 flex-1 truncate">{sessionTitle(session)}</span>
               {i < 9 && (
                 <span
@@ -97,12 +102,18 @@ export function SessionSwitcher() {
   )
 }
 
-function SwitcherDot({ attention, working }: { attention: boolean; working: boolean }) {
+function SwitcherDot({ attention, working, unread }: { attention: boolean; working: boolean; unread: boolean }) {
   return (
     <span
       className={cn(
         'size-1 shrink-0 rounded-full',
-        attention ? 'bg-amber-400' : working ? 'animate-pulse bg-(--ui-accent)' : 'bg-(--ui-text-quaternary)/50'
+        attention
+          ? 'bg-amber-400'
+          : working
+            ? 'animate-pulse bg-(--ui-accent)'
+            : unread
+              ? 'bg-emerald-500'
+              : 'bg-(--ui-text-quaternary)/50'
       )}
     />
   )

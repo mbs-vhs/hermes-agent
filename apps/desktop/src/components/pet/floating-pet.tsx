@@ -2,12 +2,22 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
+import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
 import { useRouteOverlayActive } from '@/app/hooks/use-route-overlay-active'
+import { PetHeartField } from '@/components/chat/vibe-hearts'
 import { persistString, storedString } from '@/lib/storage'
-import { $petAtRest, $petInfo, $petRoam, $petRoamDir, clearPetUnread, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
+import {
+  $petAtRest,
+  $petInfo,
+  $petRoam,
+  $petRoamDir,
+  clearPetUnread,
+  type PetInfo,
+  petProfile,
+  setPetInfo
+} from '@/store/pet'
 import { resetPetGallery, setPetScale } from '@/store/pet-gallery'
 import { $petOverlayActive, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
@@ -205,25 +215,13 @@ export function FloatingPet() {
   // Pets are per-profile. When the active profile changes, drop the previous
   // profile's mascot + gallery cache so the poll above refetches the new
   // profile's pet (its config + pets dir resolve per-profile on the backend).
-  const profileRef = useRef(normalizeProfileKey($activeGatewayProfile.get()))
-  useEffect(
-    () =>
-      $activeGatewayProfile.subscribe(next => {
-        const key = normalizeProfileKey(next)
-
-        if (key === profileRef.current) {
-          return
-        }
-
-        profileRef.current = key
-        setPetInfo({ enabled: false })
-        resetPetGallery()
-      }),
-    []
-  )
+  useOnProfileSwitch(() => {
+    setPetInfo({ enabled: false })
+    resetPetGallery()
+  })
 
   // Wire the overlay control channel once, only in the primary window — the
-  // pop-out overlay belongs to it (main.cjs positions it against the main
+  // pop-out overlay belongs to it (main.ts positions it against the main
   // window and routes control messages back to it).
   useEffect(() => {
     if (isSecondaryWindow()) {
@@ -249,6 +247,7 @@ export function FloatingPet() {
   // Restore a popped-out pet on boot, once the pet has loaded (so we never spawn
   // an empty overlay window). Primary window only; runs at most once.
   const restoredRef = useRef(false)
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (isSecondaryWindow() || restoredRef.current || !active) {
       return
@@ -450,6 +449,9 @@ export function FloatingPet() {
       >
         <PetSprite info={info} rowOverride={walk.row} />
       </div>
+      {/* Hearts puff off the pet; its celebrate ("yay"/jump) pose is driven by
+          burstVibeHearts's router. */}
+      <PetHeartField petH={petH} petW={petW} />
     </div>
   )
 }

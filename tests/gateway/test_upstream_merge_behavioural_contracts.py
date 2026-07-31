@@ -8,9 +8,15 @@ success, because upstream and the fork edited *non-overlapping* regions — or w
 because upstream re-adds a method into ``GatewayRunner``'s own body where it wins by
 MRO over the fork's mixin copy. **MRO resolution is invisible in a diff.**
 
-Every check here is written against **observable behaviour**, never a signature or a
-line of source, because a signature assertion passes the moment upstream's version
-takes over — that is precisely the failure being guarded.
+Checks here are written against **observable behaviour** wherever the behaviour is
+reachable, because a signature assertion passes the moment upstream's version takes
+over — precisely the failure being guarded.
+
+ONE test is deliberately structural rather than behavioural:
+``test_hazard1_every_call_site_consumes_the_return_value``. Whether a caller ASSIGNS
+an awaited result or discards it is not observable from outside the function — both
+run identically — so it is checked by walking the AST. AST, not a source regex: a
+regex cannot distinguish code from comments, and review demonstrated that bypass.
 
 Three hazards, established merge-base-relative by CLAWD-2841 and re-verified here:
 
@@ -39,6 +45,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import Platform
+from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 
 
@@ -62,12 +69,16 @@ class _FakeAdapter:
         return True
 
     async def send(self, chat_id, text, *a, **kw):
+        # Returns a SendResult-SHAPED object, not a dict. Production reads
+        # `getattr(result, "message_id", None)` — a dict made message_id come back
+        # None and the edit-in-place coordinate was silently lost. Caught only once
+        # the test started driving the real method instead of a replica.
         self.sent.append({"chat_id": chat_id, "text": text, "kwargs": kw})
-        return {"message_id": f"m-{len(self.sent)}"}
+        return SendResult(success=True, message_id=f"m-{len(self.sent)}")
 
     async def edit_message(self, *a, **kw):
         self.edited.append({"args": a, "kwargs": kw})
-        return {"ok": True}
+        return SendResult(success=True, message_id="edited")
 
 
 class _FakeHome:
@@ -79,9 +90,15 @@ class _FakeHome:
 
 
 class _FakePlatformCfg:
-    def __init__(self, home=None, gateway_restart_notification=True):
+    # `enabled` is required by upstream's post-merge delivery seam:
+    # gateway/delivery.py::resolve_delivery_transport gates on
+    # `native_config.enabled` before returning a transport. The fork's pre-merge
+    # lifecycle path never consulted it, so this attribute is the fixture
+    # modelling a NEW delivery precondition introduced by the merge.
+    def __init__(self, home=None, gateway_restart_notification=True, enabled=True):
         self.home_channel = home
         self.gateway_restart_notification = gateway_restart_notification
+        self.enabled = enabled
 
 
 class _FakeConfig:
@@ -134,88 +151,94 @@ def _bare_runner(adapters: dict, platforms: dict) -> GatewayRunner:
 # The scenario below is exactly that regression: home DMs sent, ZERO sessions in
 # flight. It is the case the naive `if _pre_drain_keys` gate cannot see.
 
-def test_hazard1_idle_shutdown_still_seeds_the_recovery_marker(monkeypatch):
-    """IDLE restart (no in-flight sessions) must still write a recovery marker WITH
-    targets, so the next boot edits the down-DM instead of re-announcing."""
-    captured = {}
+def test_hazard1_real_method_returns_the_home_targets_it_sent():
+    """Drive the REAL _notify_active_sessions_of_shutdown and assert its RETURN.
 
-    def _fake_write(interrupted, targets=None, shutdown_ts=None):
-        captured["interrupted"] = interrupted
-        captured["targets"] = targets
-        captured["shutdown_ts"] = shutdown_ts
+    An earlier version of this test monkeypatched both the method AND
+    _write_recovery_marker, then re-implemented the caller inside the test — so it
+    asserted against its own replica and survived every behavioural mutation of the
+    thing it claimed to guard, including `return None` (the hazard itself) and the
+    exact CLAWD-1144 gate collapse its docstring named. It was a name-existence
+    check wearing a contract docstring. Independent review caught that; this is the
+    replacement.
 
-    monkeypatch.setattr(gateway_run, "_write_recovery_marker", _fake_write)
-
+    Nothing is monkeypatched here. The runner is IDLE (no in-flight sessions) with
+    one home channel configured, which is precisely the CLAWD-1144 scenario: the
+    down-DM is the only thing that happened, so the returned targets are the only
+    thing that can seed the recovery marker. `return None` fails this immediately.
+    """
     adapter = _FakeAdapter("telegram")
     runner = _bare_runner(
         {Platform.TELEGRAM: adapter},
         {Platform.TELEGRAM: _FakePlatformCfg(_FakeHome("chat-9"))},
     )
+    runner.session_store = None
+    runner._restart_command_source = None
+    runner._cached_session_sources = {}
 
-    # The method under contract: it must RETURN the targets it sent.
-    sent_targets = [
-        {"platform": "telegram", "chat_id": "chat-9", "thread_id": None, "message_id": "m-1"}
-    ]
+    targets = asyncio.run(runner._notify_active_sessions_of_shutdown())
 
-    async def _fake_notify(self):
-        return list(sent_targets)
-
-    monkeypatch.setattr(GatewayRunner, "_notify_active_sessions_of_shutdown",
-                        _fake_notify, raising=True)
-
-    # Reproduce the caller's chain verbatim: consume the return, gate on it, pass it.
-    async def _caller():
-        home_targets = await runner._notify_active_sessions_of_shutdown()
-        pre_drain_keys: list = []          # IDLE: nothing in flight
-        if (home_targets or pre_drain_keys) and not runner._restart_requested:
-            gateway_run._write_recovery_marker(
-                len(pre_drain_keys), targets=home_targets, shutdown_ts=1.0
-            )
-        return home_targets
-
-    result = asyncio.run(_caller())
-
-    assert result, (
-        "_notify_active_sessions_of_shutdown returned a falsey value. Upstream's "
-        "version returns None; the fork's contract is to return the home-channel "
-        "targets it sent. With None, an IDLE restart writes no recovery marker at "
-        "all (CLAWD-1144 regression: loud going down, silent coming back)."
+    assert isinstance(targets, list), (
+        f"_notify_active_sessions_of_shutdown returned {type(targets).__name__}, not a "
+        f"list. Upstream's version returns None; the fork's contract is to return the "
+        f"home-channel targets it sent, because the caller feeds them to the recovery "
+        f"marker so the next boot can EDIT the down-DM in place (CLAWD-1144)."
     )
-    assert "targets" in captured, (
-        "recovery marker was NOT written on an idle shutdown — the "
-        "(_home_targets or _pre_drain_keys) gate collapsed because _home_targets "
-        "was falsey"
+    assert adapter.sent, "no shutdown down-DM was sent to the configured home channel"
+    assert targets, (
+        "the down-DM WAS sent but the method returned an empty list — the recovery "
+        "marker will have no targets, so the next boot cannot edit the down-DM and "
+        "must either re-send (a second push alert) or go silent"
     )
-    assert captured["targets"], (
-        "recovery marker written with empty targets — the next boot cannot EDIT the "
-        "down-DM in place and will either re-send (second push alert) or go silent"
+    coord = targets[0]
+    assert coord.get("message_id"), (
+        f"target is missing message_id, which the edit-in-place path needs: {coord!r}"
     )
-    assert captured["targets"][0]["message_id"] == "m-1", (
-        "target message_id lost; the edit-in-place path needs the message coordinate"
-    )
-    assert captured["interrupted"] == 0, "idle shutdown should record 0 interrupted"
+    assert str(coord.get("chat_id")) == "chat-9"
 
 
-def test_hazard1_return_value_is_actually_consumed_at_the_call_site():
-    """Guard the CALL SITE, not the signature. Upstream discards the return value
-    (`await self._notify_active_sessions_of_shutdown()`); the fork assigns it. If a
-    merge takes upstream's call site, the assignment silently disappears and every
-    downstream assertion above becomes unreachable in production."""
+def test_hazard1_every_call_site_consumes_the_return_value():
+    """Guard the CALL SITE via AST, not a source regex.
+
+    Upstream discards the value (`await self._notify_active_sessions_of_shutdown()`);
+    the fork assigns it. A regex over `inspect.getsource` cannot tell code from
+    comments — review demonstrated the bypass: discard the value and leave
+    `# was: _home_targets = await self...()` nearby, and a regex-based check passes.
+    A regex also only required SOME call site to assign, so a second discarding call
+    site slipped through. This walks the AST and requires EVERY await of the method
+    to be consumed.
+    """
+    import ast
     import inspect
-    import re
 
-    source = inspect.getsource(gateway_run)
-    calls = re.findall(r"^\s*(.*?)_notify_active_sessions_of_shutdown\(\)",
-                       source, re.M)
-    # Filter to real await call sites (not defs, not this test's monkeypatching).
-    awaits = [c for c in calls if "await" in c]
-    assert awaits, "no await call site for _notify_active_sessions_of_shutdown found"
-    assigned = [c for c in awaits if "=" in c.split("await")[0]]
-    assert assigned, (
-        "the call site DISCARDS the return value (upstream's form: "
-        "`await self._notify_active_sessions_of_shutdown()`). The fork must assign "
-        "it (`_home_targets = await ...`) or the recovery marker loses its targets. "
-        f"Found call sites: {awaits!r}"
+    tree = ast.parse(inspect.getsource(gateway_run))
+    consumed, discarded = [], []
+
+    for node in ast.walk(tree):
+        # A discarded await is an Expr whose value is an Await of this attribute.
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Await):
+            call = node.value.value
+            if (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_notify_active_sessions_of_shutdown"):
+                discarded.append(node.lineno)
+        # A consumed await is an Assign/AnnAssign whose value is such an Await.
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Await):
+            call = node.value.value
+            if (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_notify_active_sessions_of_shutdown"):
+                consumed.append(node.lineno)
+
+    assert consumed, (
+        "no call site ASSIGNS the result of _notify_active_sessions_of_shutdown. "
+        "The fork must consume it (`_home_targets = await ...`) or the recovery "
+        "marker loses its targets."
+    )
+    assert not discarded, (
+        f"call site(s) at line(s) {discarded} DISCARD the return value (upstream's "
+        f"form). Every await of this method must be consumed, or the recovery marker "
+        f"silently loses its targets on that path."
     )
 
 
@@ -247,7 +270,27 @@ def _run_startup_notifications(runner, skip_targets=None):
 
 def test_hazard3_email_is_skipped_for_lifecycle_notices():
     """CLAWD-1144 (ratified 2026-06-04): lifecycle notices are chat-platform-only.
-    Email is the supervisor's backstop channel, not a per-event copy."""
+    Email is the supervisor's backstop channel, not a per-event copy.
+
+    THIS IS A WORKING GUARD, verified by mutation: deleting the
+    `if platform == Platform.EMAIL: continue` skip from
+    _send_home_channel_startup_notifications turns it RED, on both sides of the
+    v2026.7.20 merge, and so does substituting upstream's verbatim method body (the
+    literal MRO-shadow scenario).
+
+    A previous revision wrongly labelled this NOT EXECUTABLE. That came from a bad
+    mutation: a `count=1` regex for the EMAIL skip matched the FIRST occurrence in
+    gateway/run.py — the shutdown-side skip in _notify_active_sessions_of_shutdown
+    (~L5583) — not the startup-side skip this test guards (~L14343). It removed code
+    the test never covered, the test correctly stayed green, and that was misread as
+    vacuity. Target mutations by AST span, never by regex ordinal.
+
+    The same revision claimed EMAIL was suppressed "incidentally" because
+    `_non_conversational_metadata` returns None for it. Also wrong: upstream's send
+    block has an `else: await transport.adapter.send(...)` fallback, so a None
+    metadata result does not suppress delivery. There is no incidental suppression —
+    this skip is the only thing keeping EMAIL quiet.
+    """
     email = _FakeAdapter("email")
     telegram = _FakeAdapter("telegram")
     runner = _bare_runner(
@@ -367,6 +410,18 @@ def test_hazard2_no_home_channel_means_no_delivery():
         "delivered a lifecycle notice to a platform with NO home channel configured"
     )
 
+    # POSITIVE CONTROL: without this, a wholesale delivery breakage (every send
+    # failing) would leave the assertion above green for the wrong reason. A second
+    # platform with a valid config MUST still receive its notice.
+    control = _FakeAdapter("telegram")
+    runner.adapters[Platform.TELEGRAM] = control
+    runner.config.platforms[Platform.TELEGRAM] = _FakePlatformCfg(_FakeHome("chat-ctl"))
+    _run_startup_notifications(runner)
+    assert control.sent, (
+        "control platform received nothing either — delivery is broken wholesale, so "
+        "the assertion above proves nothing"
+    )
+
 
 def test_hazard2_notification_disabled_platform_is_respected():
     """`gateway_restart_notification: false` must suppress delivery. Upstream moved
@@ -384,6 +439,18 @@ def test_hazard2_notification_disabled_platform_is_respected():
         "disabled"
     )
 
+    # POSITIVE CONTROL: without this, a wholesale delivery breakage (every send
+    # failing) would leave the assertion above green for the wrong reason. A second
+    # platform with a valid config MUST still receive its notice.
+    control = _FakeAdapter("telegram")
+    runner.adapters[Platform.TELEGRAM] = control
+    runner.config.platforms[Platform.TELEGRAM] = _FakePlatformCfg(_FakeHome("chat-ctl"))
+    _run_startup_notifications(runner)
+    assert control.sent, (
+        "control platform received nothing either — delivery is broken wholesale, so "
+        "the assertion above proves nothing"
+    )
+
 
 def test_hazard2_skip_targets_suppresses_duplicate_delivery():
     """`skip_targets` is how the recovery path tells startup 'I already edited that
@@ -398,6 +465,18 @@ def test_hazard2_skip_targets_suppresses_duplicate_delivery():
     assert adapter.sent == [], (
         "skip_targets was ignored — the recovery path already edited this down-DM, "
         "so this is a duplicate announcement (CLAWD-1144)"
+    )
+
+    # POSITIVE CONTROL: without this, a wholesale delivery breakage (every send
+    # failing) would leave the assertion above green for the wrong reason. A second
+    # platform with a valid config MUST still receive its notice.
+    control = _FakeAdapter("telegram")
+    runner.adapters[Platform.TELEGRAM] = control
+    runner.config.platforms[Platform.TELEGRAM] = _FakePlatformCfg(_FakeHome("chat-ctl"))
+    _run_startup_notifications(runner)
+    assert control.sent, (
+        "control platform received nothing either — delivery is broken wholesale, so "
+        "the assertion above proves nothing"
     )
 
 

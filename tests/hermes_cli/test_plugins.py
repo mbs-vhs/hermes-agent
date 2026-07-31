@@ -859,6 +859,171 @@ class TestPreToolCallBlocking:
         assert get_pre_tool_call_block_message("terminal", {}) == "first blocker"
 
 
+class TestPreToolCallDirective:
+    """Tests for the extended (block | approve) directive helper."""
+
+    def test_approve_directive_returned(self, monkeypatch):
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "needs human ok"}
+            ],
+        )
+        assert get_pre_tool_call_directive("write_file", {}) == (
+            "approve", "needs human ok")
+
+    def test_approve_without_message_is_valid(self, monkeypatch):
+        """approve may omit a message (block may not)."""
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve"}],
+        )
+        assert get_pre_tool_call_directive("write_file", {}) == ("approve", None)
+
+    def test_block_still_requires_message(self, monkeypatch):
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "block"}],
+        )
+        assert get_pre_tool_call_directive("terminal", {}) == (None, None)
+
+    def test_first_directive_wins_across_actions(self, monkeypatch):
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "gate first"},
+                {"action": "block", "message": "block second"},
+            ],
+        )
+        assert get_pre_tool_call_directive("terminal", {}) == (
+            "approve", "gate first")
+
+    def test_shim_ignores_approve(self, monkeypatch):
+        """Back-compat shim only reports block, never approve."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "gate"}
+            ],
+        )
+        assert get_pre_tool_call_block_message("write_file", {}) is None
+
+
+class TestResolvePreToolBlock:
+    """Tests for the single dispatch-site chokepoint that resolves a
+    directive (incl. the approve→gate escalation) to a block message."""
+
+    def test_block_returns_message(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "block", "message": "no"}],
+        )
+        assert resolve_pre_tool_block("terminal", {}) == "no"
+
+    def test_no_directive_returns_none(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook", lambda hook_name, **kwargs: [])
+        assert resolve_pre_tool_block("terminal", {}) is None
+
+    def test_approve_denied_blocks(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *a, **k: {"approved": False, "message": "user denied it"},
+        )
+        assert resolve_pre_tool_block("write_file", {}) == "user denied it"
+
+    def test_approve_granted_allows(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *a, **k: {"approved": True, "message": None},
+        )
+        assert resolve_pre_tool_block("write_file", {}) is None
+
+    def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {
+                    "action": "approve",
+                    "message": "why",
+                    "rule_key": "write_file:ssh",
+                }
+            ],
+        )
+
+        def _approve(tool_name, reason, **kwargs):
+            seen["tool_name"] = tool_name
+            seen["reason"] = reason
+            seen["rule_key"] = kwargs.get("rule_key")
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert seen == {
+            "tool_name": "write_file",
+            "reason": "why",
+            "rule_key": "write_file:ssh",
+        }
+
+    @pytest.mark.parametrize("rule_key", [None, "", "   ", 123, object()])
+    def test_approve_falls_back_to_tool_name_without_valid_rule_key(
+        self, monkeypatch, rule_key
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+        directive = {"action": "approve", "message": "why"}
+        if rule_key is not None:
+            directive["rule_key"] = rule_key
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [directive],
+        )
+
+        def _approve(tool_name, reason, **kwargs):
+            seen["rule_key"] = kwargs.get("rule_key")
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert seen["rule_key"] == "write_file"
+
+    def test_approve_gate_exception_fails_closed(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+        )
+        def _boom(*a, **k):
+            raise RuntimeError("gate crashed")
+        monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
+        msg = resolve_pre_tool_block("terminal", {})
+        assert msg is not None and "gate failed" in msg  # fail-closed
+
+
 class TestGetPreVerifyContinueMessage:
     """`pre_verify` directive aggregation — mirrors the pre_tool_call block path."""
 
@@ -1379,7 +1544,14 @@ class TestPluginToolVisibility:
     """Plugin-registered tools appear in get_tool_definitions()."""
 
     def test_plugin_tools_in_definitions(self, tmp_path, monkeypatch):
-        """Plugin tools are included when their toolset is in enabled_toolsets."""
+        """Plugin tools are reachable when their toolset is in enabled_toolsets.
+
+        Under tiered disclosure (any MCP/plugin tool defers behind the
+        tool_search bridge), a plugin tool no longer appears as a direct
+        schema — it is deferred and surfaced via the bridge's catalog
+        listing. 'Reachable' therefore means: present directly OR listed
+        in the tool_search bridge description.
+        """
         import hermes_cli.plugins as plugins_mod
 
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -1407,20 +1579,26 @@ class TestPluginToolVisibility:
 
         from model_tools import get_tool_definitions
 
-        # Plugin tools are included when their toolset is explicitly enabled
+        def _reachable(tools):
+            names = [t["function"]["name"] for t in tools]
+            if "vis_tool" in names:
+                return True  # tool_search inactive → direct schema
+            search = next((t for t in tools
+                           if t["function"]["name"] == "tool_search"), None)
+            return bool(search and "vis_tool" in search["function"]["description"])
+
+        # Reachable when its toolset is explicitly enabled
         tools = get_tool_definitions(enabled_toolsets=["terminal", "plugin_vis_plugin"], quiet_mode=True)
-        tool_names = [t["function"]["name"] for t in tools]
-        assert "vis_tool" in tool_names
+        assert _reachable(tools)
 
-        # Plugin tools are excluded when only other toolsets are enabled
+        # Excluded entirely when only other toolsets are enabled — not
+        # direct, not in the deferred listing.
         tools2 = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
-        tool_names2 = [t["function"]["name"] for t in tools2]
-        assert "vis_tool" not in tool_names2
+        assert not _reachable(tools2)
 
-        # Plugin tools are included when no toolset filter is active (all enabled)
+        # Reachable when no toolset filter is active (all enabled)
         tools3 = get_tool_definitions(quiet_mode=True)
-        tool_names3 = [t["function"]["name"] for t in tools3]
-        assert "vis_tool" in tool_names3
+        assert _reachable(tools3)
 
 
 # ── TestPluginManagerList ──────────────────────────────────────────────────

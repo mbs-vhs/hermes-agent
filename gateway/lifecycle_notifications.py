@@ -118,7 +118,18 @@ class GatewayLifecycleNotificationsMixin:
         # One-shot signal consumed by _is_stale_restart_redelivery: a missing
         # dedup marker only suppresses a /restart when we KNOW we just came out
         # of a restart cycle.
-        if restart_notification_pending or planned_restart_notification_pending:
+        #
+        # CHAT-ORIGINATED ONLY. Upstream narrowed this from
+        # ``restart_notification_pending or planned_restart_notification_pending``
+        # to the chat marker alone in cd0219da8, because the same release taught
+        # _is_stale_restart_redelivery to swallow the first same-or-older update
+        # unconditionally when this flag is set (the "slow service restart" arm,
+        # which has no five-minute trust window). A planned/service restart is
+        # not a redelivery of anything, so letting it set the flag makes the next
+        # genuine /restart get eaten. That collision is invisible in the merge:
+        # upstream's new consumer lands in gateway/run.py without conflicting,
+        # while the setter lives here in the fork's extracted mixin.
+        if restart_notification_pending:
             self._booted_from_restart = True
         delivered_restart_target = await self._send_restart_notification()
 

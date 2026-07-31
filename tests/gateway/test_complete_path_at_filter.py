@@ -26,6 +26,36 @@ import pytest
 from tui_gateway import server
 
 
+@pytest.fixture(autouse=True)
+def _isolate_launch_profile(tmp_path, monkeypatch):
+    """Pin HERMES_HOME so completion cannot resolve against the real profile.
+
+    Every test here does ``monkeypatch.chdir(tmp_path)`` and then asserts on
+    entries under that tree. That was sufficient until v2026.7.20, which put
+    ``_launch_configured_cwd()`` — the launch profile's ``terminal.cwd`` from
+    config.yaml — AHEAD of ``os.getcwd()`` in ``_completion_cwd``'s precedence
+    chain (upstream's reason: the dashboard's in-memory gateway never receives
+    the PTY child's bridged ``TERMINAL_CWD``).
+
+    Measured 2026-07-31 on the merge branch: without this fixture 13 of the 15
+    cases fail on a machine whose minerva profile sets ``terminal.cwd``, and the
+    completions come back rooted at the OPERATOR'S configured workspace (entries
+    like ``@file:hermes-agent-fork/ui-tui/src/components/appChrome.tsx``) rather
+    than ``tmp_path``. With HERMES_HOME redirected, 15/15 pass. So the assertions
+    were reading real on-disk operator config — machine-dependent, and green only
+    by accident of nobody having configured it. Same class as CLAWD-3056.
+
+    HERMES_HOME alone is not enough (config loading caches per-process), so the
+    two config/env-sourced entries in that precedence chain are neutralised
+    directly. ``os.getcwd()`` — the thing every test here sets with ``chdir`` —
+    is left as the resolved root, which is the contract these cases assert.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "_hermes_home"))
+    (tmp_path / "_hermes_home").mkdir(exist_ok=True)
+    monkeypatch.setattr(server, "_launch_configured_cwd", lambda: None)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+
 def _fixture(tmp_path: Path):
     (tmp_path / "readme.md").write_text("x")
     (tmp_path / ".env").write_text("x")

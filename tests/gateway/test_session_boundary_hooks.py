@@ -343,6 +343,94 @@ async def test_idle_expiry_emits_session_end(mock_invoke_hook):
 
 
 @pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_idle_expiry_clears_conversation_scoped_state(mock_invoke_hook):
+    """Upstream v2026.7.20's #58403 test, adapted to the fork's runner.
+
+    Expiry finalization used to carry a hand-copied pop-list of per-session
+    dicts, and the list drifted every time a dict was added — #58403 was
+    "finalization forgot ``_last_resolved_model``", so a resumed session could
+    serve a model cached before it went idle. The v2026.7.20 merge replaced the
+    pop-list with ``_clear_conversation_scope()`` (the boundary funnel driven by
+    ``_CONVERSATION_SCOPED_STATE``), which is what this pins.
+
+    Adapted, not copied: upstream's version builds a runner with no ``hooks``
+    and no ``origin``, because upstream's expiry path emits no ``session:end``.
+    The fork's does (#28746), and the two behaviours now coexist — so the setup
+    has to satisfy both or this test would pass for the wrong reason.
+    """
+    from datetime import datetime, timedelta
+
+    from gateway.run import GatewayRunner
+
+    other_key = "agent:main:telegram:dm:other"
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._running_agents = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._last_session_store_prune_ts = 0.0
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+
+    session_key = "agent:main:telegram:dm:42"
+    expired_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-expired",
+        created_at=datetime.now() - timedelta(hours=2),
+        updated_at=datetime.now() - timedelta(hours=2),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=_make_source(),
+    )
+    expired_entry.expiry_finalized = False
+
+    runner.session_store = MagicMock()
+    runner.session_store._ensure_loaded = MagicMock()
+    runner.session_store._entries = {session_key: expired_entry}
+    runner.session_store._is_session_expired = MagicMock(return_value=True)
+    runner.session_store._lock = MagicMock()
+    runner.session_store._lock.__enter__ = MagicMock(return_value=None)
+    runner.session_store._lock.__exit__ = MagicMock(return_value=None)
+    runner.session_store._save = MagicMock()
+
+    runner._evict_cached_agent = MagicMock()
+    runner._cleanup_agent_resources = MagicMock()
+    runner._sweep_idle_cached_agents = MagicMock(return_value=0)
+
+    runner._session_model_overrides = {session_key: "gpt-5-mini", other_key: "keep-me"}
+    runner._pending_model_notes = {session_key: "note", other_key: "keep-me"}
+    runner._last_resolved_model = {session_key: "gpt-5", other_key: "keep-me"}
+
+    _orig_sleep = __import__("asyncio").sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    async def _emit_and_stop(event_name, ctx):
+        if event_name == "session:end":
+            runner._running = False
+        return None
+
+    runner.hooks.emit.side_effect = _emit_and_stop
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await runner._session_expiry_watcher(interval=0)
+
+    assert session_key not in runner._last_resolved_model, (
+        "expiry finalization left _last_resolved_model behind — a resumed "
+        "session can serve a stale cached model (#58403). The boundary funnel "
+        "_clear_conversation_scope() should have dropped it."
+    )
+    assert session_key not in runner._session_model_overrides
+    assert session_key not in runner._pending_model_notes
+    # The funnel is per-session-key: an unrelated session must be untouched.
+    assert runner._last_resolved_model.get(other_key) == "keep-me"
+    assert runner._session_model_overrides.get(other_key) == "keep-me"
+    assert runner._pending_model_notes.get(other_key) == "keep-me"
+
+
+@pytest.mark.asyncio
 async def test_auto_reset_emits_session_end_for_prior_session():
     """Regression test for #28746 (auto-reset path).
 

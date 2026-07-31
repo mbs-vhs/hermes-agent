@@ -83,7 +83,7 @@ for arg in "$@"; do
     # last "#" line before `set -euo pipefail`. A stale range silently truncates
     # --help (it once cut off every flag, including the --no-restart that the
     # step-1b die() tells operators to use).
-    -h|--help)          sed -n '2,58p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)          sed -n '2,69p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "deploy-to-runtime: unknown arg: $arg (try --help)" >&2; exit 2 ;;
   esac
 done

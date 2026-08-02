@@ -312,6 +312,35 @@ def _restore_signal_handlers(previous: dict[int, signal.Handlers]) -> None:
         signal.signal(signum, handler)
 
 
+def _finish_signal_teardown(
+    registry: _ProcessRegistry,
+    previous: dict[int, signal.Handlers],
+) -> _SignalExit | None:
+    """Complete shutdown/restoration even when a managed signal interrupts it."""
+    interrupted = None
+    while True:
+        try:
+            registry.request_shutdown()
+        except _SignalExit as current:
+            # The handler closes the launch gate and ignores both managed signals
+            # before unwinding. Retry so an interrupted outer cleanup also finishes.
+            interrupted = current
+            continue
+        break
+
+    while True:
+        try:
+            _restore_signal_handlers(previous)
+        except _SignalExit as current:
+            # A signal may run through the still-installed sibling handler between
+            # the two restoration calls. It leaves both ignored, making a full
+            # retry deterministic and preventing a partially restored lifecycle.
+            interrupted = current
+            continue
+        break
+    return interrupted
+
+
 @contextmanager
 def _live_guard_environment() -> Iterator[Path | None]:
     """Expose only a private guard-module copy to per-file pytest children."""
@@ -1078,6 +1107,7 @@ def main() -> int:
     registry = _ProcessRegistry()
     previous_handlers: dict[int, signal.Handlers] = {}
     original_mask = None
+    exit_code = 1
     try:
         # On POSIX, establish the no-delivery window before guard materialization.
         # A TERM/INT arriving during guard mkdir/copy or handler installation stays
@@ -1095,14 +1125,16 @@ def main() -> int:
             if original_mask is not None:
                 signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
                 original_mask = None
-            return _main(registry)
+            exit_code = _main(registry)
     except _SignalExit as interrupted:
-        return interrupted.exit_code
+        exit_code = interrupted.exit_code
     finally:
-        registry.request_shutdown()
-        _restore_signal_handlers(previous_handlers)
+        teardown_interrupt = _finish_signal_teardown(registry, previous_handlers)
+        if teardown_interrupt is not None:
+            exit_code = teardown_interrupt.exit_code
         if original_mask is not None:
             signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+    return exit_code
 
 
 if __name__ == "__main__":

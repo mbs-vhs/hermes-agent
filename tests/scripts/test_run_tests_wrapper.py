@@ -856,6 +856,65 @@ def test_main_restores_handlers_after_partial_install(monkeypatch: pytest.Monkey
         assert [call[0] for call in mask_calls] == [signal.SIG_BLOCK, signal.SIG_SETMASK]
 
 
+@pytest.mark.parametrize("phase", ["shutdown", "handler-restoration"])
+@pytest.mark.parametrize(
+    ("sig", "expected_returncode"),
+    [(signal.SIGTERM, 143), (signal.SIGINT, 130)],
+)
+def test_main_normalizes_signal_during_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    sig: signal.Signals,
+    expected_returncode: int,
+):
+    """A teardown interrupt returns conventionally instead of escaping main."""
+    original_handlers = {
+        signal.SIGTERM: "original-term",
+        signal.SIGINT: "original-int",
+    }
+    installed = dict(original_handlers)
+    injected = False
+    real_request_shutdown = parallel_runner._ProcessRegistry.request_shutdown
+
+    def fake_getsignal(signum):
+        return installed[signum]
+
+    def fake_signal(signum, handler):
+        nonlocal injected
+        previous = installed[signum]
+        is_restoration = handler == original_handlers[signum]
+        if phase == "handler-restoration" and is_restoration and not injected:
+            injected = True
+            installed[sig](sig, None)
+        installed[signum] = handler
+        return previous
+
+    def controlled_shutdown(registry):
+        nonlocal injected
+        if phase == "shutdown" and not injected:
+            injected = True
+            installed[sig](sig, None)
+        return real_request_shutdown(registry)
+
+    monkeypatch.delenv("HERMES_PYTEST_LIVE_GUARD_SOURCE", raising=False)
+    monkeypatch.setattr(parallel_runner.signal, "getsignal", fake_getsignal)
+    monkeypatch.setattr(parallel_runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(
+        parallel_runner.signal,
+        "pthread_sigmask",
+        lambda _how, _signals: frozenset(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        parallel_runner._ProcessRegistry, "request_shutdown", controlled_shutdown
+    )
+    monkeypatch.setattr(parallel_runner, "_main", lambda _registry: 0)
+
+    assert parallel_runner.main() == expected_returncode
+    assert injected
+    assert installed == original_handlers
+
+
 def test_windows_registry_shutdown_uses_taskkill(monkeypatch: pytest.MonkeyPatch):
     """Mock the Windows tree lifecycle without claiming POSIX signal behavior."""
 

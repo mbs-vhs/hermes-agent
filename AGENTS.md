@@ -214,12 +214,15 @@ the competing PRs into plugins against that interface.
 
 ```bash
 # Prefer .venv; fall back to venv if that's what your checkout has.
+python -m venv .venv
+.venv/bin/pip install -e '.[dev,acp,wecom]'
 source .venv/bin/activate   # or: source venv/bin/activate
 ```
 
-`scripts/run_tests.sh` probes `.venv` first, then `venv`, then
-`$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
-main checkout).
+`scripts/run_tests.sh` probes `.venv` first, then `venv`. In a worktree, the
+selected environment must be a physical, worktree-local directory; the runner
+rejects symlinked or foreign-prefix environments instead of borrowing another
+checkout's interpreter.
 
 ## Project Structure
 

@@ -25,6 +25,54 @@ Paste the pass/fail summary. Do not say "should work" — verify, or say *what's
 
 A profile-safety check is part of this gate: any code that reads/writes state under `HERMES_HOME` must use `get_hermes_home()` / `display_hermes_home()` from `hermes_constants` — **never** a hardcoded `~/.hermes` or `Path.home() / ".hermes"`. Hardcoded paths break the 10-profile mesh (each profile has its own `HERMES_HOME`). See `AGENTS.md` → **Profiles** and **Known Pitfalls**.
 
+## Operator notifications — read the standard before you touch one
+
+**Normative:** `devops-process/standards/operator-notifications.md`. Canon: **ADR-091**
+(one egress) extending **ADR-078** (the cross-surface operator-action bus). Read it
+before editing a notification, adding or changing a button, or investigating why the
+operator received a message. This pointer is a **summary** — the standard is the sole
+normative source.
+
+**Senders in this repo, and the distinction that matters.** The **conversational**
+send path (`plugins/platforms/telegram/adapter.py`, `tools/send_message_tool.py`) is
+**out of scope** — the operator talking to an agent is not the mesh notifying the
+operator, and ADR-078 forbids Hermes-core edits.
+
+But `gateway/lifecycle_notifications.py` — which emits "Gateway offline — Hermes is
+restarting" — **is** an operator notification riding that adapter, and **is** a
+migration target (CLAWD-3486). Do not read the conversational exemption as covering it.
+
+(**Which files carry this, and why they differ.** `AGENTS.md` here is the **vendored
+upstream** guide — every commit touching it is by an upstream Nous author — so
+minimal-delta applies and it is deliberately left alone; see the de-vendoring epic,
+CLAWD-2832. `GROK.md` is fork-authored and is **GENERATED** from this file's shared
+body by `devops-process/scripts/gen-agent-guides.sh`, so it carries this section too —
+never hand-edit it; edit `CLAUDE.md` and regenerate.)
+
+**Three things that bite, stated here so a reader who never opens the standard gets them:**
+
+1. **Tier decides whether the operator is INTERRUPTED.** ADR-078 Amendment 2 ratifies
+   `record` as **pull-only on every surface — never an interrupt**; `confirm` (a
+   *reversible* event where silence is consent) pushes **on telegram, and is pull-only
+   on agora and control**. `record` is the DEFAULT tier — Amendment 2 calls it
+   "deliberately the annoying default", so an action with no declared tier does not
+   interrupt. Choosing `record`
+   does not change how a message is sent — it stops it being sent. Do not then claim
+   `confirm` for everything that pushes today: that is push-unless-told-otherwise
+   relabelled, and it destroys the demotion-on-evidence the tier model runs on.
+   Migration is per-producer triage, and some messages honestly go quiet — that is the
+   intended outcome.
+2. **A test run must never DM the operator, and the guard belongs at the NETWORK
+   BOUNDARY**, not the call site you happen to be looking at. The `devops-process`
+   hot-lane gate was measured sending two real DMs per gate run from a fixture
+   (CLAWD-3475). Reference impl: `devops-process/scripts/hot-lane/hl_notify.py`.
+   Mock the notifier in your test anyway — the boundary guard is a safety net, not the
+   contract.
+3. **Most of the egress is a TARGET, not built.** `tier` and producer identity are
+   absent from the live schema and `OperatorActionCreate` is `extra="forbid"`, so
+   posting them returns **422** today. The standard opens with a build-state table.
+   Epic: **CLAWD-3479**.
+
 ## When the request is ambiguous
 
 If multiple reasonable interpretations exist (e.g., "add a memory hook" — core `agent/memory_manager.py` change? a provider plugin? a generic `PluginManager` lifecycle hook?), state the assumptions you're picking and ask before writing code. **NEVER** silently choose between meaningful interpretations.

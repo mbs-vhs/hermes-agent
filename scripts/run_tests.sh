@@ -33,6 +33,18 @@
 
 set -euo pipefail
 
+# Sanitize PATH before the first external command. A caller's active venv must
+# not supply dirname/env/mktemp/ps/sleep or become the child runner's fallback.
+SAFE_SYSTEM_PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+for system_bin in /opt/homebrew/bin /opt/homebrew/sbin; do
+  if [ -d "$system_bin" ]; then
+    SAFE_SYSTEM_PATH="$SAFE_SYSTEM_PATH:$system_bin"
+  fi
+done
+PATH="$SAFE_SYSTEM_PATH"
+export PATH
+unset VIRTUAL_ENV
+
 # ── Locate repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -55,7 +67,36 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # wrapper, which is that a local run matches CI.  Fail loudly instead.
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv"; do
+  if [ -L "$candidate" ]; then
+    echo "error: refusing symlinked virtualenv: $candidate" >&2
+    echo "       test worktrees must own a real .venv/venv directory; do not" >&2
+    echo "       link a shared environment from another checkout" >&2
+    exit 1
+  fi
+
   if [ -f "$candidate/bin/activate" ]; then
+    repo_root_real="$(cd -P "$REPO_ROOT" && pwd -P)"
+    candidate_real="$(cd -P "$candidate" && pwd -P)"
+    candidate_bin_real="$(cd -P "$candidate/bin" && pwd -P)"
+
+    case "$candidate_real" in
+      "$repo_root_real"/*) ;;
+      *)
+        echo "error: virtualenv resolves outside the current worktree: $candidate" >&2
+        echo "       resolved path: $candidate_real" >&2
+        exit 1
+        ;;
+    esac
+
+    case "$candidate_bin_real" in
+      "$candidate_real"/*) ;;
+      *)
+        echo "error: virtualenv bin directory resolves outside its environment: $candidate/bin" >&2
+        echo "       resolved path: $candidate_bin_real" >&2
+        exit 1
+        ;;
+    esac
+
     VENV="$candidate"
     break
   fi
@@ -65,19 +106,34 @@ if [ -z "$VENV" ]; then
   echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
   echo "       (fresh checkout or worktree? create one — the runner deliberately" >&2
   echo "        will NOT borrow an interpreter from outside this repo:)" >&2
-  echo "  python -m venv '$REPO_ROOT/.venv' && '$REPO_ROOT/.venv/bin/pip' install -e '.[dev]'" >&2
+  echo "  python -m venv '$REPO_ROOT/.venv' && '$REPO_ROOT/.venv/bin/pip' install -e '.[dev,acp,wecom]'" >&2
   exit 1
 fi
 
 PYTHON="$VENV/bin/python"
 
+# A venv's interpreter is commonly a symlink to its base Python.  That is safe
+# only when Python still reports the selected venv as sys.prefix; a symlink to
+# another checkout's venv would instead execute with that foreign prefix.
+if ! python_prefix_real="$(
+  env -i "$PYTHON" -c 'import os, sys; print(os.path.realpath(sys.prefix))' 2>/dev/null
+)"; then
+  echo "error: unable to verify virtualenv interpreter: $PYTHON" >&2
+  exit 1
+fi
 
-# ── Live-gateway plugin (computed before we drop env) ───────────────────────
-EXTRA_PYTHONPATH=""
-EXTRA_PYTEST_PLUGINS=""
+if [ "$python_prefix_real" != "$candidate_real" ]; then
+  echo "error: virtualenv interpreter reports a foreign sys.prefix: $PYTHON" >&2
+  echo "       selected environment: $candidate_real" >&2
+  echo "       reported sys.prefix: $python_prefix_real" >&2
+  exit 1
+fi
+
+
+# ── Live-gateway plugin source (materialized by Python runner) ──────────────
+LIVE_GUARD_SOURCE=""
 if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
-  EXTRA_PYTHONPATH="$HOME/.hermes"
-  EXTRA_PYTEST_PLUGINS="pytest_live_guard"
+  LIVE_GUARD_SOURCE="$HOME/.hermes/pytest_live_guard.py"
 fi
 
 
@@ -92,8 +148,13 @@ echo "  venv: $VENV"
 
 cd "$REPO_ROOT"
 
+# Do not preserve caller PATH: its VIRTUAL_ENV/bin (or another checkout's bin)
+# would remain an executable fallback after the selected venv.
+SAFE_PATH="$candidate_bin_real:$SAFE_SYSTEM_PATH"
+
 exec env -i \
-  PATH="$PATH" \
+  PATH="$SAFE_PATH" \
+  VIRTUAL_ENV="$candidate_real" \
   HOME="$HOME" \
   TZ=UTC \
   LANG=C.UTF-8 \
@@ -101,6 +162,5 @@ exec env -i \
   PYTHONHASHSEED=0 \
   PYTHONDONTWRITEBYTECODE=1 \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
-  ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
-  ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
+  ${LIVE_GUARD_SOURCE:+HERMES_PYTEST_LIVE_GUARD_SOURCE="$LIVE_GUARD_SOURCE"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"

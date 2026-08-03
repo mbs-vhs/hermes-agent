@@ -2998,7 +2998,28 @@ def delegate_task(
             # normally, but if the parent is interrupted while a child is
             # wedged, the abandoned worker must not block interpreter exit.
             from tools.daemon_pool import DaemonThreadPoolExecutor
-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
+            # CLAWD-3556 / CLAWD-1673. Deliberately NOT `with ... as executor`.
+            # The context-manager exit is shutdown(wait=True), so an interrupt
+            # `break` falls through to it and blocks the parent for up to
+            # child_timeout on a wedged child -- measured 9.4s against a 3.0s
+            # bound.
+            #
+            # A COMMENT HERE HAS ALREADY FAILED ONCE. Do not add to it; run the
+            # test. This fix was made in 9e10a630d, and the v0.18 merge
+            # a95b7cdba reverted it. Replaying that merge from its own parents
+            # shows tools/delegate_tool.py WAS one of its 34 conflicts, and the
+            # HEAD side of the conflict already carried a six-line NOTE saying
+            # exactly what this comment says. The resolver took upstream's side
+            # anyway. So the failure was not a missing warning and not a missing
+            # conflict -- prose at the point of decision is not what stops this.
+            #
+            # tests/tools/test_delegate_interrupt_bounded.py is. It goes RED on
+            # the `with` shape (9.4s vs a 3.0s bound) and on a
+            # finally-shutdown(wait=True). It was red from a95b7cdba until
+            # CLAWD-3556 and was carried as flaky CI the whole time. If you are
+            # resolving a conflict in this function, RUN THAT FILE.
+            executor = DaemonThreadPoolExecutor(max_workers=max_children)
+            try:
                 futures = {}
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
@@ -3061,6 +3082,10 @@ def delegate_task(
                                 }
                             results.append(entry)
                             completed_count += 1
+                        # Don't wait on still-running children: cancel the not-yet-started
+                        # futures and return the already-built results rather than falling
+                        # through to an implicit shutdown(wait=True) (CLAWD-1673).
+                        executor.shutdown(wait=False, cancel_futures=True)
                         break
 
                     from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
@@ -3113,6 +3138,10 @@ def delegate_task(
                                 )
                             except Exception as e:
                                 logger.debug("Spinner update_text failed: %s", e)
+            finally:
+                # Always tear down without re-waiting. On the normal path every
+                # future is already collected, so this is a no-op wait.
+                executor.shutdown(wait=False)
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])

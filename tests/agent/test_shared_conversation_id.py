@@ -1,8 +1,8 @@
 """Behavioural tests for the shared (person, agent) conversation_id (CLAWD-1542 / ADR-065).
 
 A stable conversation_id is derived once at the agent_init seam as
-``f"{profile}:{user_id}"`` (surface-agnostic) and threaded through
-``MemoryManager.sync_all`` -> ``provider.sync_turn(..., conversation_id=...)``.
+``f"{profile}:{user_id}"`` (surface-agnostic), passed to provider initialization,
+and self-sourced by the provider during each ``sync_turn``.
 
 The mnemosyne provider stamps it into the auto-capture metadata ONLY when the
 ``MNEMOSYNE_SHARED_CONVERSATION`` flag (config key ``shared_conversation``) is
@@ -11,7 +11,7 @@ ON; OFF/unset => the metadata key is absent => the adapter falls back to
 
 These tests cover:
   1. Derivation: profile+user_id -> "minerva:<uid>"; empty user_id -> "".
-  2. Propagation: sync_all forwards conversation_id by keyword to sync_turn.
+  2. Propagation: provider initialization stores conversation_id for sync_turn.
   3. Cross-surface acceptance: a Telegram-shaped source and a voice-delegate
      source for the SAME (morgan, minerva) yield the SAME conversation_id.
   4. Provider-boundary flag behaviour (mnemosyne): flag ON => meta carries the
@@ -31,13 +31,12 @@ from agent.memory_provider import MemoryProvider
 
 
 # ---------------------------------------------------------------------------
-# Shared fake provider that records sync_turn kwargs (mirrors the _RecordingProvider
-# pattern in test_memory_session_switch.py, but captures conversation_id too).
+# Shared fake provider that records the identity self-sourced by sync_turn.
 # ---------------------------------------------------------------------------
 
 
 class _CidRecordingProvider(MemoryProvider):
-    """Records every sync_turn call's kwargs for assertion."""
+    """Records each completed turn and its initialization-sourced identity."""
 
     def __init__(self, name="rec"):
         self._name = name
@@ -75,7 +74,7 @@ class _CidRecordingProvider(MemoryProvider):
                 "user": user_content,
                 "asst": assistant_content,
                 "session_id": session_id,
-                # explicit kwarg (legacy) wins; else the self-sourced value.
+                # Direct-call compatibility wins; manager calls self-source identity.
                 "conversation_id": conversation_id or self._conversation_id,
             }
         )
@@ -128,11 +127,11 @@ class TestConversationIdDerivation:
 
 
 # ---------------------------------------------------------------------------
-# 2. Propagation — sync_all forwards conversation_id by keyword
+# 2. Propagation — providers self-source conversation_id from initialize
 # ---------------------------------------------------------------------------
 
 
-class TestSyncAllPropagatesConversationId:
+class TestSyncAllUsesInitializedConversationId:
     def test_provider_self_sources_conversation_id_from_initialize(self):
         # v0.18 exfil: the derived (person,agent) key is threaded via initialize;
         # sync_all no longer carries it. The provider self-sources it.
@@ -151,15 +150,6 @@ class TestSyncAllPropagatesConversationId:
                 "conversation_id": "minerva:tg_111",
             }
         ]
-
-    def test_sync_all_default_conversation_id_is_empty(self):
-        """Callers that omit conversation_id (legacy path) get "" — no breakage."""
-        mm = MemoryManager()
-        p = _CidRecordingProvider()
-        mm.add_provider(p)
-
-        mm.sync_all("hi", "there", session_id="sess-1")
-        assert p.sync_calls[0]["conversation_id"] == ""
 
     def test_all_providers_self_source_conversation_id(self):
         mm = MemoryManager()
@@ -188,7 +178,7 @@ class TestCrossSurfaceConversationIdEquality:
 
     The derivation is surface-agnostic by construction (profile + user_id only).
     These cases use the same (profile, user_id) pair through two differently
-    shaped session contexts to prove the forwarded conversation_id converges.
+    shaped session contexts to prove the initialized conversation_id converges.
     """
 
     def test_telegram_and_voice_delegate_same_conversation_id(self):
@@ -220,13 +210,13 @@ class TestCrossSurfaceConversationIdEquality:
             session_id="voice-delegate-7f42",
         )
 
-        tg_fwd = p_tg.sync_calls[0]["conversation_id"]
-        voice_fwd = p_voice.sync_calls[0]["conversation_id"]
+        tg_cid = p_tg.sync_calls[0]["conversation_id"]
+        voice_cid = p_voice.sync_calls[0]["conversation_id"]
 
         # Per-surface session ids differ...
         assert p_tg.sync_calls[0]["session_id"] != p_voice.sync_calls[0]["session_id"]
         # ...but the shared (person, agent) conversation_id is identical.
-        assert tg_fwd == voice_fwd == "minerva:morgan_uid"
+        assert tg_cid == voice_cid == "minerva:morgan_uid"
 
     def test_different_agents_same_person_diverge(self):
         """Sanity: different agent (profile) for the same person must NOT share

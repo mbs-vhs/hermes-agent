@@ -4,9 +4,12 @@ Verifies that gateway user_id flows from AIAgent -> MemoryManager -> plugins,
 so each gateway user gets their own memory bucket instead of sharing a static one.
 """
 
+import inspect
 import json
 import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager
@@ -42,7 +45,7 @@ class RecordingProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         return ""
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", conversation_id=""):
+    def sync_turn(self, user_content, assistant_content, *, session_id=""):
         pass
 
     def get_tool_schemas(self):
@@ -53,6 +56,11 @@ class RecordingProvider(MemoryProvider):
 
     def shutdown(self):
         pass
+
+
+@pytest.mark.parametrize("sync_turn", [RecordingProvider.sync_turn], ids=["user-id-fake"])
+def test_recording_provider_sync_turn_omits_conversation_id(sync_turn):
+    assert "conversation_id" not in inspect.signature(sync_turn).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -355,4 +363,3 @@ class TestAIAgentUserIdPropagation:
             agent = object.__new__(AIAgent)
             agent._user_id = None
             assert agent._user_id is None
-

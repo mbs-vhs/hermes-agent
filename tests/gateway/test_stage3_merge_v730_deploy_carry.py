@@ -377,6 +377,15 @@ class TestMemoryProviderModuleRename:
             f"git grep could not run (rc={out.returncode}) from {root} — this "
             f"assertion proves NOTHING here: {out.stderr.strip()[:200]}"
         )
+        # rc=1 alone is not enough: an UNREADABLE tracked file makes git grep
+        # exit 1 with empty stdout and "failed to stat: Permission denied" on
+        # stderr — it SKIPPED the file that might hold the reference and called
+        # that "no matches". Re-review reproduced it with chmod 000. Silence on
+        # stderr is part of the evidence, not decoration.
+        assert not out.stderr.strip(), (
+            f"git grep ran but could not read part of the tree, so a clean "
+            f"result proves nothing: {out.stderr.strip()[:300]}"
+        )
         assert out.stdout.strip() == "", (
             "hermes_cli.memory_providers is still referenced: "
             f"{out.stdout.strip()}"

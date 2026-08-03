@@ -3484,7 +3484,7 @@ def _read_codex_shared_store() -> Optional[Dict[str, Any]]:
     payload = None
     for attempt in range(2):
         try:
-            payload = json.loads(path.read_text())
+            payload = json.loads(path.read_text(encoding="utf-8"))
             break
         except json.JSONDecodeError as exc:
             if attempt == 0:

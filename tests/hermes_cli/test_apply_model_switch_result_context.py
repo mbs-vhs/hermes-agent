@@ -120,19 +120,40 @@ def test_picker_path_falls_back_to_model_info_when_resolver_empty(monkeypatch):
     )
 
 
-def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
+def test_global_switch_refuses_to_persist_under_adr072(monkeypatch):
+    """FORK POLICY (ADR-072): a `--global` model switch persists NOTHING.
+
+    Upstream's version of this test is `test_global_switch_clears_context_pin_
+    owned_by_previous_route`, and it asserts `("model.context_length", None)`
+    reaches `save_config_value`. In this fork it never can: provider/model is
+    manifest-governed, so `_apply_model_switch_result` deliberately refuses the
+    global persist rather than let a manual `/model --global` clobber the
+    roster-generated `config.yaml`. Taking the upstream file verbatim is what
+    made the v2026.7.30 merge gate red.
+
+    So the property is INVERTED, not dropped — the switch must still apply for
+    the session, and it must write nothing at all. Asserting only "no
+    context_length write" would pass if the refusal were replaced by a
+    different write, hence the total-writes assertion.
+    """
     import cli as cli_mod
 
     writes = []
-    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    printed = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **_k: printed.append(str(a[0]) if a else ""))
     monkeypatch.setattr(
         cli_mod,
         "save_config_value",
         lambda key, value: writes.append((key, value)),
     )
     cli = _StubCLI()
-    cli.model = "shared-model"
-    cli.provider = "custom"
+    # PRE-STATE MUST DIFFER FROM THE EXPECTED POST-STATE. Review caught this:
+    # both were "shared-model"/"custom", so the swap assertion below held even
+    # when _apply_model_switch_result was replaced by `pass` — proven by
+    # mutation (3 passed). An assertion whose expected value equals the starting
+    # value measures nothing.
+    cli.model = "old-model"
+    cli.provider = "old-provider"
     # Runtime may already diverge from persisted config through a session override.
     cli.base_url = "https://small.example/v1"
     result = ModelSwitchResult(
@@ -168,4 +189,17 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     ):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
-    assert ("model.context_length", None) in writes
+    # SCOPE OF THIS ASSERTION, stated because the commit that added it
+    # overstated it: this intercepts `cli_mod.save_config_value` ONLY. Review
+    # demonstrated a persist through `hermes_cli.config.save_config` that this
+    # does not see. It measures "does not call cli.save_config_value", which is
+    # the path ADR-072 neutralized — not "writes nothing anywhere".
+    assert writes == [], f"ADR-072: --global must persist nothing, got {writes!r}"
+    assert any("ADR-072" in line for line in printed), (
+        f"the refusal must SAY why it refused, got: {printed!r}"
+    )
+    # The in-session swap still has to happen — a refusal that ALSO declined to
+    # switch would satisfy both assertions above while breaking /model. This can
+    # only catch that because the pre-state above differs from these values.
+    assert cli.model == "shared-model", f"in-session model swap did not happen: {cli.model!r}"
+    assert cli.provider == "custom", f"in-session provider swap did not happen: {cli.provider!r}"

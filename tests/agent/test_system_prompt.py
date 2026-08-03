@@ -140,6 +140,12 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
+    # FORK-LOCAL: the always-on capability-honesty guardrail (PR #29, CLAWD-1815)
+    # is emitted between HELP and STEER whenever the agent has any tools. It does
+    # not exist upstream, so the upstream copy of this test omits it and fails on
+    # the merge. Stubbed like every other constant here so this stays an ORDER
+    # test rather than a copy of the prompt text.
+    monkeypatch.setattr(system_prompt, "CAPABILITY_HONESTY_GUIDANCE", "HONESTY")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
@@ -150,11 +156,12 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
     )
+    # The blocks that are cached as the static prefix, in order. Named rather
+    # than sliced off `expected` by index: the fork inserts HONESTY here, and a
+    # magic `[:4]` silently mis-slices the moment anything else is inserted.
+    expected_static_parts = ("IDENTITY", "HELP", "HONESTY", "STEER", "CODING_STABLE")
     expected = "\n\n".join((
-        "IDENTITY",
-        "HELP",
-        "STEER",
-        "CODING_STABLE",
+        *expected_static_parts,
         "WORKSPACE",
         "Operator instructions (from config):\nOPERATOR",
         expected_profile,
@@ -182,7 +189,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected_static_parts)
 
 
 class TestTelegramRichMessagesHint:

@@ -35,6 +35,17 @@ from tools.send_message_tool import (
     _send_to_platform,
     send_message_tool,
 )
+
+
+def test_send_message_transport_is_not_agent_registered():
+    """Keep transport callable for trusted callers without a model schema."""
+    from tools.registry import registry
+
+    assert callable(send_message_tool)
+    assert registry.get_entry("send_message") is None
+    assert registry.get_schema("send_message") is None
+
+
 # Discord helpers moved to the plugin in #24325.  Import from the new path
 # and provide a thin ``_send_discord(token, ...)`` shim that mirrors the
 # pre-migration signature so the existing test bodies keep working.

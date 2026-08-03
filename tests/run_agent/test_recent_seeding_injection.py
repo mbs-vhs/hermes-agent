@@ -95,10 +95,88 @@ class TestSourceShape:
         assert "read_recent_seed" in src
         assert "_shared_conversation_id" in src
 
+    def _turn_ctx_src(self):
+        path = Path(__file__).resolve().parents[2] / "agent" / "turn_context.py"
+        return path.read_text(encoding="utf-8")
+
     def test_seed_goes_into_user_injections(self):
+        """The seed is composed into the USER message's API content.
+
+        Was a literal check for ``_injections.append(_recent_seed_block)`` in
+        ``conversation_loop.py``. The v2026.7.20 merge (CLAWD-3009) moved that
+        composition into ``turn_context.compose_user_api_content`` — upstream's
+        single source of the user-message API bytes — so the literal is gone
+        while the invariant is not. Asserted BEHAVIOURALLY against the real
+        helper rather than re-pinning a new string, since a string check would
+        have to be rewritten by whoever next moves the seam and proves nothing
+        about what it does.
+        """
+        from agent.turn_context import compose_user_api_content
+
+        seed = format_seed_block([
+            {"role": "user", "content": "earlier on voice: book a table"},
+            {"role": "assistant", "content": "booked for 7pm"},
+        ])
+        assert seed  # sanity
+
+        composed = compose_user_api_content(
+            "what time is my reservation", "", "", seed
+        )
+        assert composed is not None, "the seed was dropped entirely"
+        assert seed in composed, "the seed is not in the user-message API content"
+        assert composed.startswith("what time is my reservation"), (
+            "the seed must be APPENDED to the user's own text, not prepended"
+        )
+
+        # Empty seed injects nothing (no trailing separator churn).
+        assert compose_user_api_content("hi", "", "", "") is None
+
+    def test_stamp_site_and_wire_site_compose_the_seed_identically(self):
+        """The prompt-cache invariant the merge introduced, and its hazard.
+
+        v2026.7.20 made the prologue persist an ``api_content`` sidecar — the
+        exact bytes sent for this turn — which every later turn replays verbatim
+        so the provider's cache prefix stays stable. If the seed were composed
+        only at the ``api_messages`` build (where the fork used to do it) the
+        stamp and the wire would differ by exactly the seed block, and every
+        subsequent turn would re-prefill from the injection point. So BOTH call
+        sites must pass the seed.
+        """
+        conv = self._conv_src()
+        ctx = self._turn_ctx_src()
+
+        assert "recent_seed_block=_recent_seed_block" in conv, (
+            "conversation_loop no longer hands the seed to build_turn_context, "
+            "so the prologue's api_content stamp will omit it"
+        )
+        assert "recent_seed_block" in ctx, (
+            "turn_context does not accept/forward the seed"
+        )
+        # The stamp site inside build_turn_context must pass it through.
+        stamp = ctx.index("_api_content = compose_user_api_content(")
+        assert "recent_seed_block" in ctx[stamp:stamp + 300], (
+            "build_turn_context stamps api_content WITHOUT the seed — the "
+            "persisted sidecar and the wire will diverge by the seed block"
+        )
+        # The loop's live-compose fallback must pass it too.
+        live = conv.index("_composed = compose_user_api_content(")
+        assert "_recent_seed_block" in conv[live:live + 300], (
+            "the api_messages live-compose path omits the seed, so callers "
+            "that bypass prologue stamping silently lose it"
+        )
+
+    def test_seed_is_read_before_the_prologue(self):
+        """Ordering guard. The prologue stamps ``api_content``; a seed read
+        AFTER that call cannot reach the stamp. This broke silently once during
+        the v2026.7.20 merge and is invisible in any behavioural test that does
+        not run the real prologue."""
         src = self._conv_src()
-        # the seed variable is appended to the user-message _injections list
-        assert "_injections.append(_recent_seed_block)" in src
+        read_at = src.index("read_recent_seed as _read_recent_seed")
+        prologue_at = src.index("_ctx = build_turn_context(")
+        assert read_at < prologue_at, (
+            "the recent-seed read moved BELOW build_turn_context; the prologue "
+            "will stamp api_content without the seed"
+        )
 
     def test_seed_not_in_system_prompt_build(self):
         src = self._conv_src()

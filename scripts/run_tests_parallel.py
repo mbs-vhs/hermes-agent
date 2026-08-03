@@ -4,7 +4,7 @@
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
 plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
-subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
+subprocess per file, with bounded parallelism (default: ``min(os.cpu_count(), 4)``).
 
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
@@ -31,7 +31,7 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
+    HERMES_TEST_WORKERS  Override worker count (allowed: 1..4)
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
@@ -57,6 +57,31 @@ from typing import Dict, Iterator, List, Tuple
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
+
+# This host runs concurrent agent sessions. Test parallelism is deliberately
+# bounded even when the machine reports dozens of CPUs or the caller supplies
+# a larger value through the CLI/environment.
+_MAX_TEST_WORKERS = 4
+
+
+def _bounded_worker_count(raw: str) -> int:
+    """Parse a worker count and enforce the shared-host 1..4 contract."""
+    try:
+        workers = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"worker count must be an integer between 1 and {_MAX_TEST_WORKERS}"
+        ) from exc
+    if not 1 <= workers <= _MAX_TEST_WORKERS:
+        raise argparse.ArgumentTypeError(
+            f"worker count must be between 1 and {_MAX_TEST_WORKERS}, got {workers}"
+        )
+    return workers
+
+
+def _default_worker_count() -> int:
+    """Use available CPUs without ever exceeding the shared-host cap."""
+    return min(_MAX_TEST_WORKERS, max(1, os.cpu_count() or 1))
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -88,6 +113,15 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
+
+# One-shot retry of failing test FILES. A file that exits non-zero is re-run
+# once in a fresh subprocess; if the re-run passes, the file counts as passed
+# but is loudly reported as FLAKY so it gets fixed rather than hidden.
+# Deterministic failures fail both attempts — a real regression can never be
+# laundered into green by this (it would have to flake in our favor twice in
+# a row on the same runner, which is exactly the definition of a flake).
+# Set to 0 to disable (env: HERMES_TEST_FILE_RETRIES).
+_DEFAULT_FILE_RETRIES = 1
 
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
@@ -381,10 +415,18 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     registry: _ProcessRegistry,
+    retries: int = 0,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
     Returns (file, returncode, captured_combined_output, summary_counts, subprocess_wall_seconds).
+
+    ``retries`` > 0 enables the one-shot flake retry: a non-zero exit is
+    re-run in a fresh subprocess; if the re-run passes, the file counts as
+    passed but the output is prefixed with a FLAKY banner and the file/output
+    are recorded in ``_FLAKY_RESULTS`` so the summary can call it out. A
+    deterministic failure fails every attempt, so real regressions cannot
+    be laundered green.
 
     ``summary_counts`` is the result of ``_parse_pytest_summary(output)`` —
 
@@ -404,6 +446,45 @@ def _run_one_file(
     On timeout or runner shutdown, the registered per-file group/tree is killed.
     This outer timeout bounds a pathologically slow or hung file as a whole.
     """
+    file, rc, output, summary, subproc_wall = _run_one_file_once(
+        file, pytest_args, repo_root, file_timeout, registry
+    )
+    attempt = 0
+    while rc != 0 and attempt < retries:
+        attempt += 1
+        first_output = output
+        file, rc, output, summary, subproc_wall2 = _run_one_file_once(
+            file, pytest_args, repo_root, file_timeout, registry
+        )
+        subproc_wall += subproc_wall2
+        if rc == 0:
+            output = (
+                f"⚠ FLAKY: failed on attempt 1, passed on retry "
+                f"(attempt {attempt + 1}). Fix the flake — do not ignore this.\n"
+                f"--- first-attempt output ---\n{first_output}\n"
+                f"--- retry output ---\n{output}"
+            )
+            with _flaky_lock:
+                _FLAKY_RESULTS.append((file, output))
+    return file, rc, output, summary, subproc_wall
+
+
+# Files that failed once and passed on retry, with both attempts' output.
+# Keeping the traceback is load-bearing: a self-healed flake without its
+# failing assertion is only a filename, which forces another expensive full
+# run to rediscover the race.
+_FLAKY_RESULTS: List[Tuple[Path, str]] = []
+_flaky_lock = threading.Lock()
+
+
+def _run_one_file_once(
+    file: Path,
+    pytest_args: List[str],
+    repo_root: Path,
+    file_timeout: float,
+    registry: _ProcessRegistry,
+) -> Tuple[Path, int, str, dict[str, int], float]:
+    """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     
     subproc_start = time.monotonic()
@@ -414,8 +495,9 @@ def _run_one_file(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
-        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+        encoding="utf-8",
+        errors="replace",
+        env=os.environ,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows does not use this as a POSIX session-ownership primitive;
@@ -601,9 +683,9 @@ def _print_inline_failure(
     print(f"  ╔╍ Failed: {rel} ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
     for line in tail.splitlines():
         print(f"  ║ {line}", flush=True)
-    print(f"  ║", flush=True)
+    print("  ║", flush=True)
     print(f"  ║  Repro: {repro}", flush=True)
-    print(f"  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
+    print("  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
     print(flush=True)
 
 
@@ -730,6 +812,21 @@ def _slice_files(
     return target
 
 
+def _make_stdio_glyph_safe() -> None:
+    """Keep progress glyphs from crashing narrow Windows console encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def _main(registry: _ProcessRegistry) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -738,9 +835,12 @@ def _main(registry: _ProcessRegistry) -> int:
     parser.add_argument(
         "-j",
         "--jobs",
-        type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        type=_bounded_worker_count,
+        default=os.environ.get("HERMES_TEST_WORKERS") or str(_default_worker_count()),
+        help=(
+            "Parallel worker count, bounded to 1..4 "
+            "(default: $HERMES_TEST_WORKERS or min(cpu_count, 4))"
+        ),
     )
     parser.add_argument(
         "--paths",
@@ -762,6 +862,19 @@ def _main(registry: _ProcessRegistry) -> int:
             "Per-file wall-clock cap in seconds. On timeout, the pytest "
             "subprocess and its full process tree are SIGKILL'd. "
             f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min), env: HERMES_TEST_FILE_TIMEOUT."
+        ),
+    )
+    parser.add_argument(
+        "--file-retries",
+        type=int,
+        default=int(
+            os.environ.get("HERMES_TEST_FILE_RETRIES", _DEFAULT_FILE_RETRIES)
+        ),
+        help=(
+            "Re-run a failing test FILE this many times in a fresh subprocess "
+            "before declaring it failed. A pass-on-retry counts as passed but "
+            "is reported as FLAKY in the summary. 0 disables. "
+            f"Default: {_DEFAULT_FILE_RETRIES}, env: HERMES_TEST_FILE_RETRIES."
         ),
     )
     parser.add_argument(
@@ -823,8 +936,8 @@ def _main(registry: _ProcessRegistry) -> int:
     # it never reaches our positional ``paths``. ``=``-joined forms
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
-        "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--slice", "--generate-slices", "--files",
+        "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
+        "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -906,7 +1019,7 @@ def _main(registry: _ProcessRegistry) -> int:
         files = _discover_files(roots)
 
     if not files:
-        print(f"No test files to run", file=sys.stderr)
+        print("No test files to run", file=sys.stderr)
         return 1
 
     # --generate-slices: compute LPT distribution and emit JSON, then exit.
@@ -966,10 +1079,12 @@ def _main(registry: _ProcessRegistry) -> int:
     fail_count = 0
     tests_passed = 0
     tests_failed = 0
+    tests_collected = 0
     lock = threading.Lock()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, dict[str, int], float]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed
+        nonlocal tests_collected
         n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
@@ -993,6 +1108,10 @@ def _main(registry: _ProcessRegistry) -> int:
             # Accumulate test-level counts from parsed summary.
             tests_passed += summary.get("passed", 0)
             tests_failed += summary.get("failed", 0)
+            tests_collected += sum(
+                summary.get(k, 0)
+                for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
+            )
             file_times.append((fpath, subproc_wall))
             if rc == 0:
                 pass_count += 1
@@ -1021,6 +1140,7 @@ def _main(registry: _ProcessRegistry) -> int:
                 repo_root,
                 args.file_timeout,
                 registry,
+                args.file_retries,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -1034,6 +1154,31 @@ def _main(registry: _ProcessRegistry) -> int:
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+
+    # Per-file exit 5 is legitimate for a platform- or marker-filtered file,
+    # but a whole invocation that collected nothing is never a green gate.
+    no_tests_ran_at_all = bool(files) and tests_collected == 0
+    if no_tests_ran_at_all:
+        print()
+        print(
+            "=== ✗ NO TESTS RAN — 0 collected across "
+            f"{len(files)} file{'s' if len(files) != 1 else ''}. "
+            "This is NOT a pass. ==="
+        )
+        print(
+            "  Common causes: the selected venv has no pytest; a -k/-m filter "
+            "matched nothing; or collection errored in every file."
+        )
+        print("  Check the per-file output above for the real error.")
+
+    # Flaky files: failed once, passed on the automatic retry. Green, but
+    # loudly reported so they get fixed instead of silently re-flaking.
+    if _FLAKY_RESULTS:
+        print()
+        print(f"=== ⚠ {len(_FLAKY_RESULTS)} FLAKY file{'s' if len(_FLAKY_RESULTS) != 1 else ''} (failed once, passed on retry — fix these) ===")
+        for f, output in _FLAKY_RESULTS:
+            print(f"  {_format_file(f, repo_root)}")
+            print(output.rstrip())
 
     # Save durations for future --slice runs. Each slice writes its own
     # partial test_durations.json; a CI merge step joins them later.
@@ -1058,14 +1203,14 @@ def _main(registry: _ProcessRegistry) -> int:
         fast = sum(1 for t in times if t < 1.0)
         fast_2s = sum(1 for t in times if t < 2.0)
         print()
-        print(f"=== Per-file subprocess time distribution ===")
+        print("=== Per-file subprocess time distribution ===")
         print(f"  Files:   {len(times)}")
         print(f"  Total subprocess CPU-wall: {total_subproc:.1f}s  (runner wall: {elapsed:.1f}s, parallelism: {args.jobs}x)")
         print(f"  P50: {p50:.2f}s  P90: {p90:.2f}s  P95: {p95:.2f}s  P99: {p99:.2f}s  Max: {max_t:.2f}s")
         print(f"  <1s: {fast} files ({fast/len(times)*100:.0f}%)  <2s: {fast_2s} files ({fast_2s/len(times)*100:.0f}%)")
         # Top 10 slowest files — likely the ones dragging the run.
         slowest = sorted(file_times, key=lambda x: x[1], reverse=True)[:10]
-        print(f"  Top 10 slowest:")
+        print("  Top 10 slowest:")
         for f, t in slowest:
             print(f"    {t:>6.2f}s  {_format_file(f, repo_root)}")
 
@@ -1099,11 +1244,15 @@ def _main(registry: _ProcessRegistry) -> int:
                 print(f"  {_format_file(file, repo_root)}")
         return 1
 
+    if no_tests_ran_at_all:
+        return 1
+
     return 0
 
 
 def main() -> int:
     """Run tests with signal-safe child publication and guard ownership."""
+    _make_stdio_glyph_safe()
     registry = _ProcessRegistry()
     previous_handlers: dict[int, signal.Handlers] = {}
     original_mask = None

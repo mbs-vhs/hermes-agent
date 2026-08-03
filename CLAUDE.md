@@ -255,7 +255,7 @@ Never echo secret values in chat, commit messages, or logs. Reference the source
 ## Cross-references
 
 - `AGENTS.md` (this repo) — upstream codebase-internals dev guide (the shared body for *how the code works*).
-- `~/.hermes/hermes-agent/` — the **runtime checkout** serving `chat.vhs.box` + research. NOT the fleet: the 11 fleet gateway units exec from `/opt/hermes-agent/venv` (see the topology re-baseline above).
+- `~/.hermes/hermes-agent/` — the **runtime checkout** serving the OAuth-refresh timers + research (`chat.vhs.box` was decommissioned 2026-07-28, CLAWD-2803). NOT the fleet: the 11 fleet gateway units exec from `/opt/hermes-agent/venv` (see the topology re-baseline above).
 - `~/.hermes/profiles/<id>/` — per-profile runtime state (config, auth, sessions, plugins, logs); not in this repo.
 - `~/dev/clawd/` — evidence + context service the mnemosyne plugin memorializes to (`POST /admin/memory-items`) and recalls from. Has its own `AGENTS.md` / `CLAUDE.md` pair.
 - `~/dev/mnemosyne/` — memory service / `compose_context` algorithm owner (recall transport for the ADR-058 plugin).

@@ -236,16 +236,33 @@ sys.exit(runner.main())
 
 
 def _fake_python(
-    path: Path, prefix: Path, marker: str, *, exit_code: int = 0
+    path: Path,
+    prefix: Path,
+    marker: str,
+    *,
+    exit_code: int = 0,
+    compile_log: Path | None = None,
 ) -> Path:
     """Write an interpreter shim that exposes its prefix and final environment."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    compile_probe = ""
+    if compile_log is not None:
+        compile_probe = (
+            'if [ "$1" = "-S" ] && [ "$2" = "-m" ] '
+            '&& [ "$3" = "compileall" ]; then\n'
+            f"  printf 'ARGS=%s\\n' \"$*\" > {shlex.quote(str(compile_log))}\n"
+            f"  printf 'PYTHONPATH=%s\\n' \"${{PYTHONPATH-}}\" >> {shlex.quote(str(compile_log))}\n"
+            f"  printf 'OPENAI_API_KEY=%s\\n' \"${{OPENAI_API_KEY-}}\" >> {shlex.quote(str(compile_log))}\n"
+            "  exit 0\n"
+            "fi\n"
+        )
     path.write_text(
         "#!/bin/sh\n"
         f'if [ "$1" = "-c" ] && [ "$2" = {shlex.quote(PREFIX_PROBE)} ]; then\n'
         f"  printf '%s\\n' {shlex.quote(str(prefix.resolve()))}\n"
         "  exit 0\n"
         "fi\n"
+        f"{compile_probe}"
         'if [ "$1" = "-c" ]; then\n'
         f"  exec {shlex.quote(sys.executable)} \"$@\"\n"
         "fi\n"
@@ -551,6 +568,62 @@ def test_shell_passes_guard_source_without_import_paths(staged: Path):
     assert _observed_value(proc, "OBSERVED_GUARD_SOURCE") == str(guard_source)
     assert _observed_value(proc, "OBSERVED_PYTHONPATH") == ""
     assert _observed_value(proc, "OBSERVED_PYTEST_PLUGINS") == ""
+
+
+def test_precompile_is_credential_isolated_and_worker_bounded(staged: Path):
+    """Compile startup gets no caller env and never exceeds four workers."""
+    local = staged / ".venv"
+    (local / "bin").mkdir(parents=True)
+    (local / "bin" / "activate").write_text("# fake\n", encoding="utf-8")
+    compile_log = staged.parent / "compile-env.txt"
+    _fake_python(
+        local / "bin" / "python",
+        local,
+        "SELECTED-LOCAL",
+        compile_log=compile_log,
+    )
+
+    proc = _run(
+        staged,
+        {
+            "PYTHONPATH": str(staged.parent / "hostile-pythonpath"),
+            "OPENAI_API_KEY": "synthetic-test-value",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    observed = compile_log.read_text(encoding="utf-8")
+    assert "ARGS=-S -m compileall -q -j 4 --" in observed
+    assert "PYTHONPATH=\n" in observed
+    assert "OPENAI_API_KEY=\n" in observed
+
+
+def test_precompile_cannot_execute_hostile_pythonpath_sitecustomize(staged: Path):
+    """Caller-controlled sitecustomize is inert during every wrapper phase."""
+    local = staged / ".venv"
+    (local / "bin").mkdir(parents=True)
+    (local / "bin" / "activate").write_text("# fake\n", encoding="utf-8")
+    _real_python_shim(local / "bin" / "python", local)
+
+    marker = staged.parent / "sitecustomize-executed.txt"
+    hostile = staged.parent / "hostile-pythonpath"
+    hostile.mkdir()
+    (hostile / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    tests_dir = staged / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_safe.py").write_text(
+        "def test_safe():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    proc = _run(staged, {"PYTHONPATH": str(hostile)})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not marker.exists()
 
 
 def test_guard_uses_one_module_path_and_worktree_imports_win(staged: Path):

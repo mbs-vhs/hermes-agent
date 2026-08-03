@@ -153,129 +153,17 @@ class TestToolResultPayload:
 # ---------------------------------------------------------------------------
 
 
-class TestPerRequestOverrides:
-    @pytest.mark.asyncio
-    async def test_overrides_reach_create_agent(self, adapter):
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent") as mock_create:
-                mock_create.return_value = _simple_agent("ok")
-                resp = await cli.post("/v1/runs", json={
-                    "input": "hi",
-                    "model": "gpt-5",
-                    "reasoning_effort": "high",
-                    "verbosity": "low",
-                })
-                assert resp.status == 202
 
-                for _ in range(60):
-                    if mock_create.called:
-                        break
-                    await asyncio.sleep(0.05)
-
-                assert mock_create.called
-                kwargs = mock_create.call_args.kwargs
-                assert kwargs["model"] == "gpt-5"
-                assert kwargs["reasoning_effort"] == "high"
-                assert kwargs["verbosity"] == "low"
-
-    @pytest.mark.asyncio
-    async def test_absent_overrides_pass_none(self, adapter):
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent") as mock_create:
-                mock_create.return_value = _simple_agent("ok")
-                resp = await cli.post("/v1/runs", json={"input": "hi"})
-                assert resp.status == 202
-
-                for _ in range(60):
-                    if mock_create.called:
-                        break
-                    await asyncio.sleep(0.05)
-
-                assert mock_create.called
-                kwargs = mock_create.call_args.kwargs
-                assert kwargs["model"] is None
-                assert kwargs["reasoning_effort"] is None
-                assert kwargs["verbosity"] is None
-
-    @pytest.mark.asyncio
-    async def test_invalid_reasoning_effort_returns_400(self, adapter):
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/runs", json={"input": "hi", "reasoning_effort": "turbo"})
-            assert resp.status == 400
-            data = await resp.json()
-            assert data["error"]["code"] == "invalid_reasoning_effort"
-        # Invalid request must not allocate a run.
-        assert adapter._run_streams == {}
-        assert adapter._run_statuses == {}
-
-    @pytest.mark.asyncio
-    async def test_invalid_verbosity_returns_400(self, adapter):
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/runs", json={"input": "hi", "verbosity": "loud"})
-            assert resp.status == 400
-            data = await resp.json()
-            assert data["error"]["code"] == "invalid_verbosity"
-        assert adapter._run_streams == {}
-        assert adapter._run_statuses == {}
-
-    def test_create_agent_merges_reasoning_overrides(self, adapter):
-        """_create_agent merges overrides into the resolved reasoning_config."""
-        captured = {}
-
-        def _fake_aiagent(**kwargs):
-            captured.update(kwargs)
-            return MagicMock()
-
-        from gateway.run import GatewayRunner
-
-        with patch("run_agent.AIAgent", side_effect=_fake_aiagent), \
-                patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}), \
-                patch("gateway.run._resolve_gateway_model", return_value="default-model"), \
-                patch("gateway.run._load_gateway_config", return_value={}), \
-                patch("hermes_cli.tools_config._get_platform_tools", return_value=set()), \
-                patch.object(adapter, "_ensure_session_db", return_value=None), \
-                patch.object(GatewayRunner, "_load_fallback_model", return_value=None), \
-                patch.object(GatewayRunner, "_load_reasoning_config",
-                             return_value={"enabled": True, "effort": "medium"}):
-            adapter._create_agent(model="gpt-5", reasoning_effort="high", verbosity="low")
-
-        assert captured["model"] == "gpt-5"
-        assert captured["reasoning_config"] == {
-            "enabled": True, "effort": "high", "verbosity": "low",
-        }
-
-    def test_create_agent_without_overrides_unchanged(self, adapter):
-        """Absent overrides → profile model + reasoning_config untouched."""
-        captured = {}
-
-        def _fake_aiagent(**kwargs):
-            captured.update(kwargs)
-            return MagicMock()
-
-        from gateway.run import GatewayRunner
-
-        with patch("run_agent.AIAgent", side_effect=_fake_aiagent), \
-                patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}), \
-                patch("gateway.run._resolve_gateway_model", return_value="default-model"), \
-                patch("gateway.run._load_gateway_config", return_value={}), \
-                patch("hermes_cli.tools_config._get_platform_tools", return_value=set()), \
-                patch.object(adapter, "_ensure_session_db", return_value=None), \
-                patch.object(GatewayRunner, "_load_fallback_model", return_value=None), \
-                patch.object(GatewayRunner, "_load_reasoning_config",
-                             return_value={"enabled": True, "effort": "medium"}):
-            adapter._create_agent()
-
-        assert captured["model"] == "default-model"
-        assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
-
-
-# ---------------------------------------------------------------------------
-# Feature 3 — clarify (agent-asks-mid-turn)
-# ---------------------------------------------------------------------------
+# CLAWD-3388 Phase 2 — TestPerRequestOverrides REMOVED, deliberately.
+# It pinned the fork's per-request overrides on the gateway run-create body
+# (top-level model / reasoning_effort / verbosity, validated with 400-on-invalid).
+# Operator decision 2026-08-03: forgo those to reduce fork delta. api_server.py
+# now takes upstream's shape wholesale — _request_agent_overrides() handles
+# provider/model/model_options only, and reasoning_effort is honoured ONLY
+# nested inside model_options (upstream _request_reasoning_config). verbosity has
+# no upstream consumer at all. These tests assert the removed contract, so they
+# fail by design rather than by regression. Downstream consequence is carded as
+# CLAWD-3533 (clawd forwards keys the gateway no longer honours).
 
 
 async def _drain_for_event(q: asyncio.Queue, event_name: str, max_iters: int = 100):

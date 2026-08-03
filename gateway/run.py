@@ -1688,7 +1688,7 @@ def _read_recovery_marker() -> Optional[dict]:
     — callers fall back to a fresh send when ``targets`` is missing.
     """
     try:
-        raw = (_hermes_home / _GATEWAY_RECOVERY_MARKER).read_text()
+        raw = (_hermes_home / _GATEWAY_RECOVERY_MARKER).read_text(encoding="utf-8")
         data = json.loads(raw)
         return data if isinstance(data, dict) else None
     except Exception:
@@ -1720,7 +1720,7 @@ def _pinned_status_key(platform: str, chat_id: str, thread_id: Optional[str]) ->
 def _read_pinned_status() -> dict:
     """Read the pinned-status id map ({key -> message_id}); {} when absent."""
     try:
-        raw = (_hermes_home / _GATEWAY_PINNED_STATUS_MARKER).read_text()
+        raw = (_hermes_home / _GATEWAY_PINNED_STATUS_MARKER).read_text(encoding="utf-8")
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     except Exception:

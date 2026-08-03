@@ -120,11 +120,27 @@ def test_picker_path_falls_back_to_model_info_when_resolver_empty(monkeypatch):
     )
 
 
-def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
+def test_global_switch_refuses_to_persist_under_adr072(monkeypatch):
+    """FORK POLICY (ADR-072): a `--global` model switch persists NOTHING.
+
+    Upstream's version of this test is `test_global_switch_clears_context_pin_
+    owned_by_previous_route`, and it asserts `("model.context_length", None)`
+    reaches `save_config_value`. In this fork it never can: provider/model is
+    manifest-governed, so `_apply_model_switch_result` deliberately refuses the
+    global persist rather than let a manual `/model --global` clobber the
+    roster-generated `config.yaml`. Taking the upstream file verbatim is what
+    made the v2026.7.30 merge gate red.
+
+    So the property is INVERTED, not dropped — the switch must still apply for
+    the session, and it must write nothing at all. Asserting only "no
+    context_length write" would pass if the refusal were replaced by a
+    different write, hence the total-writes assertion.
+    """
     import cli as cli_mod
 
     writes = []
-    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    printed = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **_k: printed.append(str(a[0]) if a else ""))
     monkeypatch.setattr(
         cli_mod,
         "save_config_value",
@@ -168,4 +184,10 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     ):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
-    assert ("model.context_length", None) in writes
+    assert writes == [], f"ADR-072: --global must persist nothing, got {writes!r}"
+    assert any("ADR-072" in line for line in printed), (
+        f"the refusal must SAY why it refused, got: {printed!r}"
+    )
+    # The in-session swap still has to happen — a refusal that also declined to
+    # switch would satisfy the two assertions above while breaking /model.
+    assert cli.model == "shared-model" and cli.provider == "custom"

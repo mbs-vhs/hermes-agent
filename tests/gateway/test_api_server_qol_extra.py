@@ -151,43 +151,17 @@ class TestToolResultEdges:
 # ---------------------------------------------------------------------------
 
 
-class TestOverrideNormalization:
-    @pytest.mark.asyncio
-    async def test_blank_model_collapses_to_none(self, adapter):
-        """A whitespace-only model must reach _create_agent as None (absent),
-        not as an empty-string override."""
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent") as mock_create:
-                mock_create.return_value = _simple_agent("ok")
-                resp = await cli.post("/v1/runs", json={"input": "hi", "model": "   "})
-                assert resp.status == 202
-                assert await _wait_create_called(mock_create)
-                kwargs = mock_create.call_args.kwargs
-                assert kwargs["model"] is None
 
-    @pytest.mark.asyncio
-    async def test_reasoning_effort_is_normalized_not_rejected(self, adapter):
-        """' High ' is stripped+lowercased to 'high', accepted, and reaches
-        _create_agent as 'high'."""
-        app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_create_agent") as mock_create:
-                mock_create.return_value = _simple_agent("ok")
-                resp = await cli.post(
-                    "/v1/runs",
-                    json={"input": "hi", "reasoning_effort": " High "},
-                )
-                assert resp.status == 202
-                assert await _wait_create_called(mock_create)
-                kwargs = mock_create.call_args.kwargs
-                assert kwargs["reasoning_effort"] == "high"
-
-
-# ---------------------------------------------------------------------------
-# Feature 3 — clarify: the under-covered branches
-# ---------------------------------------------------------------------------
-
+# CLAWD-3388 Phase 2 — TestOverrideNormalization REMOVED, deliberately.
+# It pinned the fork's per-request overrides on the gateway run-create body
+# (top-level model / reasoning_effort / verbosity, validated with 400-on-invalid).
+# Operator decision 2026-08-03: forgo those to reduce fork delta. api_server.py
+# now takes upstream's shape wholesale — _request_agent_overrides() handles
+# provider/model/model_options only, and reasoning_effort is honoured ONLY
+# nested inside model_options (upstream _request_reasoning_config). verbosity has
+# no upstream consumer at all. These tests assert the removed contract, so they
+# fail by design rather than by regression. Downstream consequence is carded as
+# CLAWD-3533 (clawd forwards keys the gateway no longer honours).
 
 class TestClarifyBranches:
     @pytest.mark.asyncio

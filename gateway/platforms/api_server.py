@@ -2428,20 +2428,19 @@ class APIServerAdapter(BasePlatformAdapter):
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
         reasoning_config = GatewayRunner._load_reasoning_config()
-        # Optional per-request model override (absent → gateway default).
-        model = model or _resolve_gateway_model()
-        # Optional per-request reasoning overrides. Merge into the profile
-        # defaults so unspecified keys keep their configured values.
-        if reasoning_effort or verbosity:
-            from hermes_constants import parse_reasoning_effort
-            merged_reasoning = dict(reasoning_config or {})
-            if reasoning_effort:
-                parsed_effort = parse_reasoning_effort(reasoning_effort)
-                if parsed_effort is not None:
-                    merged_reasoning.update(parsed_effort)
-            if verbosity:
-                merged_reasoning["verbosity"] = verbosity
-            reasoning_config = merged_reasoning
+        # CLAWD-3388 Phase 2: this was the fork's per-request override block,
+        # reading model/reasoning_effort/verbosity. Upstream renamed those
+        # parameters (requested_model / requested_provider / model_options) and
+        # moved the override handling DOWN to _request_reasoning_config(
+        # model_options) / _request_service_tier(model_options) / the
+        # _clean_request_string(requested_model) pair below. Taking upstream's
+        # signature while leaving this body orphaned made `model` an unbound
+        # local and raised UnboundLocalError on EVERY _create_agent() call —
+        # /v1/runs agent creation dead on all 11 gateways, invisible to
+        # py_compile and to an import smoke test because it is a runtime bind.
+        # Caught only by executing the fork's own api_server tests against both
+        # parents (fork main 25 passed vs merge 8 failed / 17 passed).
+        model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
         # cap), _resolve_runtime_agent_kwargs() falls through to the fallback

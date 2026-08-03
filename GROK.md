@@ -44,6 +44,54 @@ Paste the pass/fail summary. Do not say "should work" — verify, or say *what's
 
 A profile-safety check is part of this gate: any code that reads/writes state under `HERMES_HOME` must use `get_hermes_home()` / `display_hermes_home()` from `hermes_constants` — **never** a hardcoded `~/.hermes` or `Path.home() / ".hermes"`. Hardcoded paths break the 10-profile mesh (each profile has its own `HERMES_HOME`). See `AGENTS.md` → **Profiles** and **Known Pitfalls**.
 
+## Operator notifications — read the standard before you touch one
+
+**Normative:** `devops-process/standards/operator-notifications.md`. Canon: **ADR-091**
+(one egress) extending **ADR-078** (the cross-surface operator-action bus). Read it
+before editing a notification, adding or changing a button, or investigating why the
+operator received a message. This pointer is a **summary** — the standard is the sole
+normative source.
+
+**Senders in this repo, and the distinction that matters.** The **conversational**
+send path (`plugins/platforms/telegram/adapter.py`, `tools/send_message_tool.py`) is
+**out of scope** — the operator talking to an agent is not the mesh notifying the
+operator, and ADR-078 forbids Hermes-core edits.
+
+But `gateway/lifecycle_notifications.py` — which emits "Gateway offline — Hermes is
+restarting" — **is** an operator notification riding that adapter, and **is** a
+migration target (CLAWD-3486). Do not read the conversational exemption as covering it.
+
+(**Which files carry this, and why they differ.** `AGENTS.md` here is the **vendored
+upstream** guide — every commit touching it is by an upstream Nous author — so
+minimal-delta applies and it is deliberately left alone; see the de-vendoring epic,
+CLAWD-2832. `GROK.md` is fork-authored and is **GENERATED** from this file's shared
+body by `devops-process/scripts/gen-agent-guides.sh`, so it carries this section too —
+never hand-edit it; edit `CLAUDE.md` and regenerate.)
+
+**Three things that bite, stated here so a reader who never opens the standard gets them:**
+
+1. **Tier decides whether the operator is INTERRUPTED.** ADR-078 Amendment 2 ratifies
+   `record` as **pull-only on every surface — never an interrupt**; `confirm` (a
+   *reversible* event where silence is consent) pushes **on telegram, and is pull-only
+   on agora and control**. `record` is the DEFAULT tier — Amendment 2 calls it
+   "deliberately the annoying default", so an action with no declared tier does not
+   interrupt. Choosing `record`
+   does not change how a message is sent — it stops it being sent. Do not then claim
+   `confirm` for everything that pushes today: that is push-unless-told-otherwise
+   relabelled, and it destroys the demotion-on-evidence the tier model runs on.
+   Migration is per-producer triage, and some messages honestly go quiet — that is the
+   intended outcome.
+2. **A test run must never DM the operator, and the guard belongs at the NETWORK
+   BOUNDARY**, not the call site you happen to be looking at. The `devops-process`
+   hot-lane gate was measured sending two real DMs per gate run from a fixture
+   (CLAWD-3475). Reference impl: `devops-process/scripts/hot-lane/hl_notify.py`.
+   Mock the notifier in your test anyway — the boundary guard is a safety net, not the
+   contract.
+3. **Most of the egress is a TARGET, not built.** `tier` and producer identity are
+   absent from the live schema and `OperatorActionCreate` is `extra="forbid"`, so
+   posting them returns **422** today. The standard opens with a build-state table.
+   Epic: **CLAWD-3479**.
+
 ## When the request is ambiguous
 
 If multiple reasonable interpretations exist (e.g., "add a memory hook" — core `agent/memory_manager.py` change? a provider plugin? a generic `PluginManager` lifecycle hook?), state the assumptions you're picking and ask before writing code. **NEVER** silently choose between meaningful interpretations.
@@ -80,7 +128,19 @@ Address root causes, not symptoms. **NEVER** swallow exceptions, comment out fai
 >
 > Because the `~/.hermes` venv installs hermes-agent **editable**, advancing that checkout changes the code its consumers execute **immediately** — treat it as a live mutation, not a staged one.
 >
-> **⚠ `~/.hermes` IS STILL LOAD-BEARING — do not read the chat.vhs.box teardown as permission to retire it (CLAWD-2803).** That surface was the *sole* stated reason `~/.hermes` was protected. It is gone; the directory is not retirable. Nine live consumers: the two OAuth-refresh timers (which write the shared `auth.json`), `ai.hermes.dashboard.service` (`hermes.vhs.box`), clawd's and alloy's read-only `profiles` bind-mounts, the three backup/autoheal timers, `dev-preflight.sh`, `~/.hermes/skills/`, and `~/.hermes/cron/jobs.json`.
+> **⚠ `~/.hermes` IS STILL LOAD-BEARING — do not read the chat.vhs.box teardown as permission to retire it (CLAWD-2803).** The old justification written here made `chat.vhs.box` the *sole* stated reason `~/.hermes` was protected. That surface is gone; the directory is not retirable. Nine independent live consumers, all verified on the host 2026-07-25:
+>
+> 1. `ai.hermes.oauth-refresh.service`/`.timer` (every 6h) — writes the shared `auth.json`
+> 2. `ai.hermes.codex-refresh.service`/`.timer` (daily)
+> 3. `ai.hermes.dashboard.service` — serves `hermes.vhs.box` on `127.0.0.1:9119`
+> 4. `clawd-app` — bind-mounts `~/.hermes/profiles` read-only (`HERMES_PROFILE_ROOT`)
+> 5. `clawd-alloy` — bind-mounts `~/.hermes/profiles` read-only; ships 5 log files x 11 profiles to Loki
+> 6. `hermes-profile-backup.timer`, `hermes-kanban-backup.timer`, `hermes-kanban-autoheal.timer`
+> 7. `dev-preflight.sh` — monitors it as a LIVE runtime checkout
+> 8. `~/.hermes/skills/` — the curator skills dir that per-profile `external_dirs` resolve through
+> 9. `~/.hermes/cron/jobs.json` — the hermes cron ticker
+>
+> Retiring `~/.hermes` is a separate, larger decision (it would require migrating the OAuth refresh path and re-homing `hermes.vhs.box`), not a follow-on of the chat teardown.
 
 **This repo is code. `~/.hermes/` is runtime state. They are two separate checkouts.**
 
@@ -228,5 +288,5 @@ Never echo secret values in chat, commit messages, or logs. Reference the source
 |---|---|---|
 | 2026-05-29 | Created. Initial Minerva-fork operational CLAUDE.md layered over the inherited upstream `AGENTS.md`; documents fork-vs-runtime split, 10-profile mesh, shared-OAuth SPOF, ADR-058 mnemosyne rollout, ACP adapter, stop-conditions. | CLAWD-792 |
 | 2026-07-25 | **Topology re-baseline.** Corrected the falsified "the 10 gateways run from `~/.hermes/hermes-agent`" claim: there are now TWO live populations — the fleet (11 gateway units across 12 per-user accounts, exec from `/opt/hermes-agent/venv`, an editable install on a non-git tree) and the `~/.hermes` checkout (serves `chat.vhs.box` + research; hermes-webui *spawns* agents from its venv, so a deploy lands on the next spawned agent). The operator-manager `ai.hermes.gateway-*` units are masked legacy. This staleness had made `scripts/deploy-to-runtime.sh` fail *dangerous* — it advanced the live chat runtime 4,547 commits, then errored on gateways it could never restart; that script now validates restart targets **before** mutating. | CLAWD-2792 |
-| 2026-07-28 | **`chat.vhs.box` decommissioned; `~/.hermes` protection re-grounded.** hermes-webui and its two units were torn down (it ran as uid 1000 with read of the operator credential pool, while the fleet runs contained as per-user `hermes-*` uids). Two consequences recorded here: (1) `scripts/deploy-to-runtime.sh` no longer has chat-ui as its consumer — the `~/.hermes` venv's consumers are now the two OAuth-refresh timers, which are oneshots and pick up new code on their next firing; (2) the *stated reason* `~/.hermes` was protected evaporated with that surface, so the nine real consumers are now enumerated inline above. Also removed the `HERMES_OPERATOR_WEBUI` branch in `gateway/person_identity.py`; its test suite was REPLACED with removal guards, not deleted. **Correction (same day, from independent review):** this was first described as readers-without-writers with "no producer anywhere" — that was FALSE. Producers exist in `~/.hermes/profiles/minerva/.env` and `/home/hermes-minerva/.hermes/profiles/minerva/.env`; the original search covered only systemd units and `/etc/chat-ui/.env` (already deleted, so vacuously empty) and never looked at profile `.env` files. The removal is still safe — `_operator_person_id()` short-circuits on the explicit `HERMES_OPERATOR_PERSON_ID` that minerva sets, and the predicate was reachable only via `platform="webui"` which only hermes-webui emitted — but the two `.env` lines are now orphan writers-without-readers, left for an HR7-gated follow-up. | CLAWD-2803 |
 | 2026-07-27 | **`/opt/hermes-agent` made measurable; stale version corrected.** Fixed the `v0.14.0` package version (it is `0.18.0`; `0.14.0` is the *`~/.hermes`* venv, a different population). Added read-only `scripts/opt_provenance_report.py` + tests: the fleet runtime has no `.git`, so this is the only way to answer "what is running?" / "has it drifted?". Measured 251 files present in `/opt` and absent from `HEAD`, 33 still resolvable as importable modules — every one traced to a named deleting commit, so a `--delete` deploy would have removed live-tree code with no record of why. Both deploy-script refusal sites now point at the tool and the substrate proposal. GROK.md additionally received the 2026-07-25 topology re-baseline it never got — it was still asserting the falsified single-runtime topology. | CLAWD-2833 |
+| 2026-07-28 | **`chat.vhs.box` decommissioned; `~/.hermes` protection re-grounded.** hermes-webui and its two units were torn down (it ran as uid 1000 with read of the operator credential pool, while the fleet runs contained as per-user `hermes-*` uids). Two consequences recorded here: (1) `scripts/deploy-to-runtime.sh` no longer has chat-ui as its consumer — the `~/.hermes` venv's consumers are now the two OAuth-refresh timers, which are oneshots and pick up new code on their next firing; (2) the *stated reason* `~/.hermes` was protected evaporated with that surface, so the nine real consumers are now enumerated inline above. Also removed the `HERMES_OPERATOR_WEBUI` branch in `gateway/person_identity.py`; its test suite was REPLACED with removal guards, not deleted. **Correction (same day, from independent review):** this was first described as readers-without-writers with "no producer anywhere" — that was FALSE. Producers exist in `~/.hermes/profiles/minerva/.env` and `/home/hermes-minerva/.hermes/profiles/minerva/.env`; the original search covered only systemd units and `/etc/chat-ui/.env` (already deleted, so vacuously empty) and never looked at profile `.env` files. The removal is still safe — `_operator_person_id()` short-circuits on the explicit `HERMES_OPERATOR_PERSON_ID` that minerva sets, and the predicate was reachable only via `platform="webui"` which only hermes-webui emitted — but the two `.env` lines are now orphan writers-without-readers, left for an HR7-gated follow-up. | CLAWD-2803 |

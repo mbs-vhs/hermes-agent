@@ -4,7 +4,7 @@
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
 plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
-subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
+subprocess per file, with bounded parallelism (default: ``min(os.cpu_count(), 4)``).
 
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
@@ -31,7 +31,7 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
+    HERMES_TEST_WORKERS  Override worker count (allowed: 1..4)
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
@@ -42,17 +42,46 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
+
+# This host runs concurrent agent sessions. Test parallelism is deliberately
+# bounded even when the machine reports dozens of CPUs or the caller supplies
+# a larger value through the CLI/environment.
+_MAX_TEST_WORKERS = 4
+
+
+def _bounded_worker_count(raw: str) -> int:
+    """Parse a worker count and enforce the shared-host 1..4 contract."""
+    try:
+        workers = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"worker count must be an integer between 1 and {_MAX_TEST_WORKERS}"
+        ) from exc
+    if not 1 <= workers <= _MAX_TEST_WORKERS:
+        raise argparse.ArgumentTypeError(
+            f"worker count must be between 1 and {_MAX_TEST_WORKERS}, got {workers}"
+        )
+    return workers
+
+
+def _default_worker_count() -> int:
+    """Use available CPUs without ever exceeding the shared-host cap."""
+    return min(_MAX_TEST_WORKERS, max(1, os.cpu_count() or 1))
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -171,31 +200,16 @@ def _discover_files(roots: List[Path]) -> List[Path]:
 
 
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
-    """Kill the pytest subprocess and every descendant it spawned.
+    """Kill the registered pytest process group/tree and its leader.
 
-    A test run can spin up uvicorn servers, async runtimes, or other
-    long-running grandchildren that survive the pytest subprocess exit
-    if we don't kill the whole tree. ``subprocess.Popen.kill()`` only
-    targets the immediate child; grandchildren reparent to PID 1
-    (Linux) / get adopted by services.exe (Windows) and leak.
-
-    POSIX: the caller must pass ``pgid`` — the process group id captured
-    immediately after Popen (via ``os.getpgid(proc.pid)``). We can't
-    look it up here in the happy path because by the time we get
-    called the leader process has already been reaped and its pid is
-    gone from the kernel's process table, even though descendants in
-    the group are still alive. SIGKILL'ing the captured pgid takes out
-    everything in that group atomically.
+    POSIX uses the PGID recorded with Popen publication, which remains usable
+    after the group leader exits. A descendant that deliberately creates a new
+    session and exits its intermediate parent is outside this ownership contract.
 
     Windows: ``taskkill /F /T /PID`` walks the recorded ppid chain and
     terminates the whole tree, even when the root has already exited.
 
-    Why not psutil: psutil walks the parent-child tree, but in the
-    happy path the root has already been reaped so ``psutil.Process(pid)``
-    can't find it; grandchildren reparented to PID 1 are also
-    unreachable by tree walk at that point. The platform-native
-    primitives (process groups / taskkill) handle both cases correctly
-    without an extra abstraction layer.
+    The platform-native primitives avoid a global process scan or dependency.
     """
     if proc.pid is None:
         return
@@ -228,11 +242,179 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+def _capture_process_group(proc: "subprocess.Popen") -> int | None:
+    """Capture a new-session child's PGID before its leader can disappear."""
+    if sys.platform == "win32":
+        return None
+    # Popen(start_new_session=True) calls setsid() before exec; by contract the
+    # child's PID is therefore also its session and process-group id. Recording
+    # the PID avoids a getpgid() race if a very short-lived leader exits first.
+    return proc.pid
+
+
+class _ShutdownRequested(RuntimeError):
+    """Raised when a worker reaches the launch gate after shutdown begins."""
+
+
+class _SignalExit(BaseException):
+    """Unwind the runner after registered process groups have been killed."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+        self.exit_code = 128 + signum
+
+
+class _ProcessRegistry:
+    """Publish each per-file process group atomically with respect to shutdown."""
+
+    def __init__(self) -> None:
+        self._launch_lock = threading.Lock()
+        self._shutdown = threading.Event()
+        self._active: dict[int, tuple[subprocess.Popen, int | None]] = {}
+
+    def launch(self, *args, **kwargs) -> tuple[subprocess.Popen, int | None]:
+        """Start and register a child without exposing a publication window."""
+        with self._launch_lock:
+            if self._shutdown.is_set():
+                raise _ShutdownRequested("test runner shutdown already requested")
+            proc = subprocess.Popen(*args, **kwargs)
+            pgid = _capture_process_group(proc)
+            self._active[proc.pid] = (proc, pgid)
+            return proc, pgid
+
+    def finish(self, proc: subprocess.Popen) -> None:
+        """Kill any residue in a published group, then unregister it."""
+        with self._launch_lock:
+            record = self._active.pop(proc.pid, None)
+        if record is None:
+            return
+        _kill_tree(*record)
+
+    def request_shutdown(self) -> None:
+        """Close the launch gate, wait for publication, and kill all groups."""
+        self._shutdown.set()
+        with self._launch_lock:
+            active = list(self._active.values())
+        for proc, pgid in active:
+            _kill_tree(proc, pgid)
+
+
+def _install_signal_handlers(
+    registry: _ProcessRegistry,
+    previous: dict[int, signal.Handlers] | None = None,
+    *,
+    signals_already_blocked: bool = False,
+) -> dict[int, signal.Handlers]:
+    """Route TERM/INT through the registry and preserve conventional statuses.
+
+    POSIX blocks both signals until both handlers are installed. A signal sent
+    through either installation window is therefore delivered only after the
+    lifecycle can normalize its status and clean registered children.
+    """
+    if previous is None:
+        previous = {}
+
+    def handle_signal(signum: int, _frame) -> None:
+        # Prevent a second interrupt from re-entering cleanup while it waits for
+        # an in-flight launch to publish its process group.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        registry.request_shutdown()
+        raise _SignalExit(signum)
+
+    managed_signals = (signal.SIGTERM, signal.SIGINT)
+    original_mask = None
+    if not signals_already_blocked and hasattr(signal, "pthread_sigmask"):
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+    try:
+        for signum in managed_signals:
+            # Record the original before installing. If signal.signal raises or
+            # a pending managed signal is delivered on mask restoration, main's
+            # finally block can still restore every handler touched so far.
+            if signum not in previous:
+                previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, handle_signal)
+    finally:
+        if original_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+    return previous
+
+
+def _restore_signal_handlers(previous: dict[int, signal.Handlers]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+def _finish_signal_teardown(
+    registry: _ProcessRegistry,
+    previous: dict[int, signal.Handlers],
+) -> _SignalExit | None:
+    """Complete shutdown/restoration even when a managed signal interrupts it."""
+    interrupted = None
+    while True:
+        try:
+            registry.request_shutdown()
+        except _SignalExit as current:
+            # The handler closes the launch gate and ignores both managed signals
+            # before unwinding. Retry so an interrupted outer cleanup also finishes.
+            interrupted = current
+            continue
+        break
+
+    while True:
+        try:
+            _restore_signal_handlers(previous)
+        except _SignalExit as current:
+            # A signal may run through the still-installed sibling handler between
+            # the two restoration calls. It leaves both ignored, making a full
+            # retry deterministic and preventing a partially restored lifecycle.
+            interrupted = current
+            continue
+        break
+    return interrupted
+
+
+@contextmanager
+def _live_guard_environment() -> Iterator[Path | None]:
+    """Expose only a private guard-module copy to per-file pytest children."""
+    source_raw = os.environ.pop("HERMES_PYTEST_LIVE_GUARD_SOURCE", "")
+    if not source_raw:
+        yield None
+        return
+
+    source = Path(source_raw)
+    if not source.is_file():
+        raise FileNotFoundError(f"pytest live guard source does not exist: {source}")
+
+    original_pythonpath = os.environ.get("PYTHONPATH")
+    original_plugins = os.environ.get("PYTEST_PLUGINS")
+    with tempfile.TemporaryDirectory(prefix="hermes-pytest-live-guard.") as temp:
+        guard_dir = Path(temp)
+        destination = guard_dir / "pytest_live_guard.py"
+        shutil.copy2(source, destination)
+        destination.chmod(0o400)
+        os.environ["PYTHONPATH"] = str(guard_dir)
+        os.environ["PYTEST_PLUGINS"] = "pytest_live_guard"
+        try:
+            yield guard_dir
+        finally:
+            if original_pythonpath is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = original_pythonpath
+            if original_plugins is None:
+                os.environ.pop("PYTEST_PLUGINS", None)
+            else:
+                os.environ["PYTEST_PLUGINS"] = original_plugins
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    registry: _ProcessRegistry,
     retries: int = 0,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
@@ -261,21 +443,18 @@ def _run_one_file(
     files where every test is marked integration). That's intentional and
     not a failure mode.
 
-    On per-file timeout (``file_timeout`` seconds) or any other exception
-    during ``communicate()``, we kill the whole process group / process
-    tree so grandchildren (uvicorn servers, async runtimes, etc.) do not
-    orphan onto PID 1. This outer timeout exists only to
-    bound a pathologically slow or hung file as a whole.
+    On timeout or runner shutdown, the registered per-file group/tree is killed.
+    This outer timeout bounds a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, registry
     )
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, registry
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -303,36 +482,28 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    registry: _ProcessRegistry,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     
     subproc_start = time.monotonic()
     # launch the pytest process
-    proc = subprocess.Popen(
+    proc, pgid = registry.launch(
         cmd,
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=os.environ,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
+        # Windows does not use this as a POSIX session-ownership primitive;
+        # _kill_tree handles that platform explicitly via taskkill /F /T.
         start_new_session=True,
     )
-
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
-    pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
 
     try:
         output, _ = proc.communicate(timeout=file_timeout)
@@ -349,16 +520,12 @@ def _run_one_file_once(
             f"process tree SIGKILL'd)\n{output}"
         )
     except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
         raise
     else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
-
-        output +=  "\n"
+        output += "\n"
+    finally:
+        # Covers normal completion, timeout, runner shutdown, and worker crash.
+        registry.finish(proc)
 
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
@@ -645,7 +812,22 @@ def _slice_files(
     return target
 
 
-def main() -> int:
+def _make_stdio_glyph_safe() -> None:
+    """Keep progress glyphs from crashing narrow Windows console encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+def _main(registry: _ProcessRegistry) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -653,9 +835,12 @@ def main() -> int:
     parser.add_argument(
         "-j",
         "--jobs",
-        type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        type=_bounded_worker_count,
+        default=os.environ.get("HERMES_TEST_WORKERS") or str(_default_worker_count()),
+        help=(
+            "Parallel worker count, bounded to 1..4 "
+            "(default: $HERMES_TEST_WORKERS or min(cpu_count, 4))"
+        ),
     )
     parser.add_argument(
         "--paths",
@@ -751,7 +936,7 @@ def main() -> int:
     # it never reaches our positional ``paths``. ``=``-joined forms
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
-        "-j", "--jobs", "--paths", "--include-integration",
+        "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -894,10 +1079,12 @@ def main() -> int:
     fail_count = 0
     tests_passed = 0
     tests_failed = 0
+    tests_collected = 0
     lock = threading.Lock()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, dict[str, int], float]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed
+        nonlocal tests_collected
         n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
@@ -921,6 +1108,10 @@ def main() -> int:
             # Accumulate test-level counts from parsed summary.
             tests_passed += summary.get("passed", 0)
             tests_failed += summary.get("failed", 0)
+            tests_collected += sum(
+                summary.get(k, 0)
+                for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
+            )
             file_times.append((fpath, subproc_wall))
             if rc == 0:
                 pass_count += 1
@@ -943,8 +1134,13 @@ def main() -> int:
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                _run_one_file,
+                file,
+                pytest_passthrough,
+                repo_root,
+                args.file_timeout,
+                registry,
+                args.file_retries,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -958,6 +1154,22 @@ def main() -> int:
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+
+    # Per-file exit 5 is legitimate for a platform- or marker-filtered file,
+    # but a whole invocation that collected nothing is never a green gate.
+    no_tests_ran_at_all = bool(files) and tests_collected == 0
+    if no_tests_ran_at_all:
+        print()
+        print(
+            "=== ✗ NO TESTS RAN — 0 collected across "
+            f"{len(files)} file{'s' if len(files) != 1 else ''}. "
+            "This is NOT a pass. ==="
+        )
+        print(
+            "  Common causes: the selected venv has no pytest; a -k/-m filter "
+            "matched nothing; or collection errored in every file."
+        )
+        print("  Check the per-file output above for the real error.")
 
     # Flaky files: failed once, passed on the automatic retry. Green, but
     # loudly reported so they get fixed instead of silently re-flaking.
@@ -1032,7 +1244,46 @@ def main() -> int:
                 print(f"  {_format_file(file, repo_root)}")
         return 1
 
+    if no_tests_ran_at_all:
+        return 1
+
     return 0
+
+
+def main() -> int:
+    """Run tests with signal-safe child publication and guard ownership."""
+    _make_stdio_glyph_safe()
+    registry = _ProcessRegistry()
+    previous_handlers: dict[int, signal.Handlers] = {}
+    original_mask = None
+    exit_code = 1
+    try:
+        # On POSIX, establish the no-delivery window before guard materialization.
+        # A TERM/INT arriving during guard mkdir/copy or handler installation stays
+        # pending until both handlers own cleanup and conventional exit status.
+        if hasattr(signal, "pthread_sigmask"):
+            original_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, (signal.SIGTERM, signal.SIGINT)
+            )
+        with _live_guard_environment():
+            _install_signal_handlers(
+                registry,
+                previous_handlers,
+                signals_already_blocked=original_mask is not None,
+            )
+            if original_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+                original_mask = None
+            exit_code = _main(registry)
+    except _SignalExit as interrupted:
+        exit_code = interrupted.exit_code
+    finally:
+        teardown_interrupt = _finish_signal_teardown(registry, previous_handlers)
+        if teardown_interrupt is not None:
+            exit_code = teardown_interrupt.exit_code
+        if original_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from tools.registry import ToolRegistry
 from toolsets import (
     TOOLSETS,
+    _HERMES_CORE_TOOLS,
     get_toolset,
     resolve_toolset,
     resolve_multiple_toolsets,
@@ -228,6 +229,25 @@ class TestToolsetConsistency:
         # Sanity: the shared core must be non-trivial (i.e. we didn't
         # silently let a platform diverge so far that nothing is shared).
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
+
+    def test_send_message_is_absent_from_core_platform_resolution(self):
+        """Outbound transport remains external to the model tool surface."""
+        from tools.registry import registry
+        from tools.send_message_tool import send_message_tool
+
+        assert callable(send_message_tool)
+        assert registry.get_entry("send_message") is None
+        assert registry.get_schema("send_message") is None
+        assert "send_message" not in _HERMES_CORE_TOOLS
+        for platform in (
+            "hermes-cli",
+            "hermes-cron",
+            "hermes-telegram",
+            "hermes-discord",
+            "hermes-whatsapp",
+            "hermes-signal",
+        ):
+            assert "send_message" not in resolve_toolset(platform)
 
 
 class TestPluginToolsets:

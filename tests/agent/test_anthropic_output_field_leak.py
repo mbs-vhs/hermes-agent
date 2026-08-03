@@ -10,10 +10,10 @@ Fix: whitelist input-permitted fields per block type at three points —
 normalize_response capture, _sanitize_replay_block (ordered-blocks replay), and
 _convert_content_part_to_anthropic (content-list replay).
 """
-import sys, os
-sys.path.insert(0, os.path.expanduser("~/.hermes/hermes-agent"))
+from pathlib import Path
 
 import pytest
+import agent.anthropic_adapter as anthropic_adapter
 from agent.anthropic_adapter import (
     _sanitize_replay_block,
     _convert_content_part_to_anthropic,
@@ -21,6 +21,16 @@ from agent.anthropic_adapter import (
 )
 
 FORBIDDEN = {"parsed_output", "caller"}
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_production_import_comes_from_current_worktree():
+    """The regression test must never reach into a sibling live checkout."""
+    module_path = Path(anthropic_adapter.__file__).resolve()
+
+    assert module_path.is_relative_to(REPO_ROOT), (
+        f"agent.anthropic_adapter imported from {module_path}, not {REPO_ROOT}"
+    )
 
 
 def _assert_clean(block):

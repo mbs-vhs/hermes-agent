@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 import pytest
+from scripts import run_tests_parallel as runner
 
 
 # Both tests share the same handoff file: the leaker writes here, the
@@ -36,6 +37,82 @@ import pytest
 # so concurrent invocations of the suite don't clobber each other.
 _HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
 _HANDOFF_DIR.mkdir(exist_ok=True)
+
+
+@pytest.mark.parametrize("help_flag", ["-h", "--help"])
+def test_help_is_owned_and_exits_before_discovery_or_launch(
+    help_flag: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Runner help must never become a pytest flag or start test work."""
+    monkeypatch.setattr(sys, "argv", ["run_tests_parallel.py", help_flag])
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("help reached discovery or subprocess launch")
+
+    monkeypatch.setattr(runner, "_discover_files", forbidden)
+    monkeypatch.setattr(runner.subprocess, "Popen", forbidden)
+
+    with pytest.raises(SystemExit) as exc_info:
+        runner._main(runner._ProcessRegistry())
+
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "usage: run_tests_parallel.py" in captured.out
+    assert "Parallel worker count" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("cpu_count, expected", [(None, 1), (1, 1), (2, 2), (64, 4)])
+def test_default_worker_count_is_bounded(
+    cpu_count: int | None,
+    expected: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner.os, "cpu_count", lambda: cpu_count)
+    assert runner._default_worker_count() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "5", "64", "not-an-integer"])
+def test_explicit_worker_count_outside_contract_fails_before_discovery(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_tests_parallel.py", "-j", value])
+    monkeypatch.setattr(
+        runner,
+        "_discover_files",
+        lambda _roots: pytest.fail("invalid CLI worker count reached discovery"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        runner._main(runner._ProcessRegistry())
+
+    assert exc_info.value.code == 2
+    assert "between 1 and 4" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["0", "5"])
+def test_env_worker_count_outside_contract_fails_before_discovery(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HERMES_TEST_WORKERS", value)
+    monkeypatch.setattr(sys, "argv", ["run_tests_parallel.py"])
+    monkeypatch.setattr(
+        runner,
+        "_discover_files",
+        lambda _roots: pytest.fail("invalid env worker count reached discovery"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        runner._main(runner._ProcessRegistry())
+
+    assert exc_info.value.code == 2
+    assert "worker count must be between 1 and 4" in capsys.readouterr().err
 
 
 def _handoff_path_for(nonce: str) -> Path:

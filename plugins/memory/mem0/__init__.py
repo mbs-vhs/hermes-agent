@@ -475,7 +475,7 @@ class Mem0MemoryProvider(MemoryProvider):
         # Slow backend: skip injection; mem0_search tool remains the backstop.
         return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", conversation_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
         if self._backend is None or self._is_breaker_open():
             return

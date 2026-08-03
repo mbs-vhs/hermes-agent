@@ -1,5 +1,6 @@
 """Tests for hermes_cli.tools_config platform tool persistence."""
 
+from copy import deepcopy
 import logging
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +43,28 @@ def test_agent_disabled_toolsets_suppresses_across_platforms():
 
     assert "memory" not in cli_enabled
     assert "memory" not in discord_enabled
+
+
+def test_messaging_is_not_a_configurable_toolset():
+    assert "messaging" not in {name for name, _, _ in CONFIGURABLE_TOOLSETS}
+
+
+@pytest.mark.parametrize("platform", ["cli", "cron", "telegram"])
+def test_stale_messaging_config_is_resolution_noop_and_not_rewritten(platform):
+    """v2026.7.30 parity: stale picker entries resolve no agent tools."""
+    from toolsets import resolve_multiple_toolsets
+
+    stale = {"platform_toolsets": {platform: ["web", "messaging"]}}
+    without_messaging = {"platform_toolsets": {platform: ["web"]}}
+    stale_before = deepcopy(stale)
+
+    stale_tools = set(resolve_multiple_toolsets(_get_platform_tools(stale, platform)))
+    clean_tools = set(
+        resolve_multiple_toolsets(_get_platform_tools(without_messaging, platform))
+    )
+
+    assert stale_tools == clean_tools
+    assert stale == stale_before
 
 
 def test_agent_disabled_toolsets_with_explicit_platform_config():

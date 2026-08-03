@@ -112,7 +112,6 @@ CONFIGURABLE_TOOLSETS = [
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
-    ("messaging",       "📨 Cross-Platform Messaging",  "send_message"),
     ("mail",            "📧 Mail Compose",              "draft an outbound email into Control (approve-before-send)"),
     ("workflow",        "🔧 Workflow Authoring",        "define/run/revise a durable clawd workflow from chat"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),

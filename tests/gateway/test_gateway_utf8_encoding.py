@@ -3,17 +3,22 @@ must pass an explicit ``encoding=`` keyword argument so non-UTF-8 locales don't
 corrupt file IPC.  Mirrors the AST-based guard pattern in
 ``tests/tools/test_windows_compat.py``.
 
-SCOPE IS THE WHOLE POINT — widen it rather than patch instances (CLAWD-3388).
-This defect class surfaced FOUR times across the v2026.7.30 merge. Three were
-inside ``gateway/``, so this guard caught them. The fourth was
-``hermes_cli/auth.py`` reading the fleet's SHARED Codex OAuth store with a bare
-``read_text()`` — a fork-local file (CLAWD-2378) added after upstream's own
-``hermes_cli`` encoding sweep, and therefore invisible to both. Independent
-review found it by hand; nothing mechanical could have.
+SCOPE IS THE WHOLE NON-TEST TREE. There is no dir allowlist and adding one back
+would be a regression — read this before "simplifying" the scan.
 
-Patching that one line would have left the next one equally unreachable, so
-``hermes_cli/`` is now guarded too. If you find a violation outside these dirs,
-ADD THE DIR — do not fix only the instance.
+This defect class surfaced FOUR times across the v2026.7.30 merge. Three were
+inside ``gateway/``, which an allowlist caught. The fourth was
+``hermes_cli/auth.py`` reading the fleet's SHARED Codex OAuth store with a bare
+``read_text()`` — fork-local (CLAWD-2378), added after upstream's own
+``hermes_cli`` encoding sweep, so invisible to upstream AND to the allowlist.
+Independent review found it by hand; nothing mechanical could have.
+
+Naming dirs is what made it unreachable. So the allowlist is gone: everything
+outside EXCLUDED_DIRS is scanned, and adding a package no longer requires
+remembering to add it here. Do NOT reintroduce a GUARDED_DIRS tuple — an earlier
+revision of this file had one built from ``rglob``, and because ``rglob`` on a
+missing directory yields nothing and raises nothing, renaming a package made the
+whole suite report clean having scanned ZERO files.
 """
 
 import ast
@@ -39,10 +44,20 @@ EXCLUDED_DIRS = frozenset({
 METHODS = {"read_text", "write_text"}
 SUPPRESSION = "# gateway-utf8: ok"
 
-# Floor, not a guess: 1,100 .py files were measured in scope. A run that finds
-# far fewer has lost its subject, and "found no violations" would then mean
-# "looked at almost nothing". See test_the_guard_actually_scanned_the_tree.
-MIN_EXPECTED_FILES = 900
+# The floor is RELATIVE to git's own file list, not an integer.
+#
+# It was `MIN_EXPECTED_FILES = 900` against 1093 measured — 193 files of slack.
+# Review measured what that actually caught: 12 of the 14 top-level packages
+# could be added to EXCLUDED_DIRS undetected, INCLUDING ``gateway/`` (89 files),
+# the package this guard is named for. Only hermes_cli and plugins were large
+# enough to trip it. And it rots OPEN: the tree grows on every upstream merge,
+# so the slack widens on its own.
+#
+# `git ls-files` minus EXCLUDED_DIRS was measured EXACTLY equal to the rglob
+# scope (1093 == 1093, zero divergence), so this is self-maintaining and catches
+# all 14. It also pins CI parity: a fresh checkout sees the same list, with no
+# untracked local padding.
+GIT_SCOPE_TOLERANCE = 8
 
 
 def _scoped_py_files():
@@ -107,9 +122,50 @@ def test_the_guard_actually_scanned_the_tree():
     same commit had just removed from a `git grep` three hunks earlier. Do not
     reintroduce it by replacing this with a bare rglob.
     """
+    import subprocess
+
+    # PIN THE POLICY SET ITSELF. This is the only assertion here that can catch
+    # EXCLUDED_DIRS growing, and getting it wrong is instructive: the first
+    # attempt compared _scoped_py_files() against `git ls-files` ALSO filtered by
+    # EXCLUDED_DIRS. Both sides moved together, so adding "gateway" to the set
+    # left it 2/2 green -- a tautology, and the same cannot-fail class this file
+    # exists to prevent. Caught by revert-validating it; it looked correct.
+    #
+    # Growing this set is now a deliberate, reviewable edit rather than a silent
+    # loss of coverage.
+    assert EXCLUDED_DIRS == frozenset({
+        ".git", ".venv", "venv", "node_modules", "__pycache__",
+        "hermes_agent.egg-info", "build", "dist", ".mypy_cache", ".pytest_cache",
+        "tests",
+    }), (
+        f"EXCLUDED_DIRS changed to {sorted(EXCLUDED_DIRS)}. Every name added "
+        f"here silently removes files from the encoding guard. If the addition "
+        f"is intended, update this assertion in the same commit and say why."
+    )
+
+    # And pin the SCAN against git's own list using only the STRUCTURAL
+    # exclusions -- never the policy set, or it becomes the tautology above.
+    STRUCTURAL = frozenset({".git", ".venv", "venv", "node_modules",
+                            "__pycache__", "hermes_agent.egg-info",
+                            "build", "dist", ".mypy_cache", ".pytest_cache"})
     found = len(_scoped_py_files())
-    assert found >= MIN_EXPECTED_FILES, (
-        f"the encoding guard scanned only {found} files (floor "
-        f"{MIN_EXPECTED_FILES}) -- it has lost its subject, so a clean result "
-        f"here means nothing. Did a package move, or did EXCLUDED_DIRS grow?"
+    out = subprocess.run(
+        ["git", "ls-files", "--", "*.py"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert out.returncode == 0, (
+        f"git ls-files could not run (rc={out.returncode}), so this assertion "
+        f"proves NOTHING: {out.stderr.strip()[:200]}"
+    )
+    tracked_non_test = [
+        f for f in out.stdout.split()
+        if not STRUCTURAL.intersection(pathlib.PurePosixPath(f).parts)
+        and not pathlib.PurePosixPath(f).parts[0] == "tests"
+    ]
+    assert tracked_non_test, "git ls-files returned no candidate .py files at all"
+    missing = len(tracked_non_test) - found
+    assert missing <= GIT_SCOPE_TOLERANCE, (
+        f"the encoding guard scanned {found} files but git tracks "
+        f"{len(tracked_non_test)} non-test .py files -- {missing} are NOT being "
+        f"examined, so a clean result here means nothing."
     )

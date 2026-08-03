@@ -167,6 +167,7 @@ async def _drive_picker(runner, event):
             "default": "old-model",
             "provider": "custom",
             "base_url": "https://api.custom.example/v1",
+            "context_length": 1_048_576,
             "api_key": "sk-stale",
             "api_mode": "anthropic_messages",
         },

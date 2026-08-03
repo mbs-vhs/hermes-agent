@@ -24,3 +24,13 @@ paths = ['''(^|/)website/docs/''']
 [[allowlists]]
 description = "GitHub Copilot PUBLIC OAuth client id (Iv1.b507a08c87ecfe98) — a public identifier shipped in the Copilot CLI, not a secret. hermes_cli/copilot_auth.py."
 regexes = ['''Iv1\.b507a08c87ecfe98''']
+
+# --- CLAWD-3388 Phase 2 (v2026.7.30 merge) ---
+[[allowlists]]
+description = """Vendored SQLite amalgamation headers under native/fts5_cjk/vendor/ — third-party C \
+arriving verbatim from upstream cc4cab2f. The generic-api-key heuristic matches C preprocessor macros \
+of the form `#define sqlite3_soft_heap_limit64 sqlite3_api->soft_heap_limit64` — the token after `->` \
+scores as high-entropy. Verified 2026-08-03: all 3 findings (sqlite3ext.h:418,574,666) are #define \
+lines mapping public SQLite C API names onto a struct member. No credential material. Scoped to the \
+vendored subtree ONLY, not to native/ as a whole, so fork-authored native code stays scanned."""
+paths = ['''(^|/)native/[^/]+/vendor/''']

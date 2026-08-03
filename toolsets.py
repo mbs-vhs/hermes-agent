@@ -65,8 +65,6 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
-    # Cross-platform messaging (gated on gateway running via check_fn)
-    "send_message",
     # Mail compose — draft a new outbound email into Control (gated on the clawd
     # mail tokens via check_fn; approve-before-send, the agent never sends). CLAWD-1527.
     "mail_compose",

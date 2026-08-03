@@ -1,0 +1,12 @@
+[Unit]
+Description=Regularly audit the pinned Hermes fleet runtime
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=ai.hermes.opt-runtime-audit.service
+
+[Install]
+WantedBy=timers.target

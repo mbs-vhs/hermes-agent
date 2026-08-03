@@ -7,7 +7,7 @@ state in initialize() (Hindsight, and any plugin that stores session_id
 for scoped writes) keep writing into the old session's record.
 """
 
-
+import inspect
 import pytest
 
 from agent.memory_manager import MemoryManager
@@ -37,7 +37,7 @@ class _RecordingProvider(MemoryProvider):
     def get_tool_schemas(self):
         return []
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", conversation_id=""):
+    def sync_turn(self, user_content, assistant_content, *, session_id=""):
         self.sync_calls.append(
             {"user": user_content, "asst": assistant_content, "session_id": session_id}
         )
@@ -61,6 +61,11 @@ class _RecordingProvider(MemoryProvider):
                 "extra": kwargs,
             }
         )
+
+
+@pytest.mark.parametrize("sync_turn", [_RecordingProvider.sync_turn], ids=["session-switch-fake"])
+def test_recording_provider_sync_turn_omits_conversation_id(sync_turn):
+    assert "conversation_id" not in inspect.signature(sync_turn).parameters
 
 
 # ---------------------------------------------------------------------------

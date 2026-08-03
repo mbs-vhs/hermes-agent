@@ -1,5 +1,6 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
+import inspect
 import json
 import pytest
 from types import SimpleNamespace
@@ -7,6 +8,13 @@ from unittest.mock import MagicMock
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager, inject_memory_provider_tools
+from plugins.memory.byterover import ByteRoverMemoryProvider
+from plugins.memory.hindsight import HindsightMemoryProvider
+from plugins.memory.holographic import HolographicMemoryProvider
+from plugins.memory.honcho import HonchoMemoryProvider
+from plugins.memory.mem0 import Mem0MemoryProvider
+from plugins.memory.retaindb import RetainDBMemoryProvider
+from plugins.memory.supermemory import SupermemoryMemoryProvider
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -53,7 +61,7 @@ class FakeMemoryProvider(MemoryProvider):
     def queue_prefetch(self, query, *, session_id=""):
         self.queued_prefetches.append(query)
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", conversation_id=""):
+    def sync_turn(self, user_content, assistant_content, *, session_id=""):
         self.synced_turns.append((user_content, assistant_content))
 
     def get_tool_schemas(self):
@@ -90,6 +98,26 @@ class MessagesMemoryProvider(FakeMemoryProvider):
 
     def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "sync_turn"),
+    [
+        ("byterover", ByteRoverMemoryProvider.sync_turn),
+        ("hindsight", HindsightMemoryProvider.sync_turn),
+        ("holographic", HolographicMemoryProvider.sync_turn),
+        ("honcho", HonchoMemoryProvider.sync_turn),
+        ("mem0", Mem0MemoryProvider.sync_turn),
+        ("retaindb", RetainDBMemoryProvider.sync_turn),
+        ("supermemory", SupermemoryMemoryProvider.sync_turn),
+        ("fake", FakeMemoryProvider.sync_turn),
+    ],
+)
+def test_legacy_sync_turn_signatures_omit_conversation_id(provider_name, sync_turn):
+    parameters = inspect.signature(sync_turn).parameters
+    assert "conversation_id" not in parameters, (
+        f"{provider_name}.sync_turn must not restore the unused per-turn identity kwarg"
+    )
 
 
 # ---------------------------------------------------------------------------

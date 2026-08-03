@@ -217,8 +217,8 @@ class TestOnMemoryWriteFansConversationId:
 # ---------------------------------------------------------------------------
 # 4. Convergence sanity — an explicit-write turn and an auto-capture (sync_turn)
 #    turn for the SAME (person, agent) carry the SAME conversation_id.
-#    Pure HAF-side: build_memory_write_metadata (explicit write) and the value
-#    sync_all forwards to sync_turn both source the same agent attribute.
+#    Pure HAF-side: build_memory_write_metadata (explicit write) and provider
+#    initialize/self-source both use the same agent attribute.
 # ---------------------------------------------------------------------------
 
 

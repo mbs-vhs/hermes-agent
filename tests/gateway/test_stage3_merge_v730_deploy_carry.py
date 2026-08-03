@@ -341,15 +341,41 @@ class TestMemoryProviderModuleRename:
         assert callable(getattr(pm, "load_memory_provider", None))
 
     def test_nothing_in_tree_still_imports_the_removed_module(self):
-        """The orphan is only harmless while nothing references it."""
+        """The orphan is only harmless while nothing references it.
+
+        TWO TRAPS, both of which this test previously fell into. Independent
+        review caught them; the notes stay so a future edit cannot reintroduce
+        either one.
+
+        1. `git grep` searches TRACKED files, so the moment this file is
+           committed it matches its OWN argv and the test fails. It passed only
+           while it sat untracked in a scratch worktree — the "38 passed" in the
+           commit that added it was measured against an artifact that is not the
+           one being shipped. Hence the `:(exclude)` pathspec below, and hence:
+           REVERT-VALIDATE THIS FILE IN ITS TRACKED STATE, never untracked.
+
+        2. `returncode` was unchecked. `git grep` exits 1 for "no matches" but
+           128 when cwd is not a git repo — and this test's whole subject is the
+           /opt/hermes-agent deploy tree, which HAS NO .git. There, it returned
+           empty stdout and passed vacuously while a real reference sat in the
+           tree. A search that cannot run must fail loudly, not report clean.
+        """
         import subprocess
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[2]
+        rel = Path(__file__).resolve().relative_to(root).as_posix()
         out = subprocess.run(
             ["git", "grep", "-l", "-e", "hermes_cli.memory_providers",
-             "-e", "from hermes_cli import memory_providers", "--", "*.py"],
+             "-e", "from hermes_cli import memory_providers",
+             "--", "*.py", f":(exclude){rel}"],
             cwd=root, capture_output=True, text=True,
+        )
+        # 0 = matches found, 1 = none. Anything else means the search did not
+        # happen (128 = not a git repo) and the empty stdout below is meaningless.
+        assert out.returncode in (0, 1), (
+            f"git grep could not run (rc={out.returncode}) from {root} — this "
+            f"assertion proves NOTHING here: {out.stderr.strip()[:200]}"
         )
         assert out.stdout.strip() == "", (
             "hermes_cli.memory_providers is still referenced: "

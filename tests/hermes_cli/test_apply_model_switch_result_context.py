@@ -147,8 +147,13 @@ def test_global_switch_refuses_to_persist_under_adr072(monkeypatch):
         lambda key, value: writes.append((key, value)),
     )
     cli = _StubCLI()
-    cli.model = "shared-model"
-    cli.provider = "custom"
+    # PRE-STATE MUST DIFFER FROM THE EXPECTED POST-STATE. Review caught this:
+    # both were "shared-model"/"custom", so the swap assertion below held even
+    # when _apply_model_switch_result was replaced by `pass` — proven by
+    # mutation (3 passed). An assertion whose expected value equals the starting
+    # value measures nothing.
+    cli.model = "old-model"
+    cli.provider = "old-provider"
     # Runtime may already diverge from persisted config through a session override.
     cli.base_url = "https://small.example/v1"
     result = ModelSwitchResult(
@@ -184,10 +189,17 @@ def test_global_switch_refuses_to_persist_under_adr072(monkeypatch):
     ):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
+    # SCOPE OF THIS ASSERTION, stated because the commit that added it
+    # overstated it: this intercepts `cli_mod.save_config_value` ONLY. Review
+    # demonstrated a persist through `hermes_cli.config.save_config` that this
+    # does not see. It measures "does not call cli.save_config_value", which is
+    # the path ADR-072 neutralized — not "writes nothing anywhere".
     assert writes == [], f"ADR-072: --global must persist nothing, got {writes!r}"
     assert any("ADR-072" in line for line in printed), (
         f"the refusal must SAY why it refused, got: {printed!r}"
     )
-    # The in-session swap still has to happen — a refusal that also declined to
-    # switch would satisfy the two assertions above while breaking /model.
-    assert cli.model == "shared-model" and cli.provider == "custom"
+    # The in-session swap still has to happen — a refusal that ALSO declined to
+    # switch would satisfy both assertions above while breaking /model. This can
+    # only catch that because the pre-state above differs from these values.
+    assert cli.model == "shared-model", f"in-session model swap did not happen: {cli.model!r}"
+    assert cli.provider == "custom", f"in-session provider swap did not happen: {cli.provider!r}"

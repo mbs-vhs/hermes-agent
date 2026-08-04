@@ -894,10 +894,28 @@ def test_unreadable_path_makes_fingerprint_unmeasured(
 
 
 def test_updater_has_no_gateway_restart_and_constructs_only_clean_fd():
-    source = inspect.getsource(updater._apply)
-    assert "systemctl" not in source
-    assert '"clean", "-fd"' in source
+    """Scope is the WHOLE MODULE, not just `_apply`.
+
+    This previously grepped `inspect.getsource(updater._apply)`, which made a
+    `systemctl` call in `_recover`, `_init` or `main` invisible — and independent
+    review demonstrated exactly that by adding a restart to `_recover` while this
+    stayed green. It also could not see the clean in `_restore_steady_transaction`.
+    A signature check narrowed to one function is not evidence about a module.
+    """
+    source = inspect.getsource(updater)
+    assert "systemctl" not in source, (
+        "a gateway restart appeared somewhere in the module; source advance and "
+        "restart are deliberately separate operator-visible phases"
+    )
     assert '"clean", "-fdx"' not in source
+    # Every mutating clean must go through the one helper that spares the venv.
+    assert source.count('"clean", "-fd"') == 1, (
+        "a bare `clean -fd` was constructed outside `_clean_runtime`. Every mutating "
+        "clean must route through that helper, which excludes the live venv; a clean "
+        "that skips it deletes the interpreter all 11 gateways run whenever the "
+        "target commit stops ignoring venv/."
+    )
+    assert 'def _clean_runtime(' in source
 
 
 def test_systemd_templates_keep_mutation_manual_and_timer_audit_only():

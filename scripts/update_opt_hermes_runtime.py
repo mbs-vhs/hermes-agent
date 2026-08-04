@@ -53,6 +53,11 @@ DEFAULT_TARGET_FILE = Path("/etc/hermes-agent/runtime-target")
 DEFAULT_LOCK_FILE = Path("/run/lock/hermes-opt-runtime-update.lock")
 DEFAULT_RECEIPT_DIR = Path("/var/lib/hermes-agent/runtime-receipts")
 DEFAULT_TRANSACTION_DIR = Path("/var/lib/hermes-agent/runtime-transactions")
+# The live virtualenv is runtime state this tool must NEVER remove, independent of
+# git's opinion about it. Anchored with a leading slash so it matches only the
+# runtime root, not a nested vendor directory.
+VENV_EXCLUDE = "/venv"
+
 EXACT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 BACKUP_MAX_AGE = dt.timedelta(hours=24)
@@ -432,7 +437,7 @@ def _tree_fingerprint(runtime: Path) -> dict[str, Any]:
 
 
 def _clean_preview(runtime: Path) -> list[str]:
-    proc = _git(runtime, "clean", "-nd")
+    proc = _git(runtime, "clean", "-nd", "-e", VENV_EXCLUDE)
     return proc.stdout.splitlines()
 
 
@@ -898,12 +903,31 @@ def _restore_previous_ref(runtime: Path, payload: dict[str, Any]) -> None:
         raise UpdateError("transaction previous_ref is invalid")
 
 
+
+def _clean_runtime(runtime: Path) -> None:
+    """Sweep untracked files, ALWAYS sparing the live virtualenv.
+
+    Every mutating clean in this module goes through here. It exists because the
+    venv exclusion was previously spelled out at each call site, which meant a test
+    could only re-implement the invariant instead of exercising it — and a
+    re-implementation passes even when the production line has lost the exclusion.
+
+    The exclusion is load-bearing: callers run this AFTER `git reset --hard <target>`
+    has replaced .gitignore with the target commit's copy. If that commit stopped
+    listing venv/, the live interpreter for all 11 gateways is untracked-and-not-
+    ignored and a bare `clean -fd` deletes it. Git cannot restore it; it was never
+    tracked.
+    """
+    _git(runtime, "clean", "-fd", "-e", VENV_EXCLUDE)
+
 def _restore_steady_transaction(runtime: Path, payload: dict[str, Any]) -> None:
     before_head = str(payload.get("before_head", ""))
     if not EXACT_SHA_RE.fullmatch(before_head):
         raise UpdateError("transaction before_head is invalid")
     _git(runtime, "reset", "--hard", "-q", before_head)
-    _git(runtime, "clean", "-fd")
+    # Same hazard on the recovery path: before_head's .gitignore may differ from the
+    # tree's current one, and this clean runs while the fleet is already degraded.
+    _clean_runtime(runtime)
     _restore_previous_ref(runtime, payload)
     if _tree_fingerprint(runtime) != payload.get("before_tree"):
         raise UpdateError(
@@ -991,6 +1015,32 @@ def _handle_failed_transaction(
 
 def _recover(args: argparse.Namespace) -> int:
     _runtime_safety(args.runtime, require_git=True)
+    if getattr(args, "dry_run", False):
+        # `recover` is the verb an operator reaches for MID-INCIDENT, on a live tree,
+        # and --dry-run is what a careful one types first. It previously fell straight
+        # through to a real reset --hard + clean -fd, rolled the runtime back
+        # unannounced, and CONSUMED the transaction — reporting success. Every other
+        # mutating verb honoured --dry-run; this one did not, and it is the one where
+        # being wrong costs the most.
+        pending_preview = _incomplete_transactions(args.transaction_dir)
+        if args.transaction_id is not None:
+            pending_preview = [
+                item for item in pending_preview
+                if item[1].get("transaction_id") == args.transaction_id
+            ]
+        print(
+            _canonical_json({
+                "action": "recover",
+                "dry_run": True,
+                "state": "preview",
+                "runtime": str(args.runtime),
+                "would_recover": [
+                    item[1].get("transaction_id") for item in pending_preview
+                ],
+                "restart_performed": False,
+            })
+        )
+        return 0
     pending = _incomplete_transactions(args.transaction_dir)
     if args.transaction_id is not None:
         pending = [
@@ -1227,7 +1277,14 @@ def _apply(
         transaction["state"] = "cleaning"
         _persist_transaction(transaction_path, transaction)
         # Fixed, intentional command: preserves ignored venv. Never add -x.
-        _git(runtime, "clean", "-fd")
+        # -e /venv is LOAD-BEARING, not defensive. The venv guard above ran against
+        # the .gitignore that `reset --hard` on the previous line has just REPLACED
+        # with the target commit's. If the target stops listing venv/ — an ordinary
+        # tidy-up commit — the live interpreter for all 11 gateways becomes
+        # untracked-and-not-ignored and this clean deletes it. No -x required, and
+        # git cannot restore it because it was never tracked. Excluding it here makes
+        # the invariant independent of what any target commit happens to ignore.
+        _clean_runtime(runtime)
         transaction["state"] = "clean_done"
         _persist_transaction(transaction_path, transaction)
         _maybe_inject_failure(args, "clean")

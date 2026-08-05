@@ -492,8 +492,49 @@ def _build_audit(runtime: Path, target: str) -> dict[str, Any]:
     }
 
 
-def _provenance_is_exact(report: dict[str, Any]) -> bool:
-    counts = report["counts"]
+def _git_ignored(runtime: Path, paths: list[str]) -> set[str]:
+    """Which of `paths` git actually ignores in `runtime`.
+
+    Uses check-ignore's batch stdin form so one process settles the whole list.
+    A non-zero exit just means "none matched" and is not an error here.
+    """
+    if not paths:
+        return set()
+    proc = subprocess.run(
+        ["git", "-C", str(runtime), "check-ignore", "--stdin"],
+        input="\n".join(paths),
+        capture_output=True,
+        text=True,
+    )
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _provenance_is_exact(report: dict[str, Any], runtime: Path | None = None) -> bool:
+    """Readiness against what `clean -fd` can ACTUALLY remove.
+
+    The provenance walk is deliberately gitignore-BLIND — that is correct for a
+    census, and `opt_provenance_report.py` stays that way. But readiness was ANDing
+    that blind count with a gitignore-AWARE clean check, so any path git ignores and
+    the walk does not exclude became permanently un-clearable: `clean -fd` will never
+    touch it and `-x` is banned outright because it would delete the venv.
+
+    That is not hypothetical. The fork's .gitignore covers `logs/`, `data/`, `.env` —
+    files the gateway writes AT LAUNCH. So the first gateway start after a successful
+    conversion would jam every later `apply`, and `rollback` (which shares this
+    preflight) would refuse in exactly the incident it exists for. The tool would have
+    solved "a merged fix cannot reach the fleet" approximately once.
+
+    Ignored orphans are therefore excluded from the readiness verdict — but only for
+    `only_in_tree`. An IMPORTABLE orphan still fails even when ignored: a stray module
+    on the import path can shadow real code, and one the tool cannot remove is a
+    finding an operator must see rather than a state it may proceed from.
+    """
+    counts = dict(report["counts"])
+    if runtime is not None:
+        stray = [str(x) for x in report.get("only_in_tree", [])]
+        ignored = _git_ignored(runtime, stray)
+        if ignored:
+            counts["only_in_tree"] = len([x for x in stray if x not in ignored])
     return all(
         counts[name] == 0
         for name in (
@@ -513,7 +554,7 @@ def _ready(audit: dict[str, Any]) -> bool:
         and not audit["clean_preview"]
         and not audit.get("incomplete_transactions", [])
         and audit.get("bootstrap_closure_valid", True) is True
-        and _provenance_is_exact(audit["provenance"])
+        and _provenance_is_exact(audit["provenance"], Path(audit["runtime"]))
     )
 
 

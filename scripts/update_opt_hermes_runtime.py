@@ -536,9 +536,28 @@ def _dependency_skew(runtime: Path, target: str) -> list[str]:
         "        out.append(name+': target requires '+str(spec)+', venv has '+have)\n"
         "print(json.dumps(out))\n"
     )
+    # -B AND the env var, and a sanitized environment. Without them this probe
+    # imports `packaging` inside runtime/venv and CPython writes
+    # site-packages/packaging/__pycache__/*.pyc INTO the very tree _venv_guard
+    # fingerprints. `venv_before` is captured before this call and compared after
+    # the advance, so the write makes a SUCCESSFUL apply abort with "live venv
+    # changed during source advance" — and auto-recovery then fails too, because its
+    # before_tree was also captured pre-probe. Net: a functionally intact runtime is
+    # left at recovery_required with the fleet already on new source.
+    #
+    # opt_provenance_report.py next door already does exactly this and says why. Its
+    # protection has been the accident that /opt was read-only; the shipped unit puts
+    # /opt/hermes-agent in ReadWritePaths, so that accident is gone. The suite could
+    # not see it because run_tests.sh exports PYTHONDONTWRITEBYTECODE for everything.
+    probe_env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/var/empty",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
     proc = subprocess.run(
-        [str(python), "-c", probe, json.dumps(requirements)],
-        capture_output=True, text=True,
+        [str(python), "-B", "-c", probe, json.dumps(requirements)],
+        capture_output=True, text=True, env=probe_env,
     )
     if proc.returncode != 0:
         return []

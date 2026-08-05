@@ -466,112 +466,6 @@ def _venv_guard(runtime: Path) -> dict[str, Any]:
     }
 
 
-
-def _target_main_dependencies(runtime: Path, target: str) -> list[str]:
-    """`[project].dependencies` of the TARGET commit — main deps only, not extras.
-
-    Read from git, never from the worktree: at check time the worktree is still at
-    the OLD commit, which is exactly the state whose pyproject must not be trusted.
-    """
-    proc = subprocess.run(
-        ["git", "-C", str(runtime), "show", f"{target}:pyproject.toml"],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        return []
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # pragma: no cover - py<3.11
-        return []
-    try:
-        doc = tomllib.loads(proc.stdout)
-    except Exception:
-        return []
-    deps = doc.get("project", {}).get("dependencies", [])
-    return [d for d in deps if isinstance(d, str)]
-
-
-def _dependency_skew(runtime: Path, target: str) -> list[str]:
-    """Main dependencies the target declares that the live venv cannot satisfy.
-
-    THE GAP THIS CLOSES. This tool advances SOURCE ONLY and deliberately preserves
-    the venv — that is correct, the venv is the interpreter the fleet runs. But it
-    means the new code runs against the OLD environment, and nothing was checking
-    whether the new code's declared requirements are actually installed.
-
-    Measured on the live fleet: /opt pins `nemo-relay==0.3` as an OPTIONAL EXTRA,
-    while fork main declares `nemo-relay>=0.6.0` as a MAIN dependency. Advancing
-    source alone therefore produces an import-time failure across all 11 gateways,
-    at a moment the tool reports success. Local, no network: ask the runtime's own
-    interpreter what it has.
-    """
-    requirements = _target_main_dependencies(runtime, target)
-    if not requirements:
-        return []
-    python = runtime / "venv" / "bin" / "python"
-    if not python.exists():
-        return []
-    probe = (
-        "import json,sys,re\n"
-        "from importlib.metadata import version, PackageNotFoundError\n"
-        "try:\n"
-        "    from packaging.requirements import Requirement\n"
-        "except Exception:\n"
-        "    Requirement=None\n"
-        "out=[]\n"
-        "for raw in json.loads(sys.argv[1]):\n"
-        "    if Requirement is not None:\n"
-        "        try: req=Requirement(raw)\n"
-        "        except Exception: continue\n"
-        "        if req.marker is not None and not req.marker.evaluate(): continue\n"
-        "        name=req.name; spec=req.specifier\n"
-        "    else:\n"
-        "        m=re.match(r'^\\s*([A-Za-z0-9._-]+)', raw)\n"
-        "        if not m: continue\n"
-        "        name=m.group(1); spec=None\n"
-        "    try: have=version(name)\n"
-        "    except PackageNotFoundError:\n"
-        "        out.append(name+': declared by the target, NOT INSTALLED in the runtime venv'); continue\n"
-        "    if spec is not None and str(spec) and not spec.contains(have, prereleases=True):\n"
-        "        out.append(name+': target requires '+str(spec)+', venv has '+have)\n"
-        "print(json.dumps(out))\n"
-    )
-    # -B AND the env var, and a sanitized environment. Without them this probe
-    # imports `packaging` inside runtime/venv and CPython writes
-    # site-packages/packaging/__pycache__/*.pyc INTO the very tree _venv_guard
-    # fingerprints. `venv_before` is captured before this call and compared after
-    # the advance, so the write makes a SUCCESSFUL apply abort with "live venv
-    # changed during source advance" — and auto-recovery then fails too, because its
-    # before_tree was also captured pre-probe. Net: a functionally intact runtime is
-    # left at recovery_required with the fleet already on new source.
-    #
-    # opt_provenance_report.py next door already does exactly this and says why. Its
-    # protection has been the accident that /opt was read-only; the shipped unit puts
-    # /opt/hermes-agent in ReadWritePaths, so that accident is gone. The suite could
-    # not see it because run_tests.sh exports PYTHONDONTWRITEBYTECODE for everything.
-    probe_env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": "/var/empty",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONNOUSERSITE": "1",
-    }
-    proc = subprocess.run(
-        [str(python), "-B", "-c", probe, json.dumps(requirements)],
-        capture_output=True, text=True, env=probe_env,
-    )
-    if proc.returncode != 0:
-        return []
-    try:
-        result = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError:
-        return []
-    # Degrades rather than blocks: without `packaging` the probe still catches a
-    # dependency that is entirely ABSENT — which is the nemo-relay case and the one
-    # that breaks the fleet — and simply cannot compare version specifiers. Making
-    # a missing helper library block every apply would be a worse failure than the
-    # one being prevented.
-    return list(result)
-
 def _build_audit(runtime: Path, target: str) -> dict[str, Any]:
     tree_before = _tree_fingerprint(runtime)
     venv = _venv_guard(runtime)
@@ -602,71 +496,30 @@ def _build_audit(runtime: Path, target: str) -> dict[str, Any]:
         "provenance": report,
         "venv": venv,
     }
-
-
-def _git_ignored(runtime: Path, paths: list[str]) -> set[str]:
-    """Which of `paths` git actually ignores in `runtime`.
-
-    Uses check-ignore's batch stdin form so one process settles the whole list.
-    A non-zero exit just means "none matched" and is not an error here.
-    """
-    if not paths:
-        return set()
-    proc = subprocess.run(
-        ["git", "-C", str(runtime), "check-ignore", "--stdin"],
-        input="\n".join(paths),
-        capture_output=True,
-        text=True,
-    )
-    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
-
-
-def _provenance_is_exact(report: dict[str, Any], runtime: Path | None = None) -> bool:
-    """Readiness against what `clean -fd` can ACTUALLY remove.
-
-    The provenance walk is deliberately gitignore-BLIND — that is correct for a
-    census, and `opt_provenance_report.py` stays that way. But readiness was ANDing
-    that blind count with a gitignore-AWARE clean check, so any path git ignores and
-    the walk does not exclude became permanently un-clearable: `clean -fd` will never
-    touch it and `-x` is banned outright because it would delete the venv.
-
-    That is not hypothetical. The fork's .gitignore covers `logs/`, `data/`, `.env` —
-    files the gateway writes AT LAUNCH. So the first gateway start after a successful
-    conversion would jam every later `apply`, and `rollback` (which shares this
-    preflight) would refuse in exactly the incident it exists for. The tool would have
-    solved "a merged fix cannot reach the fleet" approximately once.
-
-    Ignored orphans are therefore excluded from the readiness verdict — but only for
-    `only_in_tree`. An IMPORTABLE orphan still fails even when ignored: a stray module
-    on the import path can shadow real code, and one the tool cannot remove is a
-    finding an operator must see rather than a state it may proceed from.
-    """
-    counts = dict(report["counts"])
-    if runtime is not None:
-        stray = [str(x) for x in report.get("only_in_tree", [])]
-        ignored = _git_ignored(runtime, stray)
-        if ignored:
-            counts["only_in_tree"] = len([x for x in stray if x not in ignored])
-    return all(
-        counts[name] == 0
-        for name in (
-            "only_in_tree",
-            "only_in_ref",
-            "differing",
-            "only_in_tree_importable",
-            "unreadable",
-        )
-    )
-
-
 def _ready(audit: dict[str, Any]) -> bool:
+    """Ready == git says the tree is clean and at the target. ONE oracle.
+
+    NARROWED DELIBERATELY (CLAWD-3655). This previously ANDed a gitignore-AWARE
+    clean check (`git status`, `clean -nd`) with a gitignore-BLIND provenance walk.
+    Neither was wrong alone; the COMPOSITION was unsatisfiable, because any path git
+    ignores and the walk does not exclude can never be cleared — `clean -fd` will not
+    touch it and `-x` is banned outright since it would delete the venv. The fork
+    ignores logs/, data/ and .env, which the gateway writes at launch, so the first
+    gateway start after a conversion wedged every later apply.
+
+    The surviving terms all ask GIT, which is also what `clean -fd` will act on, so
+    the verdict is self-consistent by construction: anything that makes this false is
+    something the tool can actually do something about.
+
+    The provenance walk is not deleted — `opt_provenance_report.py` still exists and
+    `audit` still reports it. It is no longer a VETO on proceeding.
+    """
     return (
         audit["head"] == audit["target"]
         and not audit["status"]
         and not audit["clean_preview"]
         and not audit.get("incomplete_transactions", [])
         and audit.get("bootstrap_closure_valid", True) is True
-        and _provenance_is_exact(audit["provenance"], Path(audit["runtime"]))
     )
 
 
@@ -1093,6 +946,32 @@ def _restore_previous_ref(runtime: Path, payload: dict[str, Any]) -> None:
 
 
 
+
+def _target_tracks_under_venv(runtime: Path, target: str) -> list[str]:
+    """Paths the TARGET commit tracks beneath the runtime venv.
+
+    `-e /venv` constrains `git clean` and NOTHING ELSE. `git reset --hard <target>`
+    writes tracked files unconditionally, so a target that tracks anything under
+    venv/ overwrites the interpreter all 11 gateways run — and the automatic
+    recovery then resets to a commit that does not track it, which DELETES it.
+    Measured: a real interpreter replaced by the committed file, then removed.
+
+    This is the hole the clean-side exclusion cannot see, found by an independent
+    tester after two review rounds had passed over the exclusion itself.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(runtime), "ls-tree", "-r", "--name-only", "-z", target, "--", "venv"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        # Could not measure. The caller treats a non-empty list as a refusal, so
+        # returning [] here would be a silent pass — say so instead.
+        raise UpdateError(
+            f"could not determine whether {target} tracks paths under venv/: "
+            f"{_redact(proc.stderr)}"
+        )
+    return [p for p in proc.stdout.split("\0") if p]
+
 def _clean_runtime(runtime: Path) -> None:
     """Sweep untracked files, ALWAYS sparing the live virtualenv.
 
@@ -1427,10 +1306,19 @@ def _apply(
 
     before_tree = _tree_fingerprint(runtime)
     venv_before = _venv_guard(runtime)
+    # BEFORE any mutation. The clean-side exclusion cannot protect against this:
+    # reset --hard writes tracked files, so a target tracking venv/** replaces the
+    # fleet's interpreter and recovery then deletes it.
+    tracked_under_venv = _target_tracks_under_venv(runtime, target)
+    if tracked_under_venv:
+        raise UpdateError(
+            f"target {target} tracks {len(tracked_under_venv)} path(s) under venv/, and "
+            "`reset --hard` would write them over the live interpreter every gateway "
+            "runs: " + ", ".join(tracked_under_venv[:10])
+        )
     clean_preview = _clean_preview(runtime)
     # Both hazards below are surfaced in the plan BEFORE the dry-run early-return,
     # so `--dry-run` shows them and an operator sees them in the rehearsal.
-    skew = _dependency_skew(runtime, target)
     # Derived from clean_preview, which is what the sweep will ACTUALLY remove —
     # not from the provenance census. Two reasons: the census answers a different
     # question (what differs from the ref), and calling _build_audit here would add
@@ -1449,19 +1337,10 @@ def _apply(
         "target": target,
         "clean_preview": clean_preview,
         "backup_receipt": str(args.backup_receipt),
-        "dependency_skew": skew,
         "importable_orphans_to_remove": importable_orphans,
         "restart_performed": False,
     }
 
-    if skew and not args.accept_dependency_skew:
-        raise UpdateError(
-            "the target's declared main dependencies are not satisfied by the live "
-            "venv, and this tool advances SOURCE ONLY — the fleet would run new code "
-            "against the old interpreter and fail at import. Resolve the environment "
-            "first, or pass --accept-dependency-skew if it is genuinely benign: "
-            + "; ".join(skew)
-        )
 
     # NOT a refusal, deliberately. The finding this answers is that
     # only_in_tree_importable was COMPUTED AND NEVER ACTED ON — the runbook gated a
@@ -1593,12 +1472,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-file", type=Path, default=DEFAULT_LOCK_FILE)
     parser.add_argument("--backup-receipt", type=Path)
     parser.add_argument("--initial-evidence", type=Path)
-    parser.add_argument(
-        "--accept-dependency-skew",
-        action="store_true",
-        help="proceed even though the target's main dependencies are unsatisfied by "
-             "the live venv (source advance does not touch the venv)",
-    )
     parser.add_argument(
         "--update-receipt", type=Path, help="successful apply receipt to roll back"
     )

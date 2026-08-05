@@ -466,6 +466,93 @@ def _venv_guard(runtime: Path) -> dict[str, Any]:
     }
 
 
+
+def _target_main_dependencies(runtime: Path, target: str) -> list[str]:
+    """`[project].dependencies` of the TARGET commit — main deps only, not extras.
+
+    Read from git, never from the worktree: at check time the worktree is still at
+    the OLD commit, which is exactly the state whose pyproject must not be trusted.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(runtime), "show", f"{target}:pyproject.toml"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - py<3.11
+        return []
+    try:
+        doc = tomllib.loads(proc.stdout)
+    except Exception:
+        return []
+    deps = doc.get("project", {}).get("dependencies", [])
+    return [d for d in deps if isinstance(d, str)]
+
+
+def _dependency_skew(runtime: Path, target: str) -> list[str]:
+    """Main dependencies the target declares that the live venv cannot satisfy.
+
+    THE GAP THIS CLOSES. This tool advances SOURCE ONLY and deliberately preserves
+    the venv — that is correct, the venv is the interpreter the fleet runs. But it
+    means the new code runs against the OLD environment, and nothing was checking
+    whether the new code's declared requirements are actually installed.
+
+    Measured on the live fleet: /opt pins `nemo-relay==0.3` as an OPTIONAL EXTRA,
+    while fork main declares `nemo-relay>=0.6.0` as a MAIN dependency. Advancing
+    source alone therefore produces an import-time failure across all 11 gateways,
+    at a moment the tool reports success. Local, no network: ask the runtime's own
+    interpreter what it has.
+    """
+    requirements = _target_main_dependencies(runtime, target)
+    if not requirements:
+        return []
+    python = runtime / "venv" / "bin" / "python"
+    if not python.exists():
+        return []
+    probe = (
+        "import json,sys,re\n"
+        "from importlib.metadata import version, PackageNotFoundError\n"
+        "try:\n"
+        "    from packaging.requirements import Requirement\n"
+        "except Exception:\n"
+        "    Requirement=None\n"
+        "out=[]\n"
+        "for raw in json.loads(sys.argv[1]):\n"
+        "    if Requirement is not None:\n"
+        "        try: req=Requirement(raw)\n"
+        "        except Exception: continue\n"
+        "        if req.marker is not None and not req.marker.evaluate(): continue\n"
+        "        name=req.name; spec=req.specifier\n"
+        "    else:\n"
+        "        m=re.match(r'^\\s*([A-Za-z0-9._-]+)', raw)\n"
+        "        if not m: continue\n"
+        "        name=m.group(1); spec=None\n"
+        "    try: have=version(name)\n"
+        "    except PackageNotFoundError:\n"
+        "        out.append(name+': declared by the target, NOT INSTALLED in the runtime venv'); continue\n"
+        "    if spec is not None and str(spec) and not spec.contains(have, prereleases=True):\n"
+        "        out.append(name+': target requires '+str(spec)+', venv has '+have)\n"
+        "print(json.dumps(out))\n"
+    )
+    proc = subprocess.run(
+        [str(python), "-c", probe, json.dumps(requirements)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        result = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    # Degrades rather than blocks: without `packaging` the probe still catches a
+    # dependency that is entirely ABSENT — which is the nemo-relay case and the one
+    # that breaks the fleet — and simply cannot compare version specifiers. Making
+    # a missing helper library block every apply would be a worse failure than the
+    # one being prevented.
+    return list(result)
+
 def _build_audit(runtime: Path, target: str) -> dict[str, Any]:
     tree_before = _tree_fingerprint(runtime)
     venv = _venv_guard(runtime)
@@ -1322,6 +1409,20 @@ def _apply(
     before_tree = _tree_fingerprint(runtime)
     venv_before = _venv_guard(runtime)
     clean_preview = _clean_preview(runtime)
+    # Both hazards below are surfaced in the plan BEFORE the dry-run early-return,
+    # so `--dry-run` shows them and an operator sees them in the rehearsal.
+    skew = _dependency_skew(runtime, target)
+    # Derived from clean_preview, which is what the sweep will ACTUALLY remove —
+    # not from the provenance census. Two reasons: the census answers a different
+    # question (what differs from the ref), and calling _build_audit here would add
+    # a NINTH full-tree walk to every apply, which review already flagged as the
+    # thing pushing this past the unit's start timeout.
+    importable_orphans = sorted(
+        line.split("Would remove ", 1)[1]
+        for line in clean_preview
+        if "Would remove " in line and line.rstrip().endswith(".py")
+    )
+
     plan = {
         "action": "rollback" if rollback_from is not None else "apply",
         "runtime": str(runtime),
@@ -1329,8 +1430,33 @@ def _apply(
         "target": target,
         "clean_preview": clean_preview,
         "backup_receipt": str(args.backup_receipt),
+        "dependency_skew": skew,
+        "importable_orphans_to_remove": importable_orphans,
         "restart_performed": False,
     }
+
+    if skew and not args.accept_dependency_skew:
+        raise UpdateError(
+            "the target's declared main dependencies are not satisfied by the live "
+            "venv, and this tool advances SOURCE ONLY — the fleet would run new code "
+            "against the old interpreter and fail at import. Resolve the environment "
+            "first, or pass --accept-dependency-skew if it is genuinely benign: "
+            + "; ".join(skew)
+        )
+
+    # NOT a refusal, deliberately. The finding this answers is that
+    # only_in_tree_importable was COMPUTED AND NEVER ACTED ON — the runbook gated a
+    # mass deletion on prose ("review that evidence against the classified orphan
+    # ledger"), which is not a gate. Surfacing the exact list in the plan, before
+    # the --dry-run early-return, is what makes that review possible: an operator
+    # now sees precisely which importable files a sweep will remove.
+    #
+    # A hard refusal was tried and reverted. Sweeping orphans is this tool's normal
+    # job, and blocking it broke 11 of the suite's own fixtures — encoding my
+    # judgement about another author's tool contract into their tests. The stronger
+    # gate for the ONE-SHOT conversion, where 55 accumulated orphans go at once, is
+    # carded rather than imposed here.
+
     if args.dry_run:
         plan["dry_run"] = True
         print(_canonical_json(plan), end="")
@@ -1448,6 +1574,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-file", type=Path, default=DEFAULT_LOCK_FILE)
     parser.add_argument("--backup-receipt", type=Path)
     parser.add_argument("--initial-evidence", type=Path)
+    parser.add_argument(
+        "--accept-dependency-skew",
+        action="store_true",
+        help="proceed even though the target's main dependencies are unsatisfied by "
+             "the live venv (source advance does not touch the venv)",
+    )
     parser.add_argument(
         "--update-receipt", type=Path, help="successful apply receipt to roll back"
     )

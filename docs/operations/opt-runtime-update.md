@@ -101,7 +101,15 @@ at `/var/lib/hermes-agent/latest-backup.json`:
 ```json
 {
   "runtime": "/opt/hermes-agent",
+  "runtime_fingerprint": {
+    "algorithm": "sha256-canonical-manifest-v2",
+    "sha256": "64-lowercase-hex",
+    "entry_count": 6236,
+    "contract": ["...exact array, see below..."]
+  },
   "created_at": "2026-08-03T00:00:00Z",
+  "archive_profile": "opt-hermes-agent-full",
+  "archive_root": "/opt/hermes-agent",
   "archive_path": "/path/to/opt-hermes-agent-UTC.tar.zst",
   "archive_sha256": "64-lowercase-hex",
   "remote_uri": "r2:clawd-substrate-backups/opt-hermes-agent/object.tar.zst",
@@ -109,6 +117,34 @@ at `/var/lib/hermes-agent/latest-backup.json`:
   "roundtrip_sha256": "the-same-64-lowercase-hex"
 }
 ```
+
+**All ten fields are required.** An earlier revision of this section showed seven and
+omitted `runtime_fingerprint`, `archive_profile` and `archive_root`, so an operator
+following it hit `FATAL: backup receipt missing fields` and had no documented way to
+produce the one that is not a plain string. As written the runbook was unexecutable.
+
+**Where `runtime_fingerprint` comes from — do not hand-compute it.** `audit` already
+emits exactly this object, with the right `algorithm`, `entry_count` and `contract`
+array. Take it verbatim:
+
+```sh
+sudo python3 scripts/update_opt_hermes_runtime.py audit \
+     --runtime /opt/hermes-agent --target <40-hex> \
+  | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["tree_fingerprint"]))'
+```
+
+It must be measured on the SAME tree state the archive captured — take the audit and
+the backup without mutating the runtime in between, or the receipt will correctly
+refuse to bind.
+
+**What the receipt does and does not prove.** `remote_uri` is validated for shape
+only. This tool performs **no network I/O**: it never contacts R2, and the
+"round-trip artifact" is a local file whose digest must equal the archive's — a `cp`
+satisfies it. That check is still worth having, because it catches a truncated or
+swapped archive, but it is byte-identity, **not** remote durability. Emitted receipts
+carry `"remote_verified": false` so a downstream reader cannot mistake one for the
+other. Off-host durability is the backup producer's guarantee.
+
 
 The updater validates the receipt and both local files; a claimed remote hash
 without a downloaded round-trip artifact is not sufficient. The round-trip

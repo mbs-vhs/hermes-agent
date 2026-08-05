@@ -16,8 +16,14 @@ The first conversion of the existing non-git tree is also split:
 * ``apply --initial-evidence ...`` requires that frozen evidence to match
   byte-for-byte before it performs proposal step a2.
 
-Every apply additionally requires a recent local backup and a verified R2
-round-trip receipt.  A steady-state update refuses dirty or untracked runtime
+Every apply additionally requires a recent local backup and an R2 round-trip
+receipt.  READ THE NEXT SENTENCE BEFORE RELYING ON THAT.  This tool performs NO
+NETWORK I/O.  It cannot and does not confirm that any byte reached R2: `remote_uri`
+is validated for shape only, and the "round-trip artifact" is a local file whose
+digest must equal the archive's.  So the receipt is an ATTESTATION by whatever
+produced it, plus a local byte-identity check.  A `cp` of the archive satisfies it.
+Remote durability is the backup producer's guarantee, not this tool's, and the
+emitted receipt says so in `remote_verified`.  A steady-state update refuses dirty or untracked runtime
 state.  Targets are full 40-hex commit ids, never moving branch names.
 """
 
@@ -759,6 +765,13 @@ def _validate_backup_receipt(path: Path, runtime: Path) -> dict[str, Any]:
             "backup and R2 round-trip SHA-256 values are invalid or differ"
         )
     archive_path = Path(receipt["archive_path"])
+    # Stated where a reader will hit it, not only in the module docstring: nothing
+    # below contacts R2. An earlier docstring called this "a verified R2 round-trip
+    # receipt", which reads as proof the object is durable off-host. It is not. The
+    # checks are: the URI is well-formed, the round-trip artifact is a distinct
+    # owned file, and its digest equals the archive's. All three are satisfiable
+    # with `cp`. That is still worth doing — it catches a truncated or swapped
+    # archive — but it is byte-identity, not remote durability.
     roundtrip_path = Path(receipt["roundtrip_path"])
     _safe_owned_file(archive_path, "local backup archive")
     _safe_owned_file(roundtrip_path, "R2 round-trip artifact")
@@ -947,6 +960,12 @@ def _begin_transaction(
             "remote_uri": backup["remote_uri"],
             "roundtrip_path": backup["roundtrip_path"],
             "roundtrip_sha256": backup["roundtrip_sha256"],
+            # This tool performs no network I/O. The digests above prove the local
+            # round-trip artifact is byte-identical to the archive; nothing here
+            # establishes the object exists in R2. Emitted so a consumer of this
+            # receipt cannot read byte-identity as remote durability.
+            "remote_verified": False,
+            "remote_verified_by": "backup producer attestation (not checked here)",
         },
         "created_at": dt.datetime
         .now(dt.timezone.utc)
@@ -1384,6 +1403,8 @@ def _apply(
                 "archive_sha256": backup["archive_sha256"],
                 "remote_uri": backup["remote_uri"],
                 "roundtrip_sha256": backup["roundtrip_sha256"],
+                "remote_verified": False,
+                "remote_verified_by": "backup producer attestation (not checked here)",
             },
             "post_tree_fingerprint": after_audit["tree_fingerprint"],
             "post_provenance_counts": after_audit["provenance"]["counts"],

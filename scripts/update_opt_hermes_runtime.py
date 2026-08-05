@@ -669,7 +669,14 @@ def _archive_restored_fingerprint(path: Path) -> dict[str, Any]:
         parts = name[2:].rstrip("/").split("/")
         if any(part in {"", ".", ".."} for part in parts):
             raise UpdateError("backup archive contains an unsafe member path")
-    with tempfile.TemporaryDirectory(prefix="hermes-backup-verify-") as temporary:
+    # dir= is deliberate. The default temp root is /tmp, which is tmpfs on this
+    # host, and this block extracts a FULL copy of the runtime — venv included —
+    # to re-hash it. Doing that in RAM on the box running the fleet is a memory
+    # event, and the unit's PrivateTmp=yes does not change where /tmp lives. Verify
+    # next to the receipt instead, which StateDirectory puts on disk.
+    with tempfile.TemporaryDirectory(
+        prefix="hermes-backup-verify-", dir=_verify_scratch_dir(path)
+    ) as temporary:
         restored = Path(temporary)
         extraction = subprocess.run(
             [
@@ -696,6 +703,22 @@ def _archive_restored_fingerprint(path: Path) -> dict[str, Any]:
             raise UpdateError(f"backup archive fidelity restore failed: {_redact(detail)}")
         return _tree_fingerprint(restored)
 
+
+
+def _verify_scratch_dir(archive_path: Path) -> str:
+    """A disk-backed directory for whole-tree extraction, never tmpfs.
+
+    Prefers the archive's own directory (StateDirectory => /var/lib, on disk).
+    Falls back to the default only if that is unusable, because refusing to verify
+    a backup is worse than verifying it slowly.
+    """
+    try:
+        candidate = Path(archive_path).resolve().parent
+        if candidate.is_dir() and os.access(candidate, os.W_OK):
+            return str(candidate)
+    except OSError:
+        pass
+    return tempfile.gettempdir()
 
 def _validate_backup_receipt(path: Path, runtime: Path) -> dict[str, Any]:
     receipt = _load_json(path, "backup receipt")
@@ -1419,8 +1442,39 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+class _Interrupted(UpdateError):
+    """SIGTERM/SIGINT arrived. Raised so the normal failure path runs."""
+
+
+def _install_signal_handlers() -> None:
+    """Turn a systemd stop into an exception, not a corpse.
+
+    `import signal` was present and unused. Without a handler, systemd's
+    TimeoutStartSec expiry SIGKILLs this process outright: no except block, no
+    _handle_failed_transaction, no rollback — and KillMode=control-group takes the
+    running `git clean` down with it, leaving a half-swept live runtime that every
+    recovery verb then refuses. Reproduced by SIGKILL mid-clean: 11,400 of 20,000
+    orphans removed, journal stuck at `cleaning`, both recover and apply refusing.
+
+    Raising instead means the existing transaction machinery unwinds and records a
+    recoverable state. SIGKILL still cannot be caught — that is why the unit also
+    sets TimeoutStopSec, so the handler gets a window before escalation.
+    """
+
+    def _raise(signum: int, _frame: Any) -> None:
+        raise _Interrupted(f"interrupted by signal {signum}; transaction unwound")
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _raise)
+        except (ValueError, OSError):
+            # Not the main thread, or a platform without it. Never fatal.
+            pass
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _install_signal_handlers()
     try:
         with _exclusive_lock(args.lock_file):
             if args.command == "recover":

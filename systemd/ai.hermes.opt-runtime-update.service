@@ -7,6 +7,17 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=root
+# WITHOUT THIS the host default applies — 45s on the reference host — and a source
+# advance over a multi-GB runtime exceeds it easily. systemd then SIGKILLs the
+# process, and with the default KillMode=control-group it kills a running
+# `git clean` with it, leaving a HALF-SWEPT live tree that every recovery path
+# then refuses. Measured: 8 full-runtime manifest walks + a whole-archive extract
+# per apply. 30 minutes is deliberately generous; this unit is started by hand
+# inside an announced window, so a long run is expected and a wrong kill is not.
+TimeoutStartSec=1800
+# The script installs a SIGTERM handler that fails the transaction cleanly, so give
+# it room to run before escalating to SIGKILL.
+TimeoutStopSec=120
 Group=root
 UMask=0077
 EnvironmentFile=-/etc/hermes-agent/runtime-update.env

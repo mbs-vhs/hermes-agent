@@ -507,9 +507,13 @@ def _ready(audit: dict[str, Any]) -> bool:
     ignores logs/, data/ and .env, which the gateway writes at launch, so the first
     gateway start after a conversion wedged every later apply.
 
-    The surviving terms all ask GIT, which is also what `clean -fd` will act on, so
-    the verdict is self-consistent by construction: anything that makes this false is
-    something the tool can actually do something about.
+    The three DRIFT terms all ask GIT, which is also what `clean -fd` will act on, so
+    the drift verdict is self-consistent by construction: anything that makes it false
+    is something the tool can act on. Stated precisely, because an earlier draft of this
+    docstring claimed "the surviving terms ALL ask git" and that is not true — the last
+    two ask the transaction directory, and `status` also goes false on modified TRACKED
+    files, which `clean -fd` does not touch (the remedy there is the `reset --hard`
+    inside apply, not clean). The claim being made is about the drift terms only.
 
     The provenance walk is not deleted — `opt_provenance_report.py` still exists and
     `audit` still reports it. It is no longer a VETO on proceeding.
@@ -1230,7 +1234,7 @@ def _steady_preflight(runtime: Path) -> None:
     current_audit = _build_audit(runtime, current)
     if not _ready(current_audit):
         raise UpdateError(
-            "runtime is dirty, untracked, or provenance-divergent from current HEAD"
+            "runtime is dirty or has untracked paths at current HEAD"
         )
 
 

@@ -18,11 +18,26 @@ cannot reach the fleet" approximately once, then wedge.
 
 WHAT THE FIX MUST NOT DO
 ------------------------
-Make readiness permissive. Three of the five tests here are negative controls: a
-non-ignored orphan, an ignored-but-IMPORTABLE orphan, and tracked-file drift must
-all still refuse. An importable orphan fails even when ignored — a stray module on
-the import path can shadow real code, and one the tool cannot remove is a finding
-an operator must see, not a state to proceed from.
+Make readiness permissive. Two of the tests here are negative controls: a non-ignored
+orphan and tracked-file drift must both still refuse.
+
+THE ONE DELIBERATE PERMISSIVENESS, STATED RATHER THAN HIDDEN
+------------------------------------------------------------
+An ignored-but-IMPORTABLE orphan used to refuse as well, on the reasoning that a stray
+module on the import path can shadow real code. Under CLAWD-3655 it no longer does, and
+that is a REAL BEHAVIOUR CHANGE, not a deferral — an independent reviewer found it
+sitting behind a conditional skip, with this docstring still asserting the old property
+the code no longer had. A doc that claims a guard the code dropped is worse than no doc.
+
+The change is deliberate because the old refusal was UNSATISFIABLE. The path is ignored,
+so `clean -fd` will never remove it, and `-x` is banned outright because it would delete
+the live venv. Refusing therefore produced a state with no operator remedy — the exact
+wedge this narrowing exists to remove — while doing nothing about the shadowing risk.
+
+What survives is the SIGNAL, which is the part that was actually load-bearing: `audit`
+still reports the orphan under `provenance.counts.only_in_tree_importable`, so an
+operator still sees it. What was removed is only its VETO over proceeding. The test
+below pins exactly that split, so neither half can be lost quietly.
 """
 
 from __future__ import annotations
@@ -114,17 +129,33 @@ def test_a_non_ignored_orphan_still_refuses(runtime: Path):
     assert not _ready(runtime)
 
 
-def test_an_ignored_but_importable_orphan_still_refuses(runtime: Path):
-    """Ignored is not a pass for something importable.
+def test_an_ignored_importable_orphan_is_REPORTED_but_no_longer_VETOES(runtime: Path):
+    """The CLAWD-3655 behaviour change, pinned on both sides.
 
-    A stray module on the import path can shadow real code. One the tool cannot
-    remove is a finding an operator must see, not a state to proceed from.
+    Was: `_ready` returned False, which the tool could never clear (ignored ⇒ invisible
+    to `clean -fd`; `-x` banned because it would delete the live venv). A refusal with
+    no remedy is the wedge, not a guard.
+
+    Is: still fully REPORTED so the operator sees the shadowing risk, but it no longer
+    blocks. If either half of this test starts failing, say which: losing the report is
+    a regression, and restoring the veto re-creates the wedge.
     """
     (runtime / "logs" / "shadow.py").write_text("x = 1\n")
     mod = _subject()
     audit = mod._build_audit(runtime, mod._head(runtime))
-    assert audit["provenance"]["counts"]["only_in_tree_importable"] == 1
-    assert not mod._ready(audit)
+
+    assert audit["provenance"]["counts"]["only_in_tree_importable"] == 1, (
+        "the importable orphan is no longer REPORTED — the narrowing removed the veto, "
+        "not the signal, and an operator now has no way to see a module that can "
+        "shadow real code"
+    )
+    assert "logs/shadow.py" in audit["provenance"]["only_in_tree"]
+
+    assert mod._ready(audit), (
+        "readiness refuses on a gitignored path again. `clean -fd` cannot remove it and "
+        "`-x` is banned, so this is a refusal with no operator remedy — the wedge "
+        "CLAWD-3655 removed"
+    )
 
 
 def test_tracked_file_drift_still_refuses(runtime: Path):

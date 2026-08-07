@@ -77,12 +77,16 @@ _DEFERRED_TESTS = {
             "test_git_ignored_helper_is_exact",
         ),
     },
-    "_provenance_is_exact": {
-        "test_update_opt_hermes_runtime_readiness.py": (
-            "test_an_ignored_but_importable_orphan_still_refuses",
-        ),
-    },
 }
+#
+# DELIBERATELY NOT LISTED: the ignored-importable-orphan case (`_provenance_is_exact`).
+# Independent review established that skipping it hid a BEHAVIOUR CHANGE rather than
+# deferring machinery: the test's unit under test is `_ready`, which the subject still
+# defines, and its assertion had flipped from False to True. A skip keyed on a removed
+# *implementation detail of* `_ready` is not the same thing as a skip keyed on the unit
+# being gone, and treating them alike is how a regression rides in as a deferral.
+# It now runs, asserting the reported-but-not-vetoed split explicitly. See
+# test_update_opt_hermes_runtime_readiness.py.
 #
 # DELIBERATELY NOT LISTED: test_DEFECT_readiness_wedges_on_a_non_ascii_gitignored_orphan.
 # It is an xfail(strict=True) pinning a wedge the narrowing REMOVED — `_ready` no longer

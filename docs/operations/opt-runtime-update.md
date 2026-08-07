@@ -21,8 +21,11 @@ receipted gates. The updater never calls `systemctl`.
   be created.
 - The cleanup command is fixed to `git clean -fd`. Never use `-fdx`:
   `venv/` is ignored and contains the interpreter all fleet gateways execute.
-- A steady-state apply refuses any tracked, untracked, unreadable, or provenance
-  drift from the current `HEAD`.
+- A steady-state apply refuses any tracked or untracked drift from the current `HEAD`.
+  It no longer refuses on *provenance* drift: under CLAWD-3655 readiness asks git only,
+  because a gitignored path can never be cleared by `clean -fd` and `-x` is banned, so
+  a provenance veto produced refusals with no operator remedy. `audit` still reports
+  provenance in full — the report was kept, only its veto was dropped.
 - The first a2 reconciliation additionally requires an exact frozen `audit`
   payload captured after a1. Its tree and venv fingerprints cover paths, object
   types, regular-file bytes, modes, uid/gid ownership, symlink targets, and
@@ -108,8 +111,8 @@ at `/var/lib/hermes-agent/latest-backup.json`:
     "contract": ["...exact array, see below..."]
   },
   "created_at": "2026-08-03T00:00:00Z",
-  "archive_profile": "opt-hermes-agent-full",
-  "archive_root": "/opt/hermes-agent",
+  "archive_profile": "gnu-tar-zstd-pax-numeric-owner-acl-xattr-v1",
+  "archive_root": ".",
   "archive_path": "/path/to/opt-hermes-agent-UTC.tar.zst",
   "archive_sha256": "64-lowercase-hex",
   "remote_uri": "r2:clawd-substrate-backups/opt-hermes-agent/object.tar.zst",
@@ -122,6 +125,34 @@ at `/var/lib/hermes-agent/latest-backup.json`:
 omitted `runtime_fingerprint`, `archive_profile` and `archive_root`, so an operator
 following it hit `FATAL: backup receipt missing fields` and had no documented way to
 produce the one that is not a plain string. As written the runbook was unexecutable.
+
+**The revision that fixed that shipped two values the code still refuses**, found by
+independent review: it printed `"archive_profile": "opt-hermes-agent-full"` and
+`"archive_root": "/opt/hermes-agent"`, and the code accepts only the exact strings now
+shown above. An operator following it stopped at the first gate of the first conversion
+with `FATAL: backup receipt archive_profile is not approved`. The remedy had inherited
+the disease. This block is now **mechanically checked** —
+`tests/scripts/test_opt_runtime_runbook_receipt.py` parses this very JSON out of this
+file and asserts the code's own validator accepts its constant fields, so the runbook
+can no longer advertise a shape the tool rejects.
+
+**Producing an archive that matches `archive_profile`.** The profile string is not
+decorative — it names the exact `tar` invocation, and nothing but the test helper knew
+it. `--directory` is what makes `archive_root` the canonical `"."`:
+
+```sh
+sudo tar --zstd \
+         --format=pax \
+         --numeric-owner \
+         --acls \
+         --xattrs --xattrs-include='*' \
+         --directory /opt/hermes-agent \
+         -cf /var/backups/opt-hermes-agent-$(date -u +%Y%m%dT%H%M%SZ).tar.zst .
+```
+
+`--numeric-owner`, `--acls` and `--xattrs` are load-bearing: the runtime is owned by
+`root` and executed by eleven separate `hermes-*` uids, so an archive that resolves
+names or drops xattrs does not restore the tree the fleet was running.
 
 **Where `runtime_fingerprint` comes from — do not hand-compute it.** `audit` already
 emits exactly this object, with the right `algorithm`, `entry_count` and `contract`
@@ -202,9 +233,25 @@ sudo /usr/bin/python3.11 \
 ```
 
 Only after the dry run and the evidence review are green, remove `--dry-run`.
-That is a2: `reset --hard` followed by `clean -fd`, with a clean/provenance and
+That is a2: `reset --hard` followed by `clean -fd -e /venv`, with a git-clean and
 venv-preservation post-check. It writes a durable transaction journal and an
 update receipt but restarts no unit.
+
+### `target … tracks N path(s) under venv/` — what this refusal means
+
+Before any mutation, apply runs `git ls-tree -r --name-only <target> -- venv`. If the
+target COMMITS anything under `venv/`, apply refuses outright and nothing is touched.
+
+This is not a hypothetical. The live interpreter is `/opt/hermes-agent/venv/bin/python`
+and it is gitignored, so it survives `clean` only because of the `-e /venv` exclusion.
+A target that both tracks `venv/…` **and** drops `venv/` from `.gitignore` would have
+that exclusion stop applying, `reset --hard` would overwrite the interpreter and `clean`
+would sweep the rest — with the eleven gateway units still pointed at it. Recovery then
+fails too, because recovery needs an interpreter.
+
+There is no override flag, and that is deliberate. If you hit this, the target is wrong:
+find the commit that added tracked paths under `venv/` and fix it in the repo. Do not
+work around it on the runtime.
 
 ## Steady-state source advance
 

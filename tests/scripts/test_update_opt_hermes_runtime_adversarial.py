@@ -870,20 +870,21 @@ def test_PIN_a_second_updater_is_refused_while_the_lock_is_held(world, tmp_path)
 # the bug.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="DEFECT: `git check-ignore --stdin` quotes non-ASCII paths (core.quotePath "
-           "defaults on) while the provenance walk returns them raw, so the set "
-           "subtraction in _provenance_is_exact never matches and readiness wedges. "
-           "Fix: -z --stdin, or -c core.quotePath=false.",
-)
-def test_DEFECT_readiness_wedges_on_a_non_ascii_gitignored_orphan(world):
-    """The round-1 readiness fix does not survive a non-ASCII filename.
+def test_readiness_does_not_wedge_on_a_non_ascii_gitignored_orphan(world):
+    """REGRESSION GUARD. This was an xfail(strict=True) pinning a live defect.
 
-    A gateway fleet handling arbitrary chat content writes gitignored logs, session
-    files and attachments named after user input. One non-ASCII character in such a
-    name re-creates exactly the wedge commit 6d969f790 was written to remove: every
-    later `apply` and `rollback` refuses, and `-x` is banned so nothing can clear it.
+    The defect: `git check-ignore --stdin` quotes non-ASCII paths (core.quotePath
+    defaults on) while the provenance walk returned them raw, so the set subtraction
+    in `_provenance_is_exact` never matched and readiness wedged. A gateway fleet
+    handling arbitrary chat content writes gitignored logs, session files and
+    attachments named after user input, so one non-ASCII character re-created exactly
+    the wedge commit 6d969f790 was written to remove: every later `apply` and
+    `rollback` refused, and `-x` is banned so nothing could clear it.
+
+    The CLAWD-3655 narrowing removed the defect by construction rather than by patch —
+    `_ready` no longer consults the gitignore-blind provenance walk at all, so there is
+    no set subtraction left to disagree about quoting. The marker is therefore dropped
+    and this now asserts the fix positively: the wedge must stay gone.
     """
     _bootstrap(world)
     runtime = world["runtime"]
@@ -894,9 +895,9 @@ def test_DEFECT_readiness_wedges_on_a_non_ascii_gitignored_orphan(world):
     audit = updater._build_audit(runtime, updater._head(runtime))
     assert updater._ready(audit), (
         "readiness is False because of a gitignored file `clean -fd` will never "
-        "remove. _git_ignored returned "
-        f"{sorted(updater._git_ignored(runtime, [str(x) for x in audit['provenance']['only_in_tree']]))!r} "
-        f"against only_in_tree {sorted(audit['provenance']['only_in_tree'])!r}"
+        "remove — the non-ASCII wedge is back. only_in_tree was "
+        f"{sorted(audit['provenance']['only_in_tree'])!r}; git status was "
+        f"{audit['status']!r} and clean_preview was {audit['clean_preview']!r}"
     )
 
 

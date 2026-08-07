@@ -38,21 +38,58 @@ import pytest
 
 SUBJECT = Path(__file__).resolve().parents[2] / "scripts" / "update_opt_hermes_runtime.py"
 
-# Each entry: the subject attribute whose ABSENCE means the feature is deferred,
-# and the substrings in a test's name that indicate it exercises that feature.
-# Whole FILES that exist only to cover deferred machinery. Keyed the same way — the
-# file's tests return the moment the named attribute does. Cheaper and more honest
-# than name-matching for a file that is 100% about one removed feature.
+# Whole FILES that exist only to cover deferred machinery. The file's tests return
+# the moment the named attribute does.
 _DEFERRED_FILES = {
     "_dependency_skew": ("test_update_opt_hermes_runtime_depskew.py",),
 }
 
-_DEFERRED = {
-    "_dependency_skew": ("dependency_skew", "depskew", "dependency_probe", "requirement_shapes",
-                         "target_pyproject"),
-    "_git_ignored": ("git_ignored", "check_ignore", "gitignored_orphan"),
-    "_provenance_is_exact": ("importable_orphan_still_refuses",),
+# EXACT test names, scoped by file, NOT name substrings.
+#
+# This was substring matching until an independent tester demonstrated the hole: the
+# token `git_ignored` also matches a plausible DEPLOY-half name such as
+# `test_venv_must_be_git_ignored_before_any_clean` — the tester dropped exactly that
+# test, containing a bare `assert False`, into a deploy-half file and the gate still
+# reported green. A skiplist that can silently swallow a failing deploy-half test is
+# worse than no skiplist, because it reports as coverage.
+#
+# Exactness costs nothing here and cannot collide. The failure mode it introduces is
+# the safe one: a deferred test nobody listed does not get skipped, so it fails loudly
+# with `AttributeError: module has no attribute '_dependency_skew'`. Rot is visible.
+# Parametrised ids are matched on the name before '['.
+_DEFERRED_TESTS = {
+    "_dependency_skew": {
+        "test_update_opt_hermes_runtime_adversarial.py": (
+            "test_PIN_dry_run_plan_carries_the_real_dependency_skew",
+            "test_PIN_dependency_skew_refuses_the_apply_and_the_flag_overrides",
+            "test_PIN_dependency_skew_asks_the_RUNTIME_venv_not_the_updater_interpreter",
+            "test_PIN_the_dependency_probe_writes_no_bytecode_into_the_venv",
+            "test_OBSERVED_requirement_shapes_are_parsed_by_packaging",
+            "test_OBSERVED_an_unreadable_target_pyproject_FAILS_OPEN",
+        ),
+    },
+    "_git_ignored": {
+        "test_update_opt_hermes_runtime_adversarial.py": (
+            "test_DEFECT_git_ignored_splits_a_path_that_contains_a_newline",
+            "test_OBSERVED_check_ignore_settles_ten_thousand_paths_in_one_process",
+        ),
+        "test_update_opt_hermes_runtime_readiness.py": (
+            "test_git_ignored_helper_is_exact",
+        ),
+    },
+    "_provenance_is_exact": {
+        "test_update_opt_hermes_runtime_readiness.py": (
+            "test_an_ignored_but_importable_orphan_still_refuses",
+        ),
+    },
 }
+#
+# DELIBERATELY NOT LISTED: test_DEFECT_readiness_wedges_on_a_non_ascii_gitignored_orphan.
+# It is an xfail(strict=True) pinning a wedge the narrowing REMOVED — `_ready` no longer
+# consults the provenance walk, so the test now passes and strict-xfail turns that into
+# the hard failure it is designed to be ("your defect is fixed, update me"). Skipping it
+# suppressed exactly the signal the marker exists to raise. Its marker is dropped and it
+# now runs as a positive regression guard that the non-ASCII wedge stays gone.
 
 
 def _subject_has(name: str) -> bool:
@@ -63,14 +100,15 @@ def _subject_has(name: str) -> bool:
 
 
 def pytest_collection_modifyitems(config, items):
-    absent = {attr for attr in _DEFERRED if not _subject_has(attr)}
+    absent = {attr for attr in _DEFERRED_TESTS if not _subject_has(attr)}
     if not absent:
         return  # assurance half is back; every test runs again automatically
     for item in items:
         fname = Path(str(item.fspath)).name
+        base = item.name.split("[", 1)[0]  # parametrised ids share one base name
         for attr in absent:
-            if fname in _DEFERRED_FILES.get(attr, ()) or any(
-                token in item.name for token in _DEFERRED[attr]
+            if fname in _DEFERRED_FILES.get(attr, ()) or base in _DEFERRED_TESTS[attr].get(
+                fname, ()
             ):
                 item.add_marker(
                     pytest.mark.skip(

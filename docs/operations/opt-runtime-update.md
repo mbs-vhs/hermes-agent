@@ -154,9 +154,28 @@ sudo tar --zstd \
 `root` and executed by eleven separate `hermes-*` uids, so an archive that resolves
 names or drops xattrs does not restore the tree the fleet was running.
 
-**Where `runtime_fingerprint` comes from — do not hand-compute it.** `audit` already
-emits exactly this object, with the right `algorithm`, `entry_count` and `contract`
-array. Take it verbatim:
+**Where `runtime_fingerprint` comes from — do not hand-compute it.** Which command you
+use depends on whether the runtime is a git checkout yet.
+
+**FIRST conversion — the runtime has no `.git`.** Use `fingerprint`:
+
+```sh
+sudo python3 scripts/update_opt_hermes_runtime.py fingerprint \
+     --runtime /opt/hermes-agent
+```
+
+It emits the `runtime_fingerprint` object directly. It takes no `--target`, needs no
+`.git`, and is read-only — it will not create a `.git` or touch a single file.
+
+This verb exists because the runbook was otherwise **circular and the first conversion
+was unreachable**: `init` requires a receipt, a valid receipt requires
+`runtime_fingerprint`, the only producer was `audit`, and `audit` opens with
+`_runtime_safety(runtime, require_git=True)`. Since `/opt/hermes-agent` is a non-git
+tree, that was not a corner case — it was the only path that mattered. Measured before
+the fix: `require_git=False` appeared exactly once in the whole module, inside `_init`.
+
+**Every LATER receipt — the runtime is already a checkout.** `audit` emits the same
+object, so take it verbatim:
 
 ```sh
 sudo python3 scripts/update_opt_hermes_runtime.py audit \
@@ -164,9 +183,9 @@ sudo python3 scripts/update_opt_hermes_runtime.py audit \
   | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["tree_fingerprint"]))'
 ```
 
-It must be measured on the SAME tree state the archive captured — take the audit and
-the backup without mutating the runtime in between, or the receipt will correctly
-refuse to bind.
+Either way it must be measured on the SAME tree state the archive captured — take the
+fingerprint and the backup without mutating the runtime in between, or the receipt will
+correctly refuse to bind.
 
 **What the receipt does and does not prove.** `remote_uri` is validated for shape
 only. This tool performs **no network I/O**: it never contacts R2, and the

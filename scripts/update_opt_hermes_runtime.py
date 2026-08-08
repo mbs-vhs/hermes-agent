@@ -1156,6 +1156,35 @@ def _recover(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fingerprint(args: argparse.Namespace) -> int:
+    """Emit `runtime_fingerprint` for a runtime that is NOT yet a git checkout.
+
+    THE CIRCULARITY THIS EXISTS TO BREAK
+    ------------------------------------
+    `init` requires `--backup-receipt`, and a valid receipt must carry a
+    `runtime_fingerprint` that `_valid_tree_fingerprint` accepts. Until this verb
+    existed, the only producer of that object was `audit`, and `_audit` opens with
+    `_runtime_safety(runtime, require_git=True)`. So the receipt needed audit, audit
+    needed `.git`, and `.git` is what `init` creates.
+
+    The tool therefore could not perform its own FIRST conversion — the one case it was
+    written for. `/opt/hermes-agent` is a non-git tree, so this was not a corner: it was
+    the only path that mattered. The runbook's instruction to "take it verbatim from
+    audit" is correct for every LATER receipt and unreachable for the first.
+
+    Measured on the real runtime before this verb existed: `require_git=False` appeared
+    exactly once in the module, inside `_init` itself.
+
+    Read-only by construction: it walks the tree and prints. No git, no network, no
+    write. It still takes the shared lock via main(), so it cannot race a live apply and
+    fingerprint a tree mid-mutation.
+    """
+    runtime = args.runtime
+    _runtime_safety(runtime, require_git=False)
+    print(_canonical_json(_tree_fingerprint(runtime)))
+    return 0
+
+
 def _init(args: argparse.Namespace, target: str) -> int:
     runtime = args.runtime
     _runtime_safety(runtime, require_git=False)
@@ -1460,7 +1489,16 @@ def _apply(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=("init", "audit", "status", "apply", "rollback", "recover")
+        "command",
+        choices=(
+            "fingerprint",
+            "init",
+            "audit",
+            "status",
+            "apply",
+            "rollback",
+            "recover",
+        ),
     )
     parser.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
     target_group = parser.add_mutually_exclusive_group(required=False)
@@ -1526,6 +1564,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     _install_signal_handlers()
     try:
         with _exclusive_lock(args.lock_file):
+            # Dispatched before _target_value: neither verb takes a target, and
+            # fingerprint must run on a tree that has no .git and therefore no refs.
+            if args.command == "fingerprint":
+                return _fingerprint(args)
             if args.command == "recover":
                 return _recover(args)
             if args.command == "rollback":

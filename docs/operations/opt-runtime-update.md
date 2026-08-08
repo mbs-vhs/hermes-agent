@@ -107,7 +107,7 @@ at `/var/lib/hermes-agent/latest-backup.json`:
   "runtime_fingerprint": {
     "algorithm": "sha256-canonical-manifest-v2",
     "sha256": "64-lowercase-hex",
-    "entry_count": 6236,
+    "entry_count": 19209,
     "contract": ["...exact array, see below..."]
   },
   "created_at": "2026-08-03T00:00:00Z",
@@ -159,10 +159,21 @@ use depends on whether the runtime is a git checkout yet.
 
 **FIRST conversion — the runtime has no `.git`.** Use `fingerprint`:
 
-```sh
-sudo python3 scripts/update_opt_hermes_runtime.py fingerprint \
-     --runtime /opt/hermes-agent
+```bash
+sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash -c '
+  exec /usr/bin/python3.11 \
+    /usr/local/libexec/hermes-agent/update_opt_hermes_runtime.py fingerprint \
+    --runtime /opt/hermes-agent
+'
 ```
+
+Pinned and confined like every other invocation in this runbook. An earlier revision
+of this block showed a bare `sudo python3 scripts/…` from the checkout: that resolves
+to **3.14** on this host rather than the pinned 3.11, and running it as root writes
+root-owned `__pycache__` into the operator's repo. Output is byte-identical across
+both interpreters (verified), so it was not a correctness bug — but an unpinned
+interpreter in a runbook that pins one everywhere else is a difference nobody should
+have to rediscover.
 
 It emits the `runtime_fingerprint` object directly. It takes no `--target`, needs no
 `.git`, and is read-only — it will not create a `.git` or touch a single file.
@@ -177,10 +188,12 @@ the fix: `require_git=False` appeared exactly once in the whole module, inside `
 **Every LATER receipt — the runtime is already a checkout.** `audit` emits the same
 object, so take it verbatim:
 
-```sh
-sudo python3 scripts/update_opt_hermes_runtime.py audit \
-     --runtime /opt/hermes-agent --target <40-hex> \
-  | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["tree_fingerprint"]))'
+```bash
+sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash -c '
+  exec /usr/bin/python3.11 \
+    /usr/local/libexec/hermes-agent/update_opt_hermes_runtime.py audit \
+    --runtime /opt/hermes-agent --target <40-hex>
+' | /usr/bin/python3.11 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["tree_fingerprint"]))'
 ```
 
 Either way it must be measured on the SAME tree state the archive captured — take the

@@ -20,8 +20,10 @@ then rejects, would look like a fix and leave the circularity in place one layer
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -78,13 +80,66 @@ def test_fingerprint_runs_on_a_runtime_with_no_git(nongit_runtime: Path, tmp_pat
     assert payload["algorithm"]
 
 
-def test_the_emitted_object_is_one_the_receipt_validator_accepts(nongit_runtime: Path):
-    """Emitting a *different* shape would move the circularity, not remove it."""
+def test_a_receipt_BUILT_FROM_THE_VERB_OUTPUT_passes_the_real_validator(
+    nongit_runtime: Path, tmp_path: Path
+):
+    """The commit's central claim, exercised end to end through the real validator.
+
+    THIS TEST WAS DECORATIVE ON FIRST WRITE and an independent reviewer proved it.
+    It called `_valid_tree_fingerprint(_tree_fingerprint(runtime))` — two helpers that
+    both PREDATE the fix — so it never invoked the verb and never reached
+    `_validate_backup_receipt`. Two measurements: reverting the entire fix (parent
+    commit, no `fingerprint` verb at all) left this one test GREEN while the other six
+    went red; and a one-line mutant emitting `sha256-canonical-manifest-v1` kept all
+    seven green while the operator's real first command died with
+    `FATAL: backup receipt runtime_fingerprint is invalid`.
+
+    That is the first gate of the first conversion failing with a green suite — the
+    third time this runbook has shipped broken that way. So this now does what it
+    always claimed: takes the verb's ACTUAL stdout, builds a real receipt around a real
+    archive, and hands it to the real validator.
+    """
     mod = _subject()
-    assert mod._valid_tree_fingerprint(mod._tree_fingerprint(nongit_runtime)), (
-        "fingerprint emits an object _validate_backup_receipt would reject, so a "
-        "receipt built from it still cannot pass init"
+    proc = _run(nongit_runtime, "fingerprint", lock=tmp_path / "lk")
+    assert proc.returncode == 0, proc.stderr
+    emitted = json.loads(proc.stdout)
+
+    archive = tmp_path / "backup.tar.zst"
+    subprocess.run(
+        [
+            "tar", "--zstd", "--format=pax", "--numeric-owner", "--acls",
+            "--xattrs", "--xattrs-include=*",
+            "--directory", str(nongit_runtime), "-cf", str(archive), ".",
+        ],
+        check=True,
+        capture_output=True,
     )
+    roundtrip = tmp_path / "roundtrip.tar.zst"
+    shutil.copy2(archive, roundtrip)
+    digest = mod._sha256(archive)
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "runtime": str(nongit_runtime),
+                "runtime_fingerprint": emitted,
+                "created_at": dt.datetime.now(dt.timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "archive_profile": mod.BACKUP_ARCHIVE_PROFILE,
+                "archive_root": ".",
+                "archive_path": str(archive),
+                "archive_sha256": digest,
+                "remote_uri": "r2:example-bucket/opt-hermes-agent/object.tar.zst",
+                "roundtrip_path": str(roundtrip),
+                "roundtrip_sha256": digest,
+            }
+        )
+    )
+
+    # Must not raise. This is the gate the first conversion actually hits.
+    mod._validate_backup_receipt(receipt_path, nongit_runtime)
 
 
 def test_fingerprint_needs_no_target(nongit_runtime: Path, tmp_path: Path):

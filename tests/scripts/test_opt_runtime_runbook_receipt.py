@@ -105,6 +105,48 @@ def test_the_runbook_archive_root_is_the_canonical_dot():
     )
 
 
+def test_every_updater_verb_the_runbook_tells_an_operator_to_RUN_exists():
+    """The runbook must not route an operator to a command the parser rejects.
+
+    Added after an independent reviewer measured that the doc half of the fingerprint
+    commit was entirely unverified: reverting the whole documentation hunk to its
+    previous revision left this file's gate at 11 passed. This file exists precisely
+    because the runbook had been "a seventh, untested oracle" — and it had just gained
+    a third operator-facing routing claim without anything checking it.
+
+    A wrong verb here is not cosmetic. `runtime_fingerprint` has exactly one reachable
+    producer before `.git` exists, and naming the wrong one puts the operator back in
+    the circularity that made the first conversion impossible.
+    """
+    spec = importlib.util.spec_from_file_location("subject", SUBJECT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    choices = set(mod._parser()._actions[1].choices)
+
+    text = RUNBOOK.read_text()
+    # Same line only. An earlier draft allowed the match to cross a newline, which
+    # swept up the next entry of the install-assets list ('scripts/...') and reported
+    # a phantom unknown verb. A verb is always adjacent to the script name.
+    named = set(re.findall(r"update_opt_hermes_runtime\.py[ \t]+([a-z][a-z-]*)", text))
+    assert named, "no updater invocations found in the runbook — has it been restructured?"
+
+    unknown = sorted(named - choices)
+    assert not unknown, (
+        f"the runbook tells an operator to run {unknown}, which the parser rejects. "
+        f"Valid verbs: {sorted(choices)}"
+    )
+
+
+def test_the_runbook_routes_the_FIRST_conversion_to_the_pre_git_producer():
+    """`audit` requires .git; only `fingerprint` works before the tree is a checkout."""
+    text = RUNBOOK.read_text()
+    assert "fingerprint" in text, (
+        "the runbook never names the `fingerprint` verb, so it routes the first "
+        "conversion to `audit`, which requires the .git that `init` has not created "
+        "yet — the circularity that made the first conversion unreachable"
+    )
+
+
 def test_the_runbook_gives_a_tar_command_matching_the_profile_it_names():
     """The profile string names an invocation; without it the doc is unexecutable.
 

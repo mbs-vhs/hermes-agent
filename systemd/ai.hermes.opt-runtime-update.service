@@ -1,0 +1,49 @@
+[Unit]
+Description=Advance the pinned Hermes fleet runtime to its exact approved commit
+Documentation=file:/usr/local/share/doc/hermes-agent/opt-runtime-update.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# WITHOUT THIS the host default applies — 45s on the reference host — and a source
+# advance over a multi-GB runtime exceeds it easily. systemd then SIGKILLs the
+# process, and with the default KillMode=control-group it kills a running
+# `git clean` with it, leaving a HALF-SWEPT live tree that every recovery path
+# then refuses. Measured: 8 full-runtime manifest walks + a whole-archive extract
+# per apply. 30 minutes is deliberately generous; this unit is started by hand
+# inside an announced window, so a long run is expected and a wrong kill is not.
+TimeoutStartSec=1800
+# The script installs a SIGTERM handler that fails the transaction cleanly, so give
+# it room to run before escalating to SIGKILL.
+TimeoutStopSec=120
+Group=root
+UMask=0077
+EnvironmentFile=-/etc/hermes-agent/runtime-update.env
+ExecStart=/usr/bin/python3.11 /usr/local/libexec/hermes-agent/update_opt_hermes_runtime.py apply --runtime /opt/hermes-agent --target-file /etc/hermes-agent/runtime-target --fetch --backup-receipt /var/lib/hermes-agent/latest-backup.json --receipt-dir /var/lib/hermes-agent/runtime-receipts
+
+# This unit advances source only. It intentionally has no ExecStartPost restart;
+# CLAWD-3507 requires an explicit canary before the controlled fleet restart.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+StateDirectory=hermes-agent
+ReadOnlyPaths=/etc/hermes-agent
+ReadWritePaths=/opt/hermes-agent /var/lib/hermes-agent /run/lock
+
+# Deliberately no [Install] section: this mutating service is started manually
+# inside the announced backup -> source advance -> canary rollout window.

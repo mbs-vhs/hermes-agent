@@ -1,0 +1,28 @@
+[Unit]
+Description=Audit pinned Hermes fleet runtime provenance and drift
+Documentation=file:/usr/local/share/doc/hermes-agent/opt-runtime-update.md
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3.11 /usr/local/libexec/hermes-agent/update_opt_hermes_runtime.py status --runtime /opt/hermes-agent --target-file /etc/hermes-agent/runtime-target
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ReadOnlyPaths=/opt/hermes-agent /etc/hermes-agent -/var/lib/hermes-agent/runtime-transactions
+ReadWritePaths=/run/lock

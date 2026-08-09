@@ -154,8 +154,15 @@ def test_the_target_pyproject_is_read_from_git_not_the_worktree(tmp_path: Path):
     assert skew, "skew was read from the worktree, not from the target commit"
 
 
-def test_the_dry_run_PRINTS_the_skew_and_then_refuses(tmp_path: Path):
-    """Behaviour, not a grep. It must be VISIBLE in the rehearsal, then refuse.
+def test_the_override_flag_is_absent_from_the_parser(tmp_path: Path):
+    """The override is gone, asserted against the PARSER.
+
+    RENAMED after review: this was called `..._dry_run_PRINTS_the_skew_and_then_refuses`
+    and its docstring claimed "behaviour, not a grep" — but it never invokes apply, never
+    passes --dry-run and never builds a plan. That behaviour IS covered, by
+    `test_PIN_dry_run_plan_carries_the_real_dependency_skew` in the adversarial file,
+    which review confirmed goes red when the dry-run refusal is deleted. This test does
+    one honest thing: pin the flag's absence.
 
     This replaces a signature test that asserted `'"dependency_skew": skew' in source`
     and `"--accept-dependency-skew" in source`. Two problems with that: the file's own
@@ -169,7 +176,11 @@ def test_the_dry_run_PRINTS_the_skew_and_then_refuses(tmp_path: Path):
     record rather than an omission.
     """
     mod = _subject()
-    assert not hasattr(mod, "_accept_dependency_skew"), "the override flag came back"
+    # REMOVED: `assert not hasattr(mod, "_accept_dependency_skew")`. Independent review
+    # showed `git log --all -S` finds that attribute in no revision — the flag was always
+    # `--accept-dependency-skew` / `args.accept_dependency_skew`, so the assertion was
+    # vacuously true forever, including if the override came back. The parser assertion
+    # below is the one that can actually fail.
     parser_choices = mod._parser()
     opts = {s for a in parser_choices._actions for s in a.option_strings}
     assert "--accept-dependency-skew" not in opts, (
@@ -178,8 +189,13 @@ def test_the_dry_run_PRINTS_the_skew_and_then_refuses(tmp_path: Path):
     )
 
 
-def test_the_plan_carries_a_MEASURED_skew_value(tmp_path: Path):
-    """`[]` in the plan must mean 'asked and clean', never 'could not ask'."""
+def test_an_unmeasurable_target_RAISES_rather_than_returning_empty(tmp_path: Path):
+    """`[]` must mean 'asked and clean', never 'could not ask'.
+
+    RENAMED: this was `test_the_plan_carries_a_MEASURED_skew_value`, which over-claimed —
+    it never builds a plan. The plan field is pinned by the adversarial dry-run test.
+    What this actually asserts is the measured-vs-unmeasurable split at the source.
+    """
     rt, head = _runtime_with(tmp_path, ["pytest"], installed={"pytest": "9.0.2"})
     mod = _subject()
     assert mod._dependency_skew(rt, head) == []
@@ -198,3 +214,42 @@ def test_the_importable_orphan_list_stays_in_the_plan(tmp_path: Path):
     mod = _subject()
     src = SUBJECT.read_text()
     assert '"importable_orphans_to_remove": importable_orphans' in src
+
+
+def test_an_UNPARSEABLE_requirement_is_reported_not_silently_dropped(tmp_path: Path):
+    """B2 from independent review: `except Exception: continue` returned [].
+
+    The docstring claimed "every path either measures or raises". This one did neither
+    — it dropped the requirement, and `[]` is then written into the plan under a comment
+    asserting it means "asked, and the venv satisfies the target". Same value, two
+    meanings: the exact CLAWD-3655 shape this work exists to remove.
+
+    It now surfaces as a finding, so the apply refuses rather than proceeding on a
+    requirement nobody could evaluate.
+    """
+    rt, head = _runtime_with(tmp_path, ["definitely-not-real-xyz >= = 1.0"])
+    skew = _subject()._dependency_skew(rt, head)
+    assert skew, "an unparseable requirement vanished into a 'measured clean' []"
+    assert "unparseable requirement" in skew[0], skew
+
+
+def test_ROLLBACK_is_never_refused_for_dependency_skew(tmp_path: Path):
+    """B1 from independent review — the severest finding, and one I introduced.
+
+    `rollback` routes through `_apply`, so the skew check was evaluated against the
+    ROLLBACK target and refused the incident verb. The failure sequence is exactly the
+    one the venv-resync packet creates: resync the venv forward, advance, hit a
+    regression, then find rollback refused because the OLDER target pins the OLDER
+    cryptography — with the refusal telling the operator to resync the venv mid-incident
+    while 11 gateways sit on the bad commit.
+
+    Going backward to a commit the venv over-satisfies is the recovery path, not a
+    hazard: that code ran against these same packages until minutes ago.
+    """
+    import inspect
+
+    src = inspect.getsource(_subject()._apply)
+    assert "rollback_from is not None else _dependency_skew" in src, (
+        "the skew check is no longer short-circuited for rollback; the incident verb "
+        "can be refused for skew again"
+    )

@@ -470,10 +470,14 @@ def _target_main_dependencies(runtime: Path, target: str) -> list[str]:
     # with no pyproject.toml genuinely declares no main dependencies — that is a
     # MEASURED empty, and raising on it would refuse every apply whose target predates
     # the file. Caught by the deploy-half suite the moment the two were conflated.
-    listed = subprocess.run(
-        ["git", "-C", str(runtime), "ls-tree", "-r", "--name-only", "-z", target, "--", "pyproject.toml"],
-        capture_output=True,
-        text=True,
+    # Through _git(), not a bare subprocess: every other git call in this module runs
+    # under GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL=/dev/null / GIT_TERMINAL_PROMPT=0 /
+    # a fixed PATH. These two were added bare and inherited the caller's environment —
+    # the same exposure class this commit's own probe-sanitisation exists to close,
+    # reproduced one function up. An exported GIT_DIR was measured changing the answer.
+    listed = _git(
+        runtime, "ls-tree", "-r", "--name-only", "-z", target, "--", ":(top)pyproject.toml",
+        check=False,
     )
     if listed.returncode != 0:
         raise UpdateError(
@@ -481,11 +485,7 @@ def _target_main_dependencies(runtime: Path, target: str) -> list[str]:
         )
     if not [p for p in listed.stdout.split("\0") if p]:
         return []  # measured: the target declares no pyproject at all
-    proc = subprocess.run(
-        ["git", "-C", str(runtime), "show", f"{target}:pyproject.toml"],
-        capture_output=True,
-        text=True,
-    )
+    proc = _git(runtime, "show", f"{target}:pyproject.toml", check=False)
     if proc.returncode != 0:
         raise UpdateError(
             f"target {target} has a pyproject.toml that cannot be read: "
@@ -543,12 +543,14 @@ def _dependency_skew(runtime: Path, target: str) -> list[str]:
         "for raw in json.loads(sys.argv[1]):\n"
         "    if Requirement is not None:\n"
         "        try: req=Requirement(raw)\n"
-        "        except Exception: continue\n"
+        "        except Exception:\n"
+        "            out.append(raw+': unparseable requirement — the runtime cannot evaluate it'); continue\n"
         "        if req.marker is not None and not req.marker.evaluate(): continue\n"
         "        name=req.name; spec=req.specifier\n"
         "    else:\n"
         "        m=re.match(r'^\\s*([A-Za-z0-9._-]+)', raw)\n"
-        "        if not m: continue\n"
+        "        if not m:\n"
+        "            out.append(raw+': unparseable requirement — the runtime cannot evaluate it'); continue\n"
         "        name=m.group(1); spec=None\n"
         "    try: have=version(name)\n"
         "    except PackageNotFoundError:\n"
@@ -1497,7 +1499,18 @@ def _apply(
     # The refusal deliberately lands BELOW the --dry-run early-return so a rehearsal
     # PRINTS the skew and then fails, rather than dying before the operator can see
     # what is wrong. Same reasoning the importable-orphan list is placed there.
-    skew = _dependency_skew(runtime, target)
+    # ROLLBACK IS NEVER GATED ON SKEW. rollback routes through _apply, so this used to
+    # be evaluated against the ROLLBACK target and refused the incident verb — in
+    # exactly the sequence the venv-resync packet creates: resync the venv forward,
+    # advance, hit a regression, then find rollback refusing because the older target
+    # pins the older cryptography. The refusal even told the operator to "resync the
+    # venv to the target" mid-incident, with 11 gateways on the bad commit. Found by
+    # independent review, reproduced end-to-end.
+    #
+    # Going BACKWARD to a commit the venv over-satisfies is the recovery path, not a
+    # hazard: the old code ran against these same packages until minutes ago. Skew is a
+    # forward-advance concern only.
+    skew = [] if rollback_from is not None else _dependency_skew(runtime, target)
     clean_preview = _clean_preview(runtime)
     # Both hazards below are surfaced in the plan BEFORE the dry-run early-return,
     # so `--dry-run` shows them and an operator sees them in the rehearsal.

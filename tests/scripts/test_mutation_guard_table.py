@@ -37,7 +37,7 @@ def _battery():
 
 def test_every_mutation_anchor_matches_the_subject_exactly_once():
     """A stale anchor makes the battery report 'killed' for a mutation it never applied."""
-    source = SUBJECT.read_text()
+    source = SUBJECT.read_text(encoding="utf-8")
     stale = []
     for mutation in _battery().MUTATIONS:
         count = source.count(mutation["old"])
@@ -73,7 +73,7 @@ def test_the_mutated_source_still_parses():
     """A mutation that breaks syntax reddens everything and proves nothing about a guard."""
     import ast
 
-    source = SUBJECT.read_text()
+    source = SUBJECT.read_text(encoding="utf-8")
     for mutation in _battery().MUTATIONS:
         mutated = source.replace(mutation["old"], mutation["new"], 1)
         try:

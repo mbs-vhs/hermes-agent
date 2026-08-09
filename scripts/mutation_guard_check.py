@@ -172,7 +172,7 @@ MUTATIONS: list[dict[str, str]] = [
 
 def _apply_mutation(tree: Path, mutation: dict[str, str]) -> None:
     subject = tree / SUBJECT_REL
-    text = subject.read_text()
+    text = subject.read_text(encoding="utf-8")
     count = text.count(mutation["old"])
     if count != 1:
         raise SystemExit(
@@ -180,7 +180,7 @@ def _apply_mutation(tree: Path, mutation: dict[str, str]) -> None:
             f"(expected exactly 1). The guard moved or was renamed — fix the table "
             f"rather than letting a mutation silently no-op."
         )
-    subject.write_text(text.replace(mutation["old"], mutation["new"], 1))
+    subject.write_text(text.replace(mutation["old"], mutation["new"], 1), encoding="utf-8")
 
 
 def _run_suite(tree: Path, stop_early: bool) -> int:

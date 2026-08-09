@@ -209,11 +209,12 @@ def test_an_unmeasurable_target_RAISES_rather_than_returning_empty(tmp_path: Pat
         raise AssertionError("an unresolvable target returned a value instead of raising")
 
 
-def test_the_importable_orphan_list_stays_in_the_plan(tmp_path: Path):
-    """Kept from the original test: it was computed and never acted on."""
-    mod = _subject()
-    src = SUBJECT.read_text()
-    assert '"importable_orphans_to_remove": importable_orphans' in src
+# REMOVED: test_the_importable_orphan_list_stays_in_the_plan. It grepped the subject's
+# source for '"importable_orphans_to_remove": importable_orphans' — a signature test, in
+# a file whose header forbids them, and (as review noted) MORE brittle than the string it
+# replaced. The property is covered behaviourally by
+# test_PIN_the_conversion_plan_names_the_importable_orphans_it_will_delete, which builds
+# a real plan and reads the field out of real JSON.
 
 
 def test_an_UNPARSEABLE_requirement_is_reported_not_silently_dropped(tmp_path: Path):
@@ -233,26 +234,9 @@ def test_an_UNPARSEABLE_requirement_is_reported_not_silently_dropped(tmp_path: P
     assert "unparseable requirement" in skew[0], skew
 
 
-def test_ROLLBACK_is_never_refused_for_dependency_skew(tmp_path: Path):
-    """B1 from independent review — the severest finding, and one I introduced.
-
-    `rollback` routes through `_apply`, so the skew check was evaluated against the
-    ROLLBACK target and refused the incident verb. The failure sequence is exactly the
-    one the venv-resync packet creates: resync the venv forward, advance, hit a
-    regression, then find rollback refused because the OLDER target pins the OLDER
-    cryptography — with the refusal telling the operator to resync the venv mid-incident
-    while 11 gateways sit on the bad commit.
-
-    Going backward to a commit the venv over-satisfies is the recovery path, not a
-    hazard: that code ran against these same packages until minutes ago.
-    """
-    import inspect
-
-    src = inspect.getsource(_subject()._apply)
-    assert "rollback_from is not None else _dependency_skew" in src, (
-        "the skew check is no longer short-circuited for rollback; the incident verb "
-        "can be refused for skew again"
-    )
+# test_ROLLBACK_is_never_refused_for_dependency_skew moved to the adversarial file as an
+# end-to-end test. It was pinned here by grepping `_apply`'s source, which is a signature
+# test for the severest finding in this branch — not good enough.
 
 
 def test_WITHOUT_packaging_the_probe_refuses_instead_of_silently_passing(tmp_path: Path):
@@ -267,10 +251,8 @@ def test_WITHOUT_packaging_the_probe_refuses_instead_of_silently_passing(tmp_pat
     the exact case this check exists for. It now refuses instead.
     """
     rt, head = _runtime_with(
-        tmp_path,
-        ["cryptography==48.0.1"],
-        installed={"cryptography": "46.0.7"},
-        with_packaging=False,
+        tmp_path, ["cryptography==48.0.1"],
+        installed={"cryptography": "46.0.7"}, with_packaging=False,
     )
     skew = _subject()._dependency_skew(rt, head)
     assert skew, "a version specifier went unevaluated and reported CLEAN"
@@ -280,10 +262,43 @@ def test_WITHOUT_packaging_the_probe_refuses_instead_of_silently_passing(tmp_pat
 def test_WITH_packaging_the_same_case_reports_the_real_version_skew(tmp_path: Path):
     """Control for the above: the normal production path names the actual mismatch."""
     rt, head = _runtime_with(
-        tmp_path,
-        ["cryptography==48.0.1"],
-        installed={"cryptography": "46.0.7"},
-        with_packaging=True,
+        tmp_path, ["cryptography==48.0.1"],
+        installed={"cryptography": "46.0.7"}, with_packaging=True,
     )
     skew = _subject()._dependency_skew(rt, head)
     assert len(skew) == 1 and "46.0.7" in skew[0], skew
+
+
+def test_a_pyproject_whose_project_is_not_a_table_RAISES_cleanly(tmp_path: Path):
+    """Was an unhandled AttributeError: raw traceback, exit 1, not UNMEASURED_EXIT(3)."""
+    rt, _ = _runtime_with(tmp_path, [])
+    # Root-level, not under [tool]: an earlier draft nested it and the guard never fired.
+    (rt / "pyproject.toml").write_text("project = 'not-a-table'\n")
+    _git(rt, "add", "-A")
+    _git(rt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "bad")
+    bad = _git(rt, "rev-parse", "HEAD").strip()
+    mod = _subject()
+    try:
+        mod._target_main_dependencies(rt, bad)
+    except mod.UpdateError as exc:
+        assert "not a table" in str(exc)
+    else:
+        raise AssertionError("a non-table [project] did not raise UpdateError")
+
+
+def test_non_string_dependency_entries_REFUSE_rather_than_being_dropped(tmp_path: Path):
+    """Silently dropping them under-counts the very thing being measured."""
+    rt, _ = _runtime_with(tmp_path, [])
+    (rt / "pyproject.toml").write_text(
+        "[project]\nname='x'\nversion='0'\ndependencies = ['ok-pkg', 123]\n"
+    )
+    _git(rt, "add", "-A")
+    _git(rt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "mixed")
+    head = _git(rt, "rev-parse", "HEAD").strip()
+    mod = _subject()
+    try:
+        mod._target_main_dependencies(rt, head)
+    except mod.UpdateError as exc:
+        assert "non-string" in str(exc)
+    else:
+        raise AssertionError("a non-string dependency entry was silently dropped")

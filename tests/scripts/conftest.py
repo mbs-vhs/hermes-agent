@@ -61,11 +61,11 @@ _DEFERRED_TESTS = {
     "_dependency_skew": {
         "test_update_opt_hermes_runtime_adversarial.py": (
             "test_PIN_dry_run_plan_carries_the_real_dependency_skew",
-            "test_PIN_dependency_skew_refuses_the_apply_and_the_flag_overrides",
+            "test_PIN_dependency_skew_refuses_the_apply_and_there_is_NO_override",
             "test_PIN_dependency_skew_asks_the_RUNTIME_venv_not_the_updater_interpreter",
             "test_PIN_the_dependency_probe_writes_no_bytecode_into_the_venv",
             "test_OBSERVED_requirement_shapes_are_parsed_by_packaging",
-            "test_OBSERVED_an_unreadable_target_pyproject_FAILS_OPEN",
+            "test_OBSERVED_a_target_declaring_no_STATIC_deps_measures_as_empty",
         ),
     },
     "_git_ignored": {

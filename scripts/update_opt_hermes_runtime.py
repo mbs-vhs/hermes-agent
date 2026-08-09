@@ -499,10 +499,24 @@ def _target_main_dependencies(runtime: Path, target: str) -> list[str]:
         doc = tomllib.loads(proc.stdout)
     except Exception as exc:
         raise UpdateError(f"target pyproject.toml is not parseable TOML: {exc}") from exc
-    deps = doc.get("project", {}).get("dependencies", [])
+    project = doc.get("project", {})
+    if not isinstance(project, dict):
+        # Was an unhandled AttributeError escaping the UpdateError contract: a raw
+        # traceback and exit 1, where runbooks branch on UNMEASURED_EXIT (3).
+        raise UpdateError("target pyproject.toml has a [project] that is not a table")
+    deps = project.get("dependencies", [])
     if not isinstance(deps, list):
         raise UpdateError("target [project].dependencies is not a list")
-    return [d for d in deps if isinstance(d, str)]
+    # Non-string entries were silently dropped, which is a quiet under-count of the
+    # thing being measured. Refuse instead: a dependency list this tool cannot read in
+    # full is not a list it can certify.
+    bad = [d for d in deps if not isinstance(d, str)]
+    if bad:
+        raise UpdateError(
+            f"target [project].dependencies has {len(bad)} non-string entry/entries; "
+            "the declared dependency set cannot be read in full"
+        )
+    return deps
 
 
 def _dependency_skew(runtime: Path, target: str) -> list[str]:
@@ -584,8 +598,12 @@ def _dependency_skew(runtime: Path, target: str) -> list[str]:
             "dependency-skew probe failed inside the runtime venv: "
             f"{_redact(proc.stderr.strip() or proc.stdout.strip())}"
         )
+    if not proc.stdout.strip():
+        # `json.loads(stdout or "[]")` turned a silent probe into a measured clean —
+        # the same []-on-unmeasured shape this function exists to remove.
+        raise UpdateError("dependency-skew probe produced no output")
     try:
-        return json.loads(proc.stdout or "[]")
+        return json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise UpdateError(f"dependency-skew probe emitted unparseable output: {exc}") from exc
 

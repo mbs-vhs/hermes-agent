@@ -253,3 +253,37 @@ def test_ROLLBACK_is_never_refused_for_dependency_skew(tmp_path: Path):
         "the skew check is no longer short-circuited for rollback; the incident verb "
         "can be refused for skew again"
     )
+
+
+def test_WITHOUT_packaging_the_probe_refuses_instead_of_silently_passing(tmp_path: Path):
+    """B3 from independent review, and the reason `with_packaging` existed.
+
+    That knob was added to both fixtures and never once passed False — a dead knob is
+    not coverage, which is how the fail-open below survived being written down as a
+    benign degradation.
+
+    Measured by review: without `packaging` the fallback stops evaluating version
+    specifiers, so `cryptography==48.0.1` against an installed 46.0.7 came back CLEAN —
+    the exact case this check exists for. It now refuses instead.
+    """
+    rt, head = _runtime_with(
+        tmp_path,
+        ["cryptography==48.0.1"],
+        installed={"cryptography": "46.0.7"},
+        with_packaging=False,
+    )
+    skew = _subject()._dependency_skew(rt, head)
+    assert skew, "a version specifier went unevaluated and reported CLEAN"
+    assert "packaging is not installed" in skew[0], skew
+
+
+def test_WITH_packaging_the_same_case_reports_the_real_version_skew(tmp_path: Path):
+    """Control for the above: the normal production path names the actual mismatch."""
+    rt, head = _runtime_with(
+        tmp_path,
+        ["cryptography==48.0.1"],
+        installed={"cryptography": "46.0.7"},
+        with_packaging=True,
+    )
+    skew = _subject()._dependency_skew(rt, head)
+    assert len(skew) == 1 and "46.0.7" in skew[0], skew

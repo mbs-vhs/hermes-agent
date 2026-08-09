@@ -651,7 +651,14 @@ def test_PIN_the_dependency_probe_writes_no_bytecode_into_the_venv(
         "    def contains(self, v, prereleases=False): return True\n"
         "class Requirement:\n"
         "    def __init__(self, raw):\n"
-        "        m = re.match(r'^\\\\s*([A-Za-z0-9._-]+)', raw)\n"
+        # NOTE: two backslashes here, not four. With four, the file received
+        # r'^\\s*(...)' — literal-backslash + zero-or-more 's' — so this fake
+        # Requirement raised ValueError on EVERY well-formed package name. The probe's
+        # old `except Exception: continue` swallowed that, so nothing was ever found and
+        # the precondition below ("the probe must actually run and find the package")
+        # was silently false, making the bytecode assertion vacuous. Surfaced only when
+        # the probe stopped failing open.
+        "        m = re.match(r'^\\s*([A-Za-z0-9._-]+)', raw)\n"
         "        if not m: raise ValueError(raw)\n"
         "        self.name = m.group(1); self.marker = None\n"
         "        self.specifier = _Spec()\n"

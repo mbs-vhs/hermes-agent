@@ -521,10 +521,20 @@ def _dependency_skew(runtime: Path, target: str) -> list[str]:
 
     FAIL-CLOSED, unlike the version deferred under CLAWD-3655. That one had four
     `return []` paths, so "clean" and "could not measure" were the same value. Every
-    path here either measures or raises. The one deliberate degradation is `packaging`
-    being absent from the runtime venv: the probe still detects an entirely ABSENT
-    dependency — which is the nemo-relay case, the one that breaks the fleet — and says
-    so, rather than blocking every apply over a missing helper library.
+    path here either measures or raises, INCLUDING the `packaging`-absent case.
+
+    An earlier draft of this docstring described that case as a benign degradation —
+    "the probe still detects an entirely ABSENT dependency". Independent review measured
+    that claim false in both directions: without `packaging` the fallback also stops
+    evaluating version specifiers, so the `cryptography 46.0.7 -> 48.0.1` case this
+    check exists for returns CLEAN; and it stops evaluating environment markers, so a
+    dependency that does not apply to this host is falsely reported as skew. A
+    degradation that silently loses the headline case is not a degradation, it is a
+    fail-open.
+
+    So: if `packaging` is missing and any requirement carries a specifier or marker, the
+    probe reports that it cannot evaluate them, and the apply refuses. The live /opt venv
+    has packaging 26.0 (measured), so this path is not the normal one.
     """
     requirements = _target_main_dependencies(runtime, target)
     if not requirements:
@@ -539,6 +549,10 @@ def _dependency_skew(runtime: Path, target: str) -> list[str]:
         "    from packaging.requirements import Requirement\n"
         "except Exception:\n"
         "    Requirement=None\n"
+        "if Requirement is None:\n"
+        "    unevaluable=[r for r in json.loads(sys.argv[1]) if any(c in r for c in '<>=!~;')]\n"
+        "    if unevaluable:\n"
+        "        print(json.dumps(['packaging is not installed in the runtime venv, so version specifiers and environment markers cannot be evaluated for: '+', '.join(sorted(unevaluable)[:10])])); sys.exit(0)\n"
         "out=[]\n"
         "for raw in json.loads(sys.argv[1]):\n"
         "    if Requirement is not None:\n"

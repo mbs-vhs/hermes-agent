@@ -302,3 +302,102 @@ def test_non_string_dependency_entries_REFUSE_rather_than_being_dropped(tmp_path
         assert "non-string" in str(exc)
     else:
         raise AssertionError("a non-string dependency entry was silently dropped")
+
+
+def test_a_finding_cannot_forge_a_second_FATAL_line_or_echo_a_CREDENTIAL(tmp_path: Path):
+    """BL-4: the B2 fix echoed the target's requirement string to the operator raw.
+
+    Two reproduced consequences: a newline fabricates a second `FATAL:` line in the
+    journal saying the opposite of the truth, and `pkg @ https://user:token@host/x.whl`
+    printed the credential verbatim. /opt applies run as root under systemd, so both land
+    in the journal. The module already had the policy — `_validate_remote_url` refuses
+    control characters, `_git` routes diagnostics through `_redact` — the fix just did not
+    apply it to the path it opened.
+    """
+    mod = _subject()
+    forged = mod._safe_finding("evil\nFATAL: dependency skew cleared, safe to proceed")
+    assert "\n" not in forged and "\r" not in forged, forged
+    assert "FATAL" not in forged.split("evil", 1)[1] or "\n" not in forged
+
+    leaked = mod._safe_finding("bad @ https://svcuser:s3cr3t-token@example.invalid/x.whl")
+    assert "s3cr3t-token" not in leaked, leaked
+
+    # The property is that it cannot forge a LOG LINE. main() prefixes "FATAL: " per
+    # line, so a newline in a finding creates a second one; the word appearing inline
+    # on a single line is harmless, and asserting its absence over-reached.
+    msg = mod._skew_refusal("deadbeef", ["evil\nFATAL: safe to proceed"])
+    assert "\n" not in msg and "\r" not in msg, f"a finding forged a log line: {msg!r}"
+
+
+def test_the_probe_ignores_metadata_sitting_in_the_CALLERS_cwd(tmp_path: Path):
+    """BL-5/BL-2: `python -c` puts cwd on sys.path — the channel the sanitised env closes.
+
+    Reproduced by review: a dist-info in the caller's working directory made a missing
+    dependency report as SATISFIED, and `[]` is then written into the plan under a comment
+    asserting it means "asked, and the venv satisfies the target". sudo preserves cwd.
+    """
+    import os
+
+    rt, head = _runtime_with(tmp_path, ["definitely-not-real-xyz>=1.0"])
+    poison = tmp_path / "poison"
+    (poison / "definitely_not_real_xyz-9.9.dist-info").mkdir(parents=True)
+    (poison / "definitely_not_real_xyz-9.9.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: definitely-not-real-xyz\nVersion: 9.9\n"
+    )
+    prev = os.getcwd()
+    os.chdir(poison)
+    try:
+        skew = _subject()._dependency_skew(rt, head)
+    finally:
+        os.chdir(prev)
+    assert skew, "a dist-info in the caller's cwd made a missing dependency look satisfied"
+
+
+def test_an_EMPTY_probe_stdout_raises_rather_than_reading_as_clean(tmp_path: Path):
+    """BL-5: the commit claimed this was revert-validated. It was not — no test existed.
+
+    A full revert to `json.loads(stdout or "[]")` left the whole suite green, on a branch
+    whose entire thesis is measured-zero versus could-not-measure.
+    """
+    import subprocess as sp
+
+    rt, head = _runtime_with(tmp_path, ["pytest"], installed={"pytest": "9.0.2"})
+    mod = _subject()
+    real = sp.run
+
+    def silent(*a, **kw):
+        proc = real(*a, **kw)
+        if a and isinstance(a[0], list) and "-c" in a[0]:
+            proc.stdout = ""
+        return proc
+
+    sp.run = silent
+    try:
+        mod.subprocess.run = silent
+        try:
+            mod._dependency_skew(rt, head)
+        except mod.UpdateError as exc:
+            assert "no output" in str(exc)
+        else:
+            raise AssertionError("an empty probe stdout was read as a measured clean")
+    finally:
+        sp.run = real
+        mod.subprocess.run = real
+
+
+def test_a_git_show_failure_RAISES_rather_than_reporting_no_dependencies(tmp_path: Path):
+    """M13 from the mutation battery: this raise-arm was revertible with the suite green."""
+    rt, head = _runtime_with(tmp_path, ["pytest"])
+    mod = _subject()
+    # A tree that lists pyproject.toml but whose blob cannot be read: point the pathspec
+    # at a real entry, then corrupt the object store for that blob.
+    blob = _git(rt, "rev-parse", f"{head}:pyproject.toml").strip()
+    obj = rt / ".git" / "objects" / blob[:2] / blob[2:]
+    if obj.exists():
+        obj.unlink()
+        try:
+            mod._target_main_dependencies(rt, head)
+        except mod.UpdateError as exc:
+            assert "cannot be read" in str(exc) or "not parseable" in str(exc)
+        else:
+            raise AssertionError("an unreadable pyproject blob reported no dependencies")

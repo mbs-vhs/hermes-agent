@@ -470,7 +470,7 @@ def _target_main_dependencies(runtime: Path, target: str) -> list[str]:
     # with no pyproject.toml genuinely declares no main dependencies — that is a
     # MEASURED empty, and raising on it would refuse every apply whose target predates
     # the file. Caught by the deploy-half suite the moment the two were conflated.
-    # Through _git(), not a bare subprocess: every other git call in this module runs
+    # Through _git(), not a bare subprocess: git calls in this module run
     # under GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL=/dev/null / GIT_TERMINAL_PROMPT=0 /
     # a fixed PATH. These two were added bare and inherited the caller's environment —
     # the same exposure class this commit's own probe-sanitisation exists to close,
@@ -592,6 +592,12 @@ def _dependency_skew(runtime: Path, target: str) -> list[str]:
         capture_output=True,
         text=True,
         env={"PATH": "/usr/bin:/bin", "HOME": "/var/empty", "PYTHONDONTWRITEBYTECODE": "1"},
+        # `python -c` puts CWD on sys.path — the same channel the sanitised env exists to
+        # close. Review reproduced a dist-info in the caller's cwd reporting a missing
+        # dependency as SATISFIED. sudo preserves cwd and both /opt/hermes-agent and the
+        # fork root carry a top-level hermes_agent.egg-info, so real working directories
+        # do carry discoverable metadata.
+        cwd="/",
     )
     if proc.returncode != 0:
         raise UpdateError(
@@ -608,6 +614,37 @@ def _dependency_skew(runtime: Path, target: str) -> list[str]:
         raise UpdateError(f"dependency-skew probe emitted unparseable output: {exc}") from exc
 
 
+def _safe_finding(raw: str) -> str:
+    """Make a probe finding safe to put in an operator-facing message.
+
+    The finding embeds the target's own requirement string. Review reproduced two
+    problems with echoing it raw: a newline fabricates a second `FATAL:` line in the
+    journal saying the opposite of the truth, and a requirement of the form
+    `pkg @ https://user:token@host/x.whl` printed the credential verbatim. Both land in
+    the journal because /opt applies run as root under systemd.
+
+    This module already had the policy — `_validate_remote_url` refuses control
+    characters and `_git` routes diagnostics through `_redact` — the B2 fix just did not
+    apply it to the new path it opened.
+    """
+    collapsed = raw.replace("\r", " ").replace("\n", " ").replace("\x00", " ")
+    return _redact(collapsed)
+
+
+def _is_ancestor(runtime: Path, maybe_ancestor: str, descendant: str) -> bool:
+    """True when `maybe_ancestor` is reachable from `descendant` — i.e. we move BACKWARD.
+
+    Fail-closed: anything git cannot answer is reported as NOT backward, so the skew
+    refusal applies. A rollback that cannot be proven backward is treated as an advance.
+    """
+    if not descendant:
+        return False
+    proc = _git(
+        runtime, "merge-base", "--is-ancestor", maybe_ancestor, descendant, check=False
+    )
+    return proc.returncode == 0
+
+
 def _skew_refusal(target: str, skew: list[str]) -> str:
     """One wording for both the dry-run and the real refusal, so they cannot drift.
 
@@ -620,7 +657,7 @@ def _skew_refusal(target: str, skew: list[str]) -> str:
         f"target {target} declares {len(skew)} main dependency/dependencies the live "
         "venv cannot satisfy; advancing source alone would break every gateway at "
         "start. Resync the runtime venv to the target, then re-run: "
-        + "; ".join(skew[:10])
+        + "; ".join(_safe_finding(s) for s in skew[:10])
     )
 
 
@@ -1135,9 +1172,9 @@ def _target_tracks_under_venv(runtime: Path, target: str) -> list[str]:
     This is the hole the clean-side exclusion cannot see, found by an independent
     tester after two review rounds had passed over the exclusion itself.
     """
-    proc = subprocess.run(
-        ["git", "-C", str(runtime), "ls-tree", "-r", "--name-only", "-z", target, "--", "venv"],
-        capture_output=True, text=True,
+    proc = _git(
+        runtime, "ls-tree", "-r", "--name-only", "-z", target, "--", ":(top)venv",
+        check=False,
     )
     if proc.returncode != 0:
         # Could not measure. The caller treats a non-empty list as a refusal, so
@@ -1542,7 +1579,14 @@ def _apply(
     # Going BACKWARD to a commit the venv over-satisfies is the recovery path, not a
     # hazard: the old code ran against these same packages until minutes ago. Skew is a
     # forward-advance concern only.
-    skew = [] if rollback_from is not None else _dependency_skew(runtime, target)
+    # DIRECTION, not verb. The first attempt keyed this on `rollback_from is not None`
+    # — "is this the rollback verb" — and review reproduced the hole: rollback writes its
+    # own receipt, and feeding a ROLLBACK's receipt back to `rollback` is a forward
+    # advance with this refusal skipped, landing the fleet on a commit the venv cannot
+    # run. `_validate_update_receipt` never checks the receipt's action, so nothing else
+    # catches it. Ask git which way we are moving instead.
+    moving_backward = rollback_from is not None and _is_ancestor(runtime, target, before_head)
+    skew = [] if moving_backward else _dependency_skew(runtime, target)
     clean_preview = _clean_preview(runtime)
     # Both hazards below are surfaced in the plan BEFORE the dry-run early-return,
     # so `--dry-run` shows them and an operator sees them in the rehearsal.
@@ -1571,7 +1615,7 @@ def _apply(
         # to remove. It is back only because there is a real measurement behind it: an
         # unmeasurable probe now raises before this dict is built, so [] here means
         # "asked, and the venv satisfies the target".
-        "dependency_skew": skew,
+        "dependency_skew": [_safe_finding(s) for s in skew],
         "restart_performed": False,
     }
 

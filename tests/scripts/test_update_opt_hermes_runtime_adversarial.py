@@ -1331,3 +1331,59 @@ def test_ROLLBACK_is_never_refused_for_dependency_skew(world):
         "rollback was refused for dependency skew against the rollback target — the "
         "incident verb is disabled in exactly the situation it exists for"
     )
+
+
+def test_ROLLBACK_of_a_ROLLBACK_is_still_refused_for_skew(world):
+    """BL-1: the skew bypass must key on DIRECTION, not on the verb.
+
+    The first fix used `rollback_from is not None` — "is this the rollback verb". Review
+    reproduced the hole: rollback writes its OWN receipt, and replaying that receipt is a
+    FORWARD advance with the branch's headline refusal skipped, landing the fleet on a
+    commit whose declared dependency the venv lacks. `_validate_update_receipt` never
+    inspects the receipt's action, so nothing else catches it.
+
+    Ordering matters here: the FORWARD target must be the unsatisfiable one, or there is
+    no skew on the replayed move and the test proves nothing. A first draft had it the
+    other way round and passed against the defect.
+    """
+    _bootstrap(world)
+    runtime = world["runtime"]
+    _venvify(runtime, installed={"revpkg": "1.0"})
+    import sys as _s
+    site = runtime / "venv" / "lib" / f"python{_s.version_info.major}.{_s.version_info.minor}" / "site-packages"
+    info = site / "revpkg-1.0.dist-info"
+
+    t_old = _new_target(world, gitignore=IGNORES_VENV, deps="[]")
+    _git(runtime, "fetch", "-q", "origin")
+    assert _steady_apply(world, t_old) == 0
+    # FORWARD target declares the package; the venv has it, so advancing is allowed.
+    t_new = _new_target(world, gitignore=IGNORES_VENV, deps='["revpkg==1.0"]',
+                        body="VERSION_C\n")
+    _git(runtime, "fetch", "-q", "origin")
+    assert _steady_apply(world, t_new) == 0
+
+    def _rollback(receipt):
+        return updater.main([
+            "rollback", "--runtime", str(runtime), "--update-receipt", str(receipt),
+            "--backup-receipt",
+            str(_backup_receipt(world["scratch"], runtime, f"rb{time.time_ns()}")),
+            "--receipt-dir", str(world["receipts"]),
+            "--transaction-dir", str(world["transactions"]),
+            "--lock-file", str(world["lock"]),
+        ])
+
+    r2 = sorted(world["receipts"].glob("*.json"))[-1]
+    assert _rollback(r2) == 0, "the legitimate BACKWARD rollback was refused"
+    assert updater._head(runtime) == t_old
+
+    # The operator now resyncs/prunes the venv. t_new is no longer runnable.
+    shutil.rmtree(info)
+    r3 = sorted(world["receipts"].glob("*.json"))[-1]
+
+    rc = _rollback(r3)
+    assert rc != 0, (
+        "replaying a ROLLBACK's own receipt moved the fleet FORWARD to a target the venv "
+        "cannot satisfy, with the skew refusal skipped — the bypass is keyed on the verb "
+        "rather than the direction of travel"
+    )
+    assert updater._head(runtime) == t_old, "HEAD moved despite the refusal"

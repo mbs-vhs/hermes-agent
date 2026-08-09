@@ -53,6 +53,34 @@ DROPS_VENV = "__pycache__/\nlogs/\n"
 # ─────────────────────────────── fixtures ────────────────────────────────────
 
 
+
+def _venvify(runtime, installed=None, with_packaging=True):
+    """Make `<runtime>/venv` resolve like a REAL venv for the sanitised probe.
+
+    A bare `venv/bin/python -> sys.executable` symlink is not a venv: python derives
+    sys.prefix from the symlink's own location, so there is no site-packages behind it.
+    That only ever worked because the probe inherited the caller's environment. The
+    probe is now sanitised on purpose — a leaked PYTHONPATH could report a dependency
+    SATISFIED that the gateway, under a clean systemd environment, will not find.
+    """
+    import sys as _s
+    from pathlib import Path as _P
+    (runtime / "venv" / "pyvenv.cfg").write_text(
+        f"home = {_P(_s.base_prefix) / 'bin'}\n"
+        f"include-system-site-packages = false\n"
+        f"version = {_s.version.split()[0]}\n"
+    )
+    site = runtime / "venv" / "lib" / f"python{_s.version_info.major}.{_s.version_info.minor}" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    for name, ver in (installed or {}).items():
+        info = site / f"{name.replace('-', '_')}-{ver}.dist-info"
+        info.mkdir(exist_ok=True)
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+        (info / "RECORD").write_text("")
+    if with_packaging:
+        import packaging as _pkg
+        (site / "packaging").symlink_to(_P(_pkg.__file__).parent, target_is_directory=True)
+
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
@@ -420,10 +448,13 @@ def test_PIN_dry_run_plan_carries_the_real_dependency_skew(world):
     assert "definitely-not-a-real-package-xyz" in refused.stderr, (
         f"the refusal does not name the unsatisfied package: {refused.stderr!r}"
     )
-
-    accepted = rehearse("--accept-dependency-skew")
-    assert accepted.returncode == 0, accepted.stderr
-    plan = json.loads(accepted.stdout)
+    # THE FIX THIS TEST ASKED FOR. It used to observe that the refusal ran BEFORE the
+    # --dry-run early return, so a plain rehearsal "prints no plan at all — it
+    # refuses", and the plan was only visible via --accept-dependency-skew. The
+    # refusal now lands BELOW the early return: the rehearsal prints the plan, THEN
+    # fails. So the operator sees exactly what is wrong without needing an override —
+    # and the override is gone, deliberately.
+    plan = json.loads(refused.stdout)
     assert plan["dependency_skew"], (
         "the plan shows no dependency skew although the target declares a package "
         "the live venv does not have — an operator rehearsing this advance sees a "
@@ -433,6 +464,7 @@ def test_PIN_dry_run_plan_carries_the_real_dependency_skew(world):
         "definitely-not-a-real-package-xyz" in s for s in plan["dependency_skew"]
     )
     assert plan["restart_performed"] is False
+    assert plan["dry_run"] is True
 
 
 def test_PIN_the_conversion_plan_names_the_importable_orphans_it_will_delete(world):
@@ -489,11 +521,18 @@ def test_PIN_the_conversion_plan_names_the_importable_orphans_it_will_delete(wor
     )
 
 
-def test_PIN_dependency_skew_refuses_the_apply_and_the_flag_overrides(world):
+def test_PIN_dependency_skew_refuses_the_apply_and_there_is_NO_override(world):
     """The refusal itself — the point of the commit — had no test at all.
 
-    Deleting the `if skew and not args.accept_dependency_skew: raise` block leaves
-    the whole pre-existing suite green.
+    CONTRACT CHANGED DELIBERATELY. This previously also asserted that
+    `--accept-dependency-skew` lets an operator proceed, on the reasoning that a
+    refusal without an override "is a wall rather than a gate". The flag is gone and
+    the wall is intended: this branch shipped two advertised-but-inert `--accept-*`
+    flags already, and the honest remedy for skew is to resync the runtime venv to the
+    target, not to wave through a finding on the way to breaking eleven gateways.
+    An override can come back when something actually rebuilds the venv — it needs
+    wiring AND a test that it changes behaviour, which is exactly what the two dead
+    flags lacked.
     """
     _bootstrap(world)
     runtime = world["runtime"]
@@ -509,11 +548,16 @@ def test_PIN_dependency_skew_refuses_the_apply_and_the_flag_overrides(world):
     )
     assert updater._head(runtime) == head_before, "the refusal still moved HEAD"
 
-    assert _steady_apply(world, target, "--accept-dependency-skew") == 0, (
-        "--accept-dependency-skew no longer lets an operator proceed on a skew they "
-        "have judged benign, so the refusal is a wall rather than a gate"
+    # No override exists, and passing one is an argparse error rather than a silent
+    # no-op — the failure mode of the two dead flags this branch already shipped.
+    with pytest.raises(SystemExit) as exit_info:
+        _steady_apply(world, target, "--accept-dependency-skew")
+    assert exit_info.value.code == 2, (
+        "an --accept-dependency-skew override is live again; argparse should reject "
+        "the flag outright rather than the tool silently ignoring it, which is how "
+        "the two dead --accept-* flags on this branch failed"
     )
-    assert updater._head(runtime) == target
+    assert updater._head(runtime) == head_before, "HEAD moved despite the refusal"
 
 
 def test_PIN_dependency_skew_asks_the_RUNTIME_venv_not_the_updater_interpreter(
@@ -1151,18 +1195,50 @@ def test_OBSERVED_requirement_shapes_are_parsed_by_packaging(
     head = _commit(runtime, "t")
     (runtime / "venv" / "bin").mkdir(parents=True)
     (runtime / "venv" / "bin" / "python").symlink_to(sys.executable)
+    # pytest present so the "installed, extra does not exist" case is really satisfied,
+    # and packaging present so markers are evaluated rather than ignored.
+    _venvify(runtime, installed={"pytest": "9.0.2"})
     assert bool(updater._dependency_skew(runtime, head)) is expected_skew
+
+
+def test_a_target_whose_pyproject_is_UNPARSEABLE_now_RAISES(tmp_path):
+    """The case removed from the parametrize above, kept as its own assertion.
+
+    It used to be one of three "FAILS_OPEN" cases returning `[]` — indistinguishable
+    from "measured, no skew". That test's own docstring said it pinned the behaviour
+    "so a change is deliberate" and was "NOT an endorsement". This is the deliberate
+    change: unreadable is not clean, so it raises.
+
+    The other two cases stay empty on purpose. A target with `dynamic = ['dependencies']`
+    or no [project] table declares no STATIC main dependencies, which is a measured
+    answer, not a failure to measure. hermes-agent does not use dynamic deps today.
+    """
+    runtime = tmp_path / "rt"
+    runtime.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(runtime)], check=True)
+    (runtime / "pyproject.toml").write_text("[project\nname='x'\n")   # malformed TOML
+    (runtime / "keep.txt").write_text("so the commit is never empty\n")
+    head = _commit(runtime, "t")
+    (runtime / "venv" / "bin").mkdir(parents=True)
+    (runtime / "venv" / "bin" / "python").symlink_to(sys.executable)
+    _venvify(runtime)
+
+    with pytest.raises(updater.UpdateError) as err:
+        updater._target_main_dependencies(runtime, head)
+    assert "not parseable" in str(err.value)
+
+    with pytest.raises(updater.UpdateError):
+        updater._dependency_skew(runtime, head)
 
 
 @pytest.mark.parametrize(
     "pyproject",
     [
-        "[project\nname='x'\n",                                  # malformed TOML
         "[project]\nname='x'\nversion='0'\ndynamic=['dependencies']\n",
         "",                                                       # empty
     ],
 )
-def test_OBSERVED_an_unreadable_target_pyproject_FAILS_OPEN(tmp_path, pyproject):
+def test_OBSERVED_a_target_declaring_no_STATIC_deps_measures_as_empty(tmp_path, pyproject):
     """Stated rather than hidden: this is a fail-OPEN path in a fail-closed tool.
 
     `_target_main_dependencies` returns `[]` — and therefore "no skew", and therefore

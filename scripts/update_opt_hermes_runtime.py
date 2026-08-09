@@ -452,6 +452,144 @@ def _status_lines(runtime: Path) -> list[str]:
     return proc.stdout.splitlines()
 
 
+def _target_main_dependencies(runtime: Path, target: str) -> list[str]:
+    """`[project].dependencies` of the TARGET commit — main deps only, not extras.
+
+    Read from git, never from the worktree: at check time the worktree is still at the
+    OLD commit, which is exactly the state whose pyproject must not be trusted.
+
+    FAIL-CLOSED. An earlier version of this returned `[]` on every error — unreadable
+    pyproject, missing tomllib, parse failure. `[]` also means "the target declares no
+    dependencies", so a consumer could not tell "measured, nothing to do" from "could
+    not measure". That is the exact shape CLAWD-3655 was written to remove, and it is
+    why this function raises instead. Only a genuinely absent/empty `dependencies` key
+    returns an empty list.
+    """
+    # ABSENT and UNREADABLE are different answers and must not collapse together.
+    # `git show` exits non-zero for both, so existence is asked separately. A target
+    # with no pyproject.toml genuinely declares no main dependencies — that is a
+    # MEASURED empty, and raising on it would refuse every apply whose target predates
+    # the file. Caught by the deploy-half suite the moment the two were conflated.
+    listed = subprocess.run(
+        ["git", "-C", str(runtime), "ls-tree", "-r", "--name-only", "-z", target, "--", "pyproject.toml"],
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode != 0:
+        raise UpdateError(
+            f"cannot list the target tree at {target}: {_redact(listed.stderr.strip())}"
+        )
+    if not [p for p in listed.stdout.split("\0") if p]:
+        return []  # measured: the target declares no pyproject at all
+    proc = subprocess.run(
+        ["git", "-C", str(runtime), "show", f"{target}:pyproject.toml"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise UpdateError(
+            f"target {target} has a pyproject.toml that cannot be read: "
+            f"{_redact(proc.stderr.strip())}"
+        )
+    try:
+        import tomllib
+    except ModuleNotFoundError as exc:  # pragma: no cover - py<3.11
+        raise UpdateError("tomllib unavailable; dependency skew is unmeasurable") from exc
+    try:
+        doc = tomllib.loads(proc.stdout)
+    except Exception as exc:
+        raise UpdateError(f"target pyproject.toml is not parseable TOML: {exc}") from exc
+    deps = doc.get("project", {}).get("dependencies", [])
+    if not isinstance(deps, list):
+        raise UpdateError("target [project].dependencies is not a list")
+    return [d for d in deps if isinstance(d, str)]
+
+
+def _dependency_skew(runtime: Path, target: str) -> list[str]:
+    """Main dependencies the target declares that the live venv cannot satisfy.
+
+    THE GAP THIS CLOSES. This tool advances SOURCE ONLY and deliberately preserves the
+    venv — correct, because the venv holds the interpreter all 11 gateways execute. But
+    the units run `-m` with cwd at the runtime root, so the TREE shadows site-packages:
+    advancing source really does change the code that runs, against the OLD environment.
+
+    Measured on the real fleet, advancing the current pin to origin/main:
+      cryptography  46.0.7 -> 48.0.1
+      nemo-relay    ABSENT -> required (>=0.6.0,<0.7; its marker matches this host)
+    Without this check that lands as an import-time failure across all 11 gateways, at
+    the moment the tool reports success.
+
+    FAIL-CLOSED, unlike the version deferred under CLAWD-3655. That one had four
+    `return []` paths, so "clean" and "could not measure" were the same value. Every
+    path here either measures or raises. The one deliberate degradation is `packaging`
+    being absent from the runtime venv: the probe still detects an entirely ABSENT
+    dependency — which is the nemo-relay case, the one that breaks the fleet — and says
+    so, rather than blocking every apply over a missing helper library.
+    """
+    requirements = _target_main_dependencies(runtime, target)
+    if not requirements:
+        return []
+    python = runtime / "venv" / "bin" / "python"
+    if not python.exists():
+        raise UpdateError(f"runtime venv interpreter is missing: {python}")
+    probe = (
+        "import json,sys,re\n"
+        "from importlib.metadata import version, PackageNotFoundError\n"
+        "try:\n"
+        "    from packaging.requirements import Requirement\n"
+        "except Exception:\n"
+        "    Requirement=None\n"
+        "out=[]\n"
+        "for raw in json.loads(sys.argv[1]):\n"
+        "    if Requirement is not None:\n"
+        "        try: req=Requirement(raw)\n"
+        "        except Exception: continue\n"
+        "        if req.marker is not None and not req.marker.evaluate(): continue\n"
+        "        name=req.name; spec=req.specifier\n"
+        "    else:\n"
+        "        m=re.match(r'^\\s*([A-Za-z0-9._-]+)', raw)\n"
+        "        if not m: continue\n"
+        "        name=m.group(1); spec=None\n"
+        "    try: have=version(name)\n"
+        "    except PackageNotFoundError:\n"
+        "        out.append(name+': declared by the target, NOT INSTALLED in the runtime venv'); continue\n"
+        "    if spec is not None and str(spec) and not spec.contains(have, prereleases=True):\n"
+        "        out.append(name+': target requires '+str(spec)+', venv has '+have)\n"
+        "print(json.dumps(out))\n"
+    )
+    proc = subprocess.run(
+        [str(python), "-c", probe, json.dumps(requirements)],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/var/empty", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    if proc.returncode != 0:
+        raise UpdateError(
+            "dependency-skew probe failed inside the runtime venv: "
+            f"{_redact(proc.stderr.strip() or proc.stdout.strip())}"
+        )
+    try:
+        return json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise UpdateError(f"dependency-skew probe emitted unparseable output: {exc}") from exc
+
+
+def _skew_refusal(target: str, skew: list[str]) -> str:
+    """One wording for both the dry-run and the real refusal, so they cannot drift.
+
+    There is deliberately NO --accept-dependency-skew escape hatch. This branch has
+    already shipped two advertised-but-inert `--accept-*` flags, and the honest remedy
+    for skew is to resync the runtime venv to the target, not to wave the finding
+    through on the way to breaking eleven gateways.
+    """
+    return (
+        f"target {target} declares {len(skew)} main dependency/dependencies the live "
+        "venv cannot satisfy; advancing source alone would break every gateway at "
+        "start. Resync the runtime venv to the target, then re-run: "
+        + "; ".join(skew[:10])
+    )
+
+
 def _venv_guard(runtime: Path) -> dict[str, Any]:
     venv = runtime / "venv"
     python = venv / "bin" / "python"
@@ -1349,6 +1487,17 @@ def _apply(
             "`reset --hard` would write them over the live interpreter every gateway "
             "runs: " + ", ".join(tracked_under_venv[:10])
         )
+    # MEASURED here, REFUSED after the plan prints. The tree shadows site-packages, so
+    # advancing source runs new code against the old environment; a target declaring a
+    # dependency the venv lacks fails at gateway start, on 11 units, AFTER this tool
+    # reports success. Measured on the live fleet right now: the venv has
+    # cryptography 46.0.7 and origin/main requires 48.0.1, plus nemo-relay is absent
+    # and becomes a main dependency whose marker matches this host.
+    #
+    # The refusal deliberately lands BELOW the --dry-run early-return so a rehearsal
+    # PRINTS the skew and then fails, rather than dying before the operator can see
+    # what is wrong. Same reasoning the importable-orphan list is placed there.
+    skew = _dependency_skew(runtime, target)
     clean_preview = _clean_preview(runtime)
     # Both hazards below are surfaced in the plan BEFORE the dry-run early-return,
     # so `--dry-run` shows them and an operator sees them in the rehearsal.
@@ -1371,6 +1520,13 @@ def _apply(
         "clean_preview": clean_preview,
         "backup_receipt": str(args.backup_receipt),
         "importable_orphans_to_remove": importable_orphans,
+        # A MEASURED value, always. When the narrowing removed the check this field was
+        # left emitting a hardcoded [], and it was deleted on the grounds that "a
+        # consumer reads [] as a measured zero" — the fail-open shape CLAWD-3655 exists
+        # to remove. It is back only because there is a real measurement behind it: an
+        # unmeasurable probe now raises before this dict is built, so [] here means
+        # "asked, and the venv satisfies the target".
+        "dependency_skew": skew,
         "restart_performed": False,
     }
 
@@ -1391,7 +1547,12 @@ def _apply(
     if args.dry_run:
         plan["dry_run"] = True
         print(_canonical_json(plan), end="")
+        if skew:
+            raise UpdateError(_skew_refusal(target, skew))
         return 0
+
+    if skew:
+        raise UpdateError(_skew_refusal(target, skew))
 
     transaction_path, transaction = _begin_transaction(
         args,

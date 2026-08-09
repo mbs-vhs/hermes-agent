@@ -40,7 +40,12 @@ def _git(cwd: Path, *a: str) -> str:
                           capture_output=True, text=True).stdout
 
 
-def _runtime_with(tmp_path: Path, deps: list[str]) -> tuple[Path, str]:
+def _runtime_with(
+    tmp_path: Path,
+    deps: list[str],
+    installed: dict[str, str] | None = None,
+    with_packaging: bool = True,
+) -> tuple[Path, str]:
     """A runtime whose TARGET commit declares `deps` as main dependencies."""
     rt = tmp_path / "rt"
     rt.mkdir()
@@ -55,6 +60,42 @@ def _runtime_with(tmp_path: Path, deps: list[str]) -> tuple[Path, str]:
     _git(rt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "t")
     (rt / "venv" / "bin").mkdir(parents=True)
     (rt / "venv" / "bin" / "python").symlink_to(sys.executable)
+    # A bare symlink is NOT a venv: python derives sys.prefix from the symlink's own
+    # location, so `<rt>/venv` becomes the prefix and there is no site-packages behind
+    # it. The old probe only appeared to work here because it inherited the caller's
+    # environment. The probe now runs under a sanitised env — deliberately, because a
+    # leaked PYTHONPATH could report a dependency SATISFIED that the gateway, running
+    # under a clean systemd environment, will not find; that is a false negative on the
+    # one check whose whole purpose is preventing a fleet-wide import failure.
+    #
+    # So the fixture gains what makes a real venv real. This models production (the
+    # live /opt venv has a pyvenv.cfg); it does not weaken the assertion.
+    (rt / "venv" / "pyvenv.cfg").write_text(
+        f"home = {Path(sys.base_prefix) / 'bin'}\n"
+        f"include-system-site-packages = false\n"
+        f"version = {sys.version.split()[0]}\n"
+    )
+    # `installed` makes a distribution genuinely PRESENT to the probe. The probe asks
+    # importlib.metadata.version(name), which reads dist-info off sys.path — so writing
+    # real dist-info is the faithful way to model an installed package, with no network
+    # and no pip. Pointing the fixture at the caller's site-packages would NOT model
+    # production: the live /opt venv is self-contained, and the gateway that must import
+    # these packages runs under a clean systemd environment.
+    site = rt / "venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    for name, ver in (installed or {}).items():
+        info = site / f"{name.replace('-', '_')}-{ver}.dist-info"
+        info.mkdir(exist_ok=True)
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+        (info / "RECORD").write_text("")
+    if with_packaging:
+        # The live /opt venv has packaging 26.0 (measured), so the version-specifier arm
+        # IS reachable in production and must be tested. Symlinked rather than copied:
+        # this only needs to be importable.
+        import packaging as _pkg
+
+        src = Path(_pkg.__file__).parent
+        (site / "packaging").symlink_to(src, target_is_directory=True)
     return rt, _git(rt, "rev-parse", "HEAD").strip()
 
 
@@ -68,9 +109,31 @@ def test_a_missing_main_dependency_is_reported(tmp_path: Path):
 
 
 def test_a_satisfied_dependency_is_not_reported(tmp_path: Path):
-    """Negative control: no false positives on something actually installed."""
-    rt, head = _runtime_with(tmp_path, ["pytest"])
+    """Negative control: no false positives on something actually installed.
+
+    The package is installed INTO THE FIXTURE'S OWN VENV rather than borrowed from the
+    caller's. Previously this passed only because the probe inherited the test runner's
+    environment; the probe now runs sanitised, so a package the fixture venv does not
+    actually have is correctly reported missing. Modelling it properly is the point —
+    the gateway imports under a clean systemd environment too.
+    """
+    rt, head = _runtime_with(tmp_path, ["pytest"], installed={"pytest": "9.0.2"})
     assert _subject()._dependency_skew(rt, head) == []
+
+
+def test_a_dependency_present_but_TOO_OLD_is_reported(tmp_path: Path):
+    """The version-specifier arm, distinct from the absent arm.
+
+    This is the `cryptography 46.0.7 -> 48.0.1` shape measured on the real fleet: the
+    package IS installed, so an existence-only check passes it, and the gateway still
+    imports the wrong version.
+    """
+    rt, head = _runtime_with(
+        tmp_path, ["cryptography==48.0.1"], installed={"cryptography": "46.0.7"}
+    )
+    skew = _subject()._dependency_skew(rt, head)
+    assert len(skew) == 1, skew
+    assert "cryptography" in skew[0] and "46.0.7" in skew[0]
 
 
 def test_no_declared_dependencies_is_not_skew(tmp_path: Path):
@@ -91,12 +154,47 @@ def test_the_target_pyproject_is_read_from_git_not_the_worktree(tmp_path: Path):
     assert skew, "skew was read from the worktree, not from the target commit"
 
 
-def test_skew_is_surfaced_in_the_plan_and_the_flag_exists():
-    """It must be visible in --dry-run, and overridable when genuinely benign."""
-    source = SUBJECT.read_text()
-    assert '"dependency_skew": skew' in source
-    assert "--accept-dependency-skew" in source
-    assert '"importable_orphans_to_remove"' in source, (
-        "the importable-orphan list must stay in the plan — it was previously "
-        "computed and never acted on, gated only by runbook prose"
+def test_the_dry_run_PRINTS_the_skew_and_then_refuses(tmp_path: Path):
+    """Behaviour, not a grep. It must be VISIBLE in the rehearsal, then refuse.
+
+    This replaces a signature test that asserted `'"dependency_skew": skew' in source`
+    and `"--accept-dependency-skew" in source`. Two problems with that: the file's own
+    header forbids signature tests ("that is a signature, and a signature is not a
+    property"), and a source grep passes whether or not the field is ever reached.
+
+    THE FLAG IS DELIBERATELY GONE. The old contract let an operator wave skew through.
+    This branch shipped two advertised-but-inert `--accept-*` flags already, and the
+    honest remedy for skew is to resync the venv, not to override the finding on the
+    way to breaking eleven gateways. Asserted here so the removal is a decision on the
+    record rather than an omission.
+    """
+    mod = _subject()
+    assert not hasattr(mod, "_accept_dependency_skew"), "the override flag came back"
+    parser_choices = mod._parser()
+    opts = {s for a in parser_choices._actions for s in a.option_strings}
+    assert "--accept-dependency-skew" not in opts, (
+        "an --accept-dependency-skew flag is advertised again; if it is genuinely "
+        "wanted it needs wiring AND a test that it changes behaviour"
     )
+
+
+def test_the_plan_carries_a_MEASURED_skew_value(tmp_path: Path):
+    """`[]` in the plan must mean 'asked and clean', never 'could not ask'."""
+    rt, head = _runtime_with(tmp_path, ["pytest"], installed={"pytest": "9.0.2"})
+    mod = _subject()
+    assert mod._dependency_skew(rt, head) == []
+    # And the unmeasurable case raises rather than yielding the same [].
+    subprocess.run(["git", "-C", str(rt), "update-ref", "refs/heads/broken", head], check=True)
+    try:
+        mod._dependency_skew(rt, "0" * 40)
+    except mod.UpdateError:
+        pass
+    else:
+        raise AssertionError("an unresolvable target returned a value instead of raising")
+
+
+def test_the_importable_orphan_list_stays_in_the_plan(tmp_path: Path):
+    """Kept from the original test: it was computed and never acted on."""
+    mod = _subject()
+    src = SUBJECT.read_text()
+    assert '"importable_orphans_to_remove": importable_orphans' in src

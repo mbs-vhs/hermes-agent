@@ -84,3 +84,51 @@ def test_the_mutated_source_still_parses():
                 "would go red on a syntax error rather than on the guard's absence, "
                 "which would report the guard as protected when it is not"
             ) from exc
+
+
+def _embedded_probe(source: str) -> str | None:
+    """The probe the subject builds as a STRING and runs with `python -c`."""
+    import ast
+
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "probe" for t in node.targets
+        ):
+            try:
+                return ast.literal_eval(node.value)
+            except ValueError:
+                return None
+    return None
+
+
+def test_the_mutated_EMBEDDED_PROBE_still_compiles():
+    """The outer module parsing is not enough — the probe is a string, and it runs.
+
+    Review found a mutation that left `except Exception:` with no body INSIDE the probe
+    string. The outer module parsed fine, so `test_the_mutated_source_still_parses`
+    passed, while every `_dependency_skew` call raised `probe failed inside the runtime
+    venv` and reddened 20 unrelated tests. The battery counted that as the guard being
+    protected. A syntax error one quoting level down is exactly the blind spot this whole
+    file exists to close, so it has to look inside the string too.
+    """
+    source = SUBJECT.read_text(encoding="utf-8")
+    baseline = _embedded_probe(source)
+    assert baseline is not None, (
+        "could not extract the embedded probe from the subject — if it was renamed or "
+        "built differently, this guard is now blind and must be updated"
+    )
+    compile(baseline, "<probe>", "exec")
+
+    for mutation in _battery().MUTATIONS:
+        probe = _embedded_probe(source.replace(mutation["old"], mutation["new"], 1))
+        if probe is None or probe == baseline:
+            continue  # this row does not touch the probe
+        try:
+            compile(probe, "<probe>", "exec")
+        except SyntaxError as exc:
+            raise AssertionError(
+                f"mutation {mutation['id']} breaks the EMBEDDED PROBE ({exc}). Every "
+                "_dependency_skew call would then raise, reddening unrelated tests, and "
+                "the battery would report this guard as protected on that evidence. "
+                "Mutate to a variant that still compiles."
+            ) from exc

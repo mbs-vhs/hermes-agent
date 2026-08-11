@@ -109,15 +109,25 @@ MUTATIONS: list[dict[str, str]] = [
     {
         "id": "unparseable-requirement",
         "why": "a dropped requirement returns [] which reads as a measured clean",
-        "old": "\"            out.append(raw+': unparseable requirement — the runtime cannot evaluate it'); continue\\n\"\n"
-               '        "        if req.marker is not None',
-        "new": '        "        if req.marker is not None',
+        # Mutates to a COMPILING variant that restores the old fail-open. An earlier
+        # version deleted the append line and left `except Exception:` with no body, so
+        # the embedded probe no longer compiled and every _dependency_skew call raised —
+        # reddening 20 tests for a reason unrelated to this guard. Found by review.
+        "old": "        \"        except Exception:\\n\"\n"
+               "        \"            out.append(raw+': unparseable requirement — the runtime cannot evaluate it'); continue\\n\"",
+        "new": "        \"        except Exception: continue\\n\"",
     },
     {
         "id": "packaging-absent",
         "why": "without packaging, version skew and markers go unevaluated and report CLEAN",
         "old": '        "if Requirement is None:\\n"',
         "new": '        "if False:\\n"',
+    },
+    {
+        "id": "finding-sanitised-in-plan",
+        "why": "the plan is written into a durable receipt on disk; a raw finding puts a credential there",
+        "old": '"dependency_skew": [_safe_finding(s) for s in skew],',
+        "new": '"dependency_skew": skew,',
     },
     {
         "id": "empty-probe-stdout",
@@ -183,6 +193,29 @@ def _apply_mutation(tree: Path, mutation: dict[str, str]) -> None:
     subject.write_text(text.replace(mutation["old"], mutation["new"], 1), encoding="utf-8")
 
 
+# Excluded from MUTANT runs only — the baseline still runs the whole suite.
+#
+# THE BATTERY DEFEATED ITSELF AND AN INDEPENDENT TESTER CAUGHT IT.
+# `test_mutation_guard_table.py` asserts every mutation anchor appears in the subject
+# exactly once. Applying a mutation DELETES its own anchor, so that test fails for EVERY
+# row — and with `-x` pytest stopped there, 19 tests in, before reaching any guard's
+# coverage. Every mutation therefore reported "killed", unconditionally. The tester
+# measured `all 17 guards killed` where the true answer was 14/3.
+#
+# The 14-killed/3-survived figure this branch reported WAS correct when taken, because
+# the table test did not exist yet — it was added afterwards, to stop the battery lying,
+# and it is what made the battery lie. Same remedy-inherits-the-disease shape as the rest
+# of this file's history, in the tool built to detect that shape.
+#
+# The carded flake is excluded for a different reason: an unrelated red counts as a kill,
+# and test_launch_gate_signal_cleanup (CLAWD-3663) fired in 2 of 4 observed full runs. A
+# mutant "killed" by a flake is not evidence about the guard.
+_EXCLUDED_FROM_MUTANT_RUNS = (
+    "tests/scripts/test_mutation_guard_table.py",
+    "tests/scripts/test_run_tests_wrapper.py",
+)
+
+
 def _run_suite(tree: Path, stop_early: bool) -> int:
     env = dict(os.environ)
     # Match the wrapper's CI-parity variables. Bare pytest is used deliberately here:
@@ -191,6 +224,8 @@ def _run_suite(tree: Path, stop_early: bool) -> int:
     env.update(TZ="UTC", LANG="C.UTF-8", PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
     cmd = [str(REPO / ".venv" / "bin" / "python"), "-m", "pytest", SUITE, "-q",
            "-p", "no:cacheprovider"]
+    for ignored in _EXCLUDED_FROM_MUTANT_RUNS:
+        cmd += ["--ignore", ignored]
     if stop_early:
         cmd.append("-x")
     # encoding= explicit: `text=True` alone decodes with the locale encoding, which the

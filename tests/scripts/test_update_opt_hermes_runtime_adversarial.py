@@ -1387,3 +1387,43 @@ def test_ROLLBACK_of_a_ROLLBACK_is_still_refused_for_skew(world):
         "rather than the direction of travel"
     )
     assert updater._head(runtime) == t_old, "HEAD moved despite the refusal"
+
+
+def test_the_DRY_RUN_PLAN_carries_a_SANITISED_finding(world):
+    """BL-C: the plan field, not the refusal text — read out of a real plan.
+
+    This is the worse of the two paths. `--dry-run` prints the plan to stdout AND
+    `receipt_payload = {**plan, ...}` writes it into --receipt-dir, so an unsanitised
+    finding puts a credential in a DURABLE FILE. The refusal text was tested; this site
+    was fixed but never mutated, so reverting it left the whole suite green.
+
+    A companion test asserting `_safe_finding` directly is NOT sufficient — it stays green
+    when the call site is reverted, which is exactly how this gap survived.
+    """
+    _bootstrap(world)
+    runtime = world["runtime"]
+    hostile = "!!bad!! @ https://svcuser:s3cr3t-token@example.invalid/x.whl"
+    target = _new_target(world, gitignore=IGNORES_VENV, deps=json.dumps([hostile]))
+    _git(runtime, "fetch", "-q", "origin")
+
+    proc = subprocess.run(
+        [
+            sys.executable, str(SUBJECT), "apply",
+            "--runtime", str(runtime), "--target", target,
+            "--backup-receipt",
+            str(_backup_receipt(world["scratch"], runtime, f"bl{time.time_ns()}")),
+            "--receipt-dir", str(world["receipts"]),
+            "--transaction-dir", str(world["transactions"]),
+            "--lock-file", str(world["lock"]),
+            "--dry-run",
+        ],
+        capture_output=True, text=True,
+    )
+    plan = json.loads(proc.stdout)
+    findings = plan["dependency_skew"]
+    assert findings, "the hostile requirement produced no finding to sanitise"
+    assert not any("s3cr3t-token" in f for f in findings), (
+        f"a credential reached plan['dependency_skew'], which is written into a receipt "
+        f"on disk: {findings!r}"
+    )
+    assert not any("\n" in f or "\r" in f for f in findings), findings

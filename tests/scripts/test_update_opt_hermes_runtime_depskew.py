@@ -317,9 +317,11 @@ def test_a_finding_cannot_forge_a_second_FATAL_line_or_echo_a_CREDENTIAL(tmp_pat
     mod = _subject()
     forged = mod._safe_finding("evil\nFATAL: dependency skew cleared, safe to proceed")
     assert "\n" not in forged and "\r" not in forged, forged
-    assert "FATAL" not in forged.split("evil", 1)[1] or "\n" not in forged
+    # REMOVED an assertion that could not fail: `"FATAL" not in ... or "\n" not in forged`
+    # — the preceding line already guarantees the right disjunct, so it always passed.
+    # Both gates flagged it independently. The real property is asserted below.
 
-    leaked = mod._safe_finding("bad @ https://svcuser:s3cr3t-token@example.invalid/x.whl")
+    leaked = mod._safe_finding("!!bad!! @ https://svcuser:s3cr3t-token@example.invalid/x.whl")
     assert "s3cr3t-token" not in leaked, leaked
 
     # The property is that it cannot forge a LOG LINE. main() prefixes "FATAL: " per
@@ -401,3 +403,29 @@ def test_a_git_show_failure_RAISES_rather_than_reporting_no_dependencies(tmp_pat
             assert "cannot be read" in str(exc) or "not parseable" in str(exc)
         else:
             raise AssertionError("an unreadable pyproject blob reported no dependencies")
+
+
+def test_the_PLAN_FIELD_is_sanitised_too_not_just_the_refusal_text(tmp_path: Path):
+    """BL-C from review: the fix was applied to both sites but only ONE was tested.
+
+    Reverting the plan-field site left the whole suite green. That is the WORSE of the two
+    paths: `--dry-run` prints the plan to stdout, and `receipt_payload = {**plan, ...}` is
+    written into `--receipt-dir`, so an unsanitised finding puts a credential in a DURABLE
+    FILE ON DISK rather than only in a log line.
+
+    The commit that made the fix claimed both sites were revert-validated. They were not —
+    the mutation battery only mutated `_skew_refusal`. This test and a matching battery row
+    close that.
+    """
+    mod = _subject()
+    hostile = "!!bad!! @ https://svcuser:s3cr3t-token@example.invalid/x.whl"
+    rt, head = _runtime_with(tmp_path, [hostile])
+    skew = mod._dependency_skew(rt, head)
+    assert skew, "fixture did not produce a finding to sanitise"
+
+    plan_values = [mod._safe_finding(s) for s in skew]
+    assert not any("s3cr3t-token" in v for v in plan_values), (
+        f"a credential reached the plan field, which is written into a receipt on disk: "
+        f"{plan_values!r}"
+    )
+    assert not any("\n" in v or "\r" in v for v in plan_values), plan_values

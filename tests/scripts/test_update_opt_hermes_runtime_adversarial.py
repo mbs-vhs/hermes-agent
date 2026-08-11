@@ -53,6 +53,34 @@ DROPS_VENV = "__pycache__/\nlogs/\n"
 # ─────────────────────────────── fixtures ────────────────────────────────────
 
 
+
+def _venvify(runtime, installed=None, with_packaging=True):
+    """Make `<runtime>/venv` resolve like a REAL venv for the sanitised probe.
+
+    A bare `venv/bin/python -> sys.executable` symlink is not a venv: python derives
+    sys.prefix from the symlink's own location, so there is no site-packages behind it.
+    That only ever worked because the probe inherited the caller's environment. The
+    probe is now sanitised on purpose — a leaked PYTHONPATH could report a dependency
+    SATISFIED that the gateway, under a clean systemd environment, will not find.
+    """
+    import sys as _s
+    from pathlib import Path as _P
+    (runtime / "venv" / "pyvenv.cfg").write_text(
+        f"home = {_P(_s.base_prefix) / 'bin'}\n"
+        f"include-system-site-packages = false\n"
+        f"version = {_s.version.split()[0]}\n"
+    )
+    site = runtime / "venv" / "lib" / f"python{_s.version_info.major}.{_s.version_info.minor}" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    for name, ver in (installed or {}).items():
+        info = site / f"{name.replace('-', '_')}-{ver}.dist-info"
+        info.mkdir(exist_ok=True)
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+        (info / "RECORD").write_text("")
+    if with_packaging:
+        import packaging as _pkg
+        (site / "packaging").symlink_to(_P(_pkg.__file__).parent, target_is_directory=True)
+
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
@@ -420,10 +448,13 @@ def test_PIN_dry_run_plan_carries_the_real_dependency_skew(world):
     assert "definitely-not-a-real-package-xyz" in refused.stderr, (
         f"the refusal does not name the unsatisfied package: {refused.stderr!r}"
     )
-
-    accepted = rehearse("--accept-dependency-skew")
-    assert accepted.returncode == 0, accepted.stderr
-    plan = json.loads(accepted.stdout)
+    # THE FIX THIS TEST ASKED FOR. It used to observe that the refusal ran BEFORE the
+    # --dry-run early return, so a plain rehearsal "prints no plan at all — it
+    # refuses", and the plan was only visible via --accept-dependency-skew. The
+    # refusal now lands BELOW the early return: the rehearsal prints the plan, THEN
+    # fails. So the operator sees exactly what is wrong without needing an override —
+    # and the override is gone, deliberately.
+    plan = json.loads(refused.stdout)
     assert plan["dependency_skew"], (
         "the plan shows no dependency skew although the target declares a package "
         "the live venv does not have — an operator rehearsing this advance sees a "
@@ -433,6 +464,7 @@ def test_PIN_dry_run_plan_carries_the_real_dependency_skew(world):
         "definitely-not-a-real-package-xyz" in s for s in plan["dependency_skew"]
     )
     assert plan["restart_performed"] is False
+    assert plan["dry_run"] is True
 
 
 def test_PIN_the_conversion_plan_names_the_importable_orphans_it_will_delete(world):
@@ -489,11 +521,18 @@ def test_PIN_the_conversion_plan_names_the_importable_orphans_it_will_delete(wor
     )
 
 
-def test_PIN_dependency_skew_refuses_the_apply_and_the_flag_overrides(world):
+def test_PIN_dependency_skew_refuses_the_apply_and_there_is_NO_override(world):
     """The refusal itself — the point of the commit — had no test at all.
 
-    Deleting the `if skew and not args.accept_dependency_skew: raise` block leaves
-    the whole pre-existing suite green.
+    CONTRACT CHANGED DELIBERATELY. This previously also asserted that
+    `--accept-dependency-skew` lets an operator proceed, on the reasoning that a
+    refusal without an override "is a wall rather than a gate". The flag is gone and
+    the wall is intended: this branch shipped two advertised-but-inert `--accept-*`
+    flags already, and the honest remedy for skew is to resync the runtime venv to the
+    target, not to wave through a finding on the way to breaking eleven gateways.
+    An override can come back when something actually rebuilds the venv — it needs
+    wiring AND a test that it changes behaviour, which is exactly what the two dead
+    flags lacked.
     """
     _bootstrap(world)
     runtime = world["runtime"]
@@ -509,11 +548,16 @@ def test_PIN_dependency_skew_refuses_the_apply_and_the_flag_overrides(world):
     )
     assert updater._head(runtime) == head_before, "the refusal still moved HEAD"
 
-    assert _steady_apply(world, target, "--accept-dependency-skew") == 0, (
-        "--accept-dependency-skew no longer lets an operator proceed on a skew they "
-        "have judged benign, so the refusal is a wall rather than a gate"
+    # No override exists, and passing one is an argparse error rather than a silent
+    # no-op — the failure mode of the two dead flags this branch already shipped.
+    with pytest.raises(SystemExit) as exit_info:
+        _steady_apply(world, target, "--accept-dependency-skew")
+    assert exit_info.value.code == 2, (
+        "an --accept-dependency-skew override is live again; argparse should reject "
+        "the flag outright rather than the tool silently ignoring it, which is how "
+        "the two dead --accept-* flags on this branch failed"
     )
-    assert updater._head(runtime) == target
+    assert updater._head(runtime) == head_before, "HEAD moved despite the refusal"
 
 
 def test_PIN_dependency_skew_asks_the_RUNTIME_venv_not_the_updater_interpreter(
@@ -607,7 +651,14 @@ def test_PIN_the_dependency_probe_writes_no_bytecode_into_the_venv(
         "    def contains(self, v, prereleases=False): return True\n"
         "class Requirement:\n"
         "    def __init__(self, raw):\n"
-        "        m = re.match(r'^\\\\s*([A-Za-z0-9._-]+)', raw)\n"
+        # NOTE: two backslashes here, not four. With four, the file received
+        # r'^\\s*(...)' — literal-backslash + zero-or-more 's' — so this fake
+        # Requirement raised ValueError on EVERY well-formed package name. The probe's
+        # old `except Exception: continue` swallowed that, so nothing was ever found and
+        # the precondition below ("the probe must actually run and find the package")
+        # was silently false, making the bytecode assertion vacuous. Surfaced only when
+        # the probe stopped failing open.
+        "        m = re.match(r'^\\s*([A-Za-z0-9._-]+)', raw)\n"
         "        if not m: raise ValueError(raw)\n"
         "        self.name = m.group(1); self.marker = None\n"
         "        self.specifier = _Spec()\n"
@@ -1151,29 +1202,62 @@ def test_OBSERVED_requirement_shapes_are_parsed_by_packaging(
     head = _commit(runtime, "t")
     (runtime / "venv" / "bin").mkdir(parents=True)
     (runtime / "venv" / "bin" / "python").symlink_to(sys.executable)
+    # pytest present so the "installed, extra does not exist" case is really satisfied,
+    # and packaging present so markers are evaluated rather than ignored.
+    _venvify(runtime, installed={"pytest": "9.0.2"})
     assert bool(updater._dependency_skew(runtime, head)) is expected_skew
+
+
+def test_a_target_whose_pyproject_is_UNPARSEABLE_now_RAISES(tmp_path):
+    """The case removed from the parametrize above, kept as its own assertion.
+
+    It used to be one of three "FAILS_OPEN" cases returning `[]` — indistinguishable
+    from "measured, no skew". That test's own docstring said it pinned the behaviour
+    "so a change is deliberate" and was "NOT an endorsement". This is the deliberate
+    change: unreadable is not clean, so it raises.
+
+    The other two cases stay empty on purpose. A target with `dynamic = ['dependencies']`
+    or no [project] table declares no STATIC main dependencies, which is a measured
+    answer, not a failure to measure. hermes-agent does not use dynamic deps today.
+    """
+    runtime = tmp_path / "rt"
+    runtime.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(runtime)], check=True)
+    (runtime / "pyproject.toml").write_text("[project\nname='x'\n")   # malformed TOML
+    (runtime / "keep.txt").write_text("so the commit is never empty\n")
+    head = _commit(runtime, "t")
+    (runtime / "venv" / "bin").mkdir(parents=True)
+    (runtime / "venv" / "bin" / "python").symlink_to(sys.executable)
+    _venvify(runtime)
+
+    with pytest.raises(updater.UpdateError) as err:
+        updater._target_main_dependencies(runtime, head)
+    assert "not parseable" in str(err.value)
+
+    with pytest.raises(updater.UpdateError):
+        updater._dependency_skew(runtime, head)
 
 
 @pytest.mark.parametrize(
     "pyproject",
     [
-        "[project\nname='x'\n",                                  # malformed TOML
         "[project]\nname='x'\nversion='0'\ndynamic=['dependencies']\n",
         "",                                                       # empty
     ],
 )
-def test_OBSERVED_an_unreadable_target_pyproject_FAILS_OPEN(tmp_path, pyproject):
-    """Stated rather than hidden: this is a fail-OPEN path in a fail-closed tool.
+def test_OBSERVED_a_target_declaring_no_STATIC_deps_measures_as_empty(tmp_path, pyproject):
+    """A target declaring no STATIC main deps measures as empty — and that is correct.
 
-    `_target_main_dependencies` returns `[]` — and therefore "no skew", and therefore
-    "proceed" — for a target whose pyproject cannot be parsed, cannot be read from
-    git, or declares its dependencies dynamically (which the real hermes-agent does
-    not, today). The module's own comment justifies degrading only for the missing
-    `packaging` case; these four other silent-empty returns are undocumented.
+    DOCSTRING REWRITTEN. It previously described this as a fail-OPEN path, listing
+    "cannot be parsed, cannot be read from git" alongside these cases and citing "four
+    other silent-empty returns". All of that is now false: unparseable raises, unreadable
+    raises, an unparseable requirement is reported, an absent packaging is reported, and
+    empty probe output raises. Only these two remain empty, and they are MEASURED empties
+    — `dynamic = ['dependencies']` and a pyproject with no [project] table both declare
+    no static main dependencies. hermes-agent does not use dynamic deps today.
 
-    This test PINS the current behaviour so a change is deliberate. It is NOT an
-    endorsement: an operator reading `"dependency_skew": []` cannot distinguish
-    "measured, none" from "could not measure".
+    The old text was the contract documentation rotting inside the test that documents
+    the contract, which review caught.
     """
     runtime = tmp_path / "rt"
     runtime.mkdir()
@@ -1186,3 +1270,160 @@ def test_OBSERVED_an_unreadable_target_pyproject_FAILS_OPEN(tmp_path, pyproject)
 
     assert updater._target_main_dependencies(runtime, head) == []
     assert updater._dependency_skew(runtime, head) == []
+
+
+def test_ROLLBACK_is_never_refused_for_dependency_skew(world):
+    """B1 from independent review — the severest defect in this branch, end to end.
+
+    `rollback` routes through `_apply`, so the skew check was evaluated against the
+    ROLLBACK target and refused the incident verb. The sequence is exactly the one the
+    venv-resync packet creates: resync the venv forward, advance, hit a regression, then
+    find rollback refused because the OLDER target pins the OLDER dependency — with the
+    refusal telling the operator to resync the venv mid-incident while 11 gateways sit on
+    the bad commit.
+
+    Going back to a commit the venv over-satisfies is the recovery path, not a hazard:
+    that code ran against these same packages until minutes ago.
+
+    This is deliberately end-to-end rather than a grep of `_apply`'s source, which is how
+    it was first pinned. A one-line short-circuit protecting the incident verb deserves a
+    test that actually rolls back.
+    """
+    _bootstrap(world)
+    runtime = world["runtime"]
+
+    # t_old declares a package the venv HAS; advancing to it succeeds.
+    # packaging present too, or the B3 guard refuses the FORWARD advance before we ever
+    # reach the rollback this test is about.
+    _venvify(runtime, installed={"rollbackpkg": "1.0"})
+    import sys as _s
+    site = runtime / "venv" / "lib" / f"python{_s.version_info.major}.{_s.version_info.minor}" / "site-packages"
+    info = site / "rollbackpkg-1.0.dist-info"
+
+    t_old = _new_target(world, gitignore=IGNORES_VENV, deps='["rollbackpkg==1.0"]')
+    _git(runtime, "fetch", "-q", "origin")
+    assert _steady_apply(world, t_old) == 0, "advancing to a satisfied target failed"
+
+    # t_new declares nothing; advance succeeds. Its receipt is the one rollback consumes:
+    # target == current HEAD (t_new), before_head == t_old.
+    t_new = _new_target(world, gitignore=IGNORES_VENV, deps="[]", body="VERSION_C\n")
+    _git(runtime, "fetch", "-q", "origin")
+    assert _steady_apply(world, t_new) == 0
+    receipts = sorted(world["receipts"].glob("*.json"))
+    assert receipts, "no update receipt was written for the advance"
+    rollback_receipt = receipts[-1]
+
+    # The operator "resyncs" the venv forward, dropping the package t_old required.
+    # This is the step that arms the trap.
+    shutil.rmtree(info)
+
+    # Now roll back. Under the defect this returned UNMEASURED_EXIT with HEAD unmoved.
+    rc = updater.main([
+        "rollback", "--runtime", str(runtime),
+        "--update-receipt", str(rollback_receipt),
+        "--backup-receipt",
+        str(_backup_receipt(world["scratch"], runtime, f"rb{time.time_ns()}")),
+        "--receipt-dir", str(world["receipts"]),
+        "--transaction-dir", str(world["transactions"]),
+        "--lock-file", str(world["lock"]),
+    ])
+    assert rc == 0, (
+        "rollback was refused for dependency skew against the rollback target — the "
+        "incident verb is disabled in exactly the situation it exists for"
+    )
+
+
+def test_ROLLBACK_of_a_ROLLBACK_is_still_refused_for_skew(world):
+    """BL-1: the skew bypass must key on DIRECTION, not on the verb.
+
+    The first fix used `rollback_from is not None` — "is this the rollback verb". Review
+    reproduced the hole: rollback writes its OWN receipt, and replaying that receipt is a
+    FORWARD advance with the branch's headline refusal skipped, landing the fleet on a
+    commit whose declared dependency the venv lacks. `_validate_update_receipt` never
+    inspects the receipt's action, so nothing else catches it.
+
+    Ordering matters here: the FORWARD target must be the unsatisfiable one, or there is
+    no skew on the replayed move and the test proves nothing. A first draft had it the
+    other way round and passed against the defect.
+    """
+    _bootstrap(world)
+    runtime = world["runtime"]
+    _venvify(runtime, installed={"revpkg": "1.0"})
+    import sys as _s
+    site = runtime / "venv" / "lib" / f"python{_s.version_info.major}.{_s.version_info.minor}" / "site-packages"
+    info = site / "revpkg-1.0.dist-info"
+
+    t_old = _new_target(world, gitignore=IGNORES_VENV, deps="[]")
+    _git(runtime, "fetch", "-q", "origin")
+    assert _steady_apply(world, t_old) == 0
+    # FORWARD target declares the package; the venv has it, so advancing is allowed.
+    t_new = _new_target(world, gitignore=IGNORES_VENV, deps='["revpkg==1.0"]',
+                        body="VERSION_C\n")
+    _git(runtime, "fetch", "-q", "origin")
+    assert _steady_apply(world, t_new) == 0
+
+    def _rollback(receipt):
+        return updater.main([
+            "rollback", "--runtime", str(runtime), "--update-receipt", str(receipt),
+            "--backup-receipt",
+            str(_backup_receipt(world["scratch"], runtime, f"rb{time.time_ns()}")),
+            "--receipt-dir", str(world["receipts"]),
+            "--transaction-dir", str(world["transactions"]),
+            "--lock-file", str(world["lock"]),
+        ])
+
+    r2 = sorted(world["receipts"].glob("*.json"))[-1]
+    assert _rollback(r2) == 0, "the legitimate BACKWARD rollback was refused"
+    assert updater._head(runtime) == t_old
+
+    # The operator now resyncs/prunes the venv. t_new is no longer runnable.
+    shutil.rmtree(info)
+    r3 = sorted(world["receipts"].glob("*.json"))[-1]
+
+    rc = _rollback(r3)
+    assert rc != 0, (
+        "replaying a ROLLBACK's own receipt moved the fleet FORWARD to a target the venv "
+        "cannot satisfy, with the skew refusal skipped — the bypass is keyed on the verb "
+        "rather than the direction of travel"
+    )
+    assert updater._head(runtime) == t_old, "HEAD moved despite the refusal"
+
+
+def test_the_DRY_RUN_PLAN_carries_a_SANITISED_finding(world):
+    """BL-C: the plan field, not the refusal text — read out of a real plan.
+
+    This is the worse of the two paths. `--dry-run` prints the plan to stdout AND
+    `receipt_payload = {**plan, ...}` writes it into --receipt-dir, so an unsanitised
+    finding puts a credential in a DURABLE FILE. The refusal text was tested; this site
+    was fixed but never mutated, so reverting it left the whole suite green.
+
+    A companion test asserting `_safe_finding` directly is NOT sufficient — it stays green
+    when the call site is reverted, which is exactly how this gap survived.
+    """
+    _bootstrap(world)
+    runtime = world["runtime"]
+    hostile = "!!bad!! @ https://svcuser:s3cr3t-token@example.invalid/x.whl"
+    target = _new_target(world, gitignore=IGNORES_VENV, deps=json.dumps([hostile]))
+    _git(runtime, "fetch", "-q", "origin")
+
+    proc = subprocess.run(
+        [
+            sys.executable, str(SUBJECT), "apply",
+            "--runtime", str(runtime), "--target", target,
+            "--backup-receipt",
+            str(_backup_receipt(world["scratch"], runtime, f"bl{time.time_ns()}")),
+            "--receipt-dir", str(world["receipts"]),
+            "--transaction-dir", str(world["transactions"]),
+            "--lock-file", str(world["lock"]),
+            "--dry-run",
+        ],
+        capture_output=True, text=True,
+    )
+    plan = json.loads(proc.stdout)
+    findings = plan["dependency_skew"]
+    assert findings, "the hostile requirement produced no finding to sanitise"
+    assert not any("s3cr3t-token" in f for f in findings), (
+        f"a credential reached plan['dependency_skew'], which is written into a receipt "
+        f"on disk: {findings!r}"
+    )
+    assert not any("\n" in f or "\r" in f for f in findings), findings

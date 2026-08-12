@@ -13,6 +13,7 @@ passing for a reason unrelated to this class.
 """
 
 import logging
+import signal
 import subprocess
 import sys
 import threading
@@ -116,7 +117,29 @@ def test_at_capacity_submit_skips_the_spawn_hop():
         pool.shutdown(wait=True)
 
 
-def test_interrupt_during_the_spawn_hop_leaves_no_registered_worker():
+# How long the patched detach below stalls the spawn thread.  The interrupt
+# is timed to land well inside it, so "did the caller wait?" is decided by the
+# grace wait rather than by a race.
+_SLOW_DETACH_S = 0.5
+_INTERRUPT_AT_S = 0.1
+
+
+def _stalled_detach(delay=_SLOW_DETACH_S):
+    """Patch _detach_new_workers so the spawn thread is demonstrably mid-flight."""
+    real = DaemonThreadPoolExecutor._detach_new_workers
+
+    def _slow(self, known):
+        time.sleep(delay)
+        real(self, known)
+
+    return mock.patch.object(DaemonThreadPoolExecutor, "_detach_new_workers", _slow)
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "setitimer"),
+    reason="POSIX itimer required to raise a real signal",
+)
+def test_real_sigint_during_the_spawn_hop_leaves_no_registered_worker():
     """Ctrl-C in the caller's join() must not orphan a registered worker.
 
     Thread.join() on the main thread is signal-interruptible, so a SIGINT
@@ -126,10 +149,56 @@ def test_interrupt_during_the_spawn_hop_leaves_no_registered_worker():
     worker that may be wedged on network I/O — the exact exit hang this
     module exists to prevent.
 
-    The assertion deliberately runs the instant KeyboardInterrupt escapes
-    submit(), with no wait for the spawn thread: the contract is that the
-    caller cannot leave submit()'s critical section before the registration
-    has been undone.
+    Uses a REAL signal, and asserts on _threads_queues rather than on
+    runner.is_alive().  Both matter: a mocked join that raises INSTEAD of
+    joining leaves is_alive() True, a state CPython <= 3.13 cannot produce
+    under a real signal (its interrupted join calls _stop() on the still
+    running thread), so an is_alive() assertion there is answered by the
+    defect instead of by the fix.
+    """
+    pool = DaemonThreadPoolExecutor(max_workers=2)
+
+    def _boom(signum, frame):
+        raise KeyboardInterrupt("test SIGALRM")
+
+    previous = signal.signal(signal.SIGALRM, _boom)
+    try:
+        with _stalled_detach():
+            signal.setitimer(signal.ITIMER_REAL, _INTERRUPT_AT_S)
+            started = time.monotonic()
+            with pytest.raises(KeyboardInterrupt):
+                pool.submit(time.sleep, 0)
+            unwound_after = time.monotonic() - started
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+            # Ground truth, read the instant the caller unwinds: the contract
+            # is that it cannot leave submit()'s critical section before the
+            # registration has been undone.
+            assert pool._threads, "no worker was created — test proves nothing"
+            for worker in pool._threads:
+                assert worker not in _threads_queues, worker.name
+                assert worker.daemon is True, worker.name
+            assert unwound_after >= _SLOW_DETACH_S * 0.5, (
+                f"caller unwound after {unwound_after:.3f}s without waiting for "
+                f"a detach stalled for {_SLOW_DETACH_S}s"
+            )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        pool.shutdown(wait=True)
+
+
+def test_interrupt_during_the_spawn_hop_leaves_no_registered_worker():
+    """Portable twin of the test above (no POSIX signals needed).
+
+    Same ground-truth assertion; the interrupt is simulated by raising out
+    of join() instead of being delivered by the OS.
+
+    KNOWN LIMIT, measured: because this raises INSTEAD of joining, the spawn
+    thread keeps is_alive() == True — a state a real signal cannot produce on
+    CPython <= 3.13.  So this test stays GREEN against a grace wait keyed on
+    is_alive() (which is inert there).  Only the real-signal test above
+    catches that; do not treat this one as covering it.
     """
     real_join = threading.Thread.join
     hopped = []
@@ -142,19 +211,53 @@ def test_interrupt_during_the_spawn_hop_leaves_no_registered_worker():
 
     pool = DaemonThreadPoolExecutor(max_workers=2)
     try:
-        with mock.patch.object(threading.Thread, "join", _interrupted_join):
+        with (
+            _stalled_detach(),
+            mock.patch.object(threading.Thread, "join", _interrupted_join),
+        ):
             with pytest.raises(KeyboardInterrupt):
                 pool.submit(time.sleep, 0)
 
         assert hopped, "the spawn hop was never taken — test proves nothing"
-        assert not hopped[0].is_alive(), (
-            "the caller unwound while the spawn thread was still running"
-        )
         assert pool._threads, "no worker was created"
         for worker in pool._threads:
             assert worker not in _threads_queues, worker.name
             assert worker.daemon is True, worker.name
     finally:
+        pool.shutdown(wait=True)
+
+
+def test_detach_still_runs_when_the_spawn_itself_raises():
+    """NEW-4: pin the try/finally around super()._adjust_thread_count().
+
+    Defence in depth — on 3.8-3.14 CPython registers the worker in
+    _threads_queues as the LAST statement of _adjust_thread_count(), so
+    nothing between registration and return can raise, and no reachable
+    trigger exists.  Pinned anyway because the failure mode if that order
+    ever changes is a permanently registered worker, which is the entire
+    bug class this module exists for.
+    """
+    pool = DaemonThreadPoolExecutor(max_workers=2)
+    impostor = threading.Thread(target=lambda: None, name="half-spawned", daemon=True)
+
+    def _register_then_raise(_self):
+        pool._threads.add(impostor)
+        _threads_queues[impostor] = pool._work_queue
+        raise RuntimeError("spawn failed after registering the worker")
+
+    try:
+        with mock.patch.object(
+            ThreadPoolExecutor, "_adjust_thread_count", _register_then_raise
+        ):
+            with pytest.raises(RuntimeError, match="spawn failed"):
+                pool.submit(lambda: None)
+
+        assert impostor not in _threads_queues, (
+            "the spawn raised after registering and the detach was skipped"
+        )
+    finally:
+        _threads_queues.pop(impostor, None)
+        pool._threads.discard(impostor)
         pool.shutdown(wait=True)
 
 

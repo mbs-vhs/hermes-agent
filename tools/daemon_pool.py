@@ -93,21 +93,39 @@ def _run_on_daemon_thread(fn: Callable[[], None]) -> None:
     Any ``threading.Thread`` ``fn`` creates without an explicit ``daemon=``
     argument inherits ``daemon=True`` from this thread.
 
-    ``fn`` must own **every** side effect that needs undoing, and nothing may
-    be sequenced after the join that the correctness of those side effects
-    depends on.  ``Thread.join()`` on the main thread is interruptible: a
-    SIGINT arrives there as a KeyboardInterrupt and unwinds the caller while
-    this thread keeps running to completion.  The retry loop below keeps that
-    unwind from overtaking ``fn``, but code after the join can still be
-    skipped entirely.
+    ``fn`` must own **every** side effect that needs undoing: nothing sequenced
+    after the join is guaranteed to run.  ``Thread.join()`` on the main thread
+    is interruptible — a SIGINT arrives there as a KeyboardInterrupt and
+    unwinds the caller while this thread keeps going.  The grace wait below
+    holds that unwind until ``fn`` has finished.
+
+    That wait keys on a completion Event, NOT on ``runner.is_alive()``, and the
+    difference is load-bearing rather than stylistic.  On CPython <= 3.13 an
+    interrupted ``join()`` reaches the ``except:`` limb of
+    ``Thread._wait_for_tstate_lock()``, and because a *live* thread's
+    ``_tstate_lock`` is always held, that limb unconditionally calls
+    ``self._stop()`` — marking a still-running thread stopped.  Measured on
+    3.11.15: after an interrupted join, ``is_alive()`` is False while the
+    thread is still in ``threading.enumerate()`` and its work is unfinished.
+    An ``is_alive()``-keyed wait therefore exits at zero iterations on exactly
+    the interpreter the gate and both production venvs run (3.14 replaced that
+    path with ``_os_thread_handle.is_done()`` and is unaffected).
+
+    NB the caller is unresponsive to further Ctrl-C for the duration of the
+    grace wait — repeat KeyboardInterrupts are discarded, and only the first
+    is re-raised.  In practice that window is the microseconds ``fn`` needs;
+    ``_SPAWN_UNWIND_GRACE_S`` is only the pathological cap.
     """
     raised: list[BaseException] = []
+    done = threading.Event()
 
     def _target() -> None:
         try:
             fn()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
             raised.append(exc)
+        finally:
+            done.set()
 
     runner = threading.Thread(target=_target, name=SPAWN_THREAD_NAME, daemon=True)
     runner.start()
@@ -118,11 +136,14 @@ def _run_on_daemon_thread(fn: Callable[[], None]) -> None:
         # caller cannot leave submit()'s critical section (and let
         # _python_exit() in) while _threads_queues is still half-updated.
         deadline = time.monotonic() + _SPAWN_UNWIND_GRACE_S
-        while runner.is_alive() and time.monotonic() < deadline:
+        while not done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                runner.join(0.05)
-            except BaseException:  # noqa: BLE001,S110 - a repeat signal; the
-                pass  # original is re-raised below either way
+                done.wait(remaining)
+            except BaseException:  # noqa: BLE001,S110 - a repeat signal; only
+                pass  # the original is re-raised, by design (see docstring)
         raise
     if raised:
         raise raised[0]

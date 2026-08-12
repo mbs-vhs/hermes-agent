@@ -134,31 +134,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # legacy bare-int form, and they already catch UnicodeDecodeError (a corrupt
     # or binary gateway.pid raised it uncaught here, killing ExecStop with a
     # traceback, because this only caught OSError).
-    from gateway.status import _pid_from_record, _read_pid_record
+    # USE THE READER THAT VALIDATES LIVENESS AND IDENTITY, not the raw record.
+    # The previous version compared `_pid_from_record(_read_pid_record())` to the
+    # pid — which treats "the record names somebody else" as proof of a wrong
+    # HERMES_HOME. It is equally the signature of a STALE gateway.pid in the
+    # CORRECT home, and that state is reachable on every restart after an unclean
+    # exit: a SIGKILLed/OOM-killed gateway never runs its atexit remover, so the
+    # file keeps naming the dead pid until get_running_pid() cleans it, which
+    # happens AFTER import + config load (measured >=0.35s for the import alone).
+    # A systemd stop in that window refused a legitimate stop, wrote no marker,
+    # and the SIGTERM then classified as UNEXPECTED -> exit 1 -> ActiveState=failed.
+    # The pre-CLAWD-3786 symptom, in the path this card exists to fix, and
+    # correlated with exactly the moment an operator restarts a flapping unit.
+    #
+    # get_running_pid(cleanup_stale=False) checks _pid_exists, start_time and
+    # _record_matches_live_gateway_pid, so a STALE record returns None (proceed)
+    # while a genuinely FOREIGN LIVE gateway returns its pid (refuse). That is the
+    # discrimination this guard needs, and hermes_cli/gateway.py:3341 — the
+    # sibling stop path — already uses exactly this call.
+    from gateway.status import get_running_pid
 
     try:
-        recorded_pid = _pid_from_record(_read_pid_record())
+        live_pid = get_running_pid(cleanup_stale=False)
     except Exception as exc:  # noqa: BLE001 - a probe must not decide a stop
         print(
             f"hermes: could not read the gateway PID record to confirm HERMES_HOME "
             f"({exc}) — proceeding with the marker write UNVERIFIED (CLAWD-3786)",
             file=sys.stderr,
         )
-        recorded_pid = None
+        live_pid = None
 
-    # DECLARED RESIDUAL: a MISSING or unparseable pid file leaves recorded_pid
-    # None and is NOT treated as a mismatch. The most likely wrong-home shape — a
-    # directory no gateway has ever run in — therefore passes silently. Refusing
-    # on absence would refuse every first stop after a pid file is cleaned up,
-    # which is worse than the gap; closing it properly needs a second signal.
-    if recorded_pid is not None and recorded_pid != pid:
+    # DECLARED RESIDUAL: a missing, unparseable, or STALE pid file all leave
+    # live_pid None and are NOT treated as a mismatch, so the most likely
+    # wrong-home shape — a directory no gateway has ever run in — still passes
+    # silently. That is deliberate: refusing on absence would refuse a legitimate
+    # stop in every one of those states, which is the defect this replaces.
+    if live_pid is not None and live_pid != pid:
         print(
             f"hermes: HERMES_HOME={os.environ.get('HERMES_HOME') or '<unset>'} holds "
-            f"a gateway.pid naming PID {recorded_pid}, but this stop is for PID "
-            f"{pid}. The unit's Environment= and the gateway's own HERMES_HOME "
-            "disagree, so a marker written here would never be read: this stop "
-            "would be classified as an unexpected kill. Fix the unit's "
-            "Environment=HERMES_HOME to match its --profile (CLAWD-3786)",
+            f"a LIVE gateway at PID {live_pid}, but this stop is for PID {pid}. The "
+            "unit's Environment= and the gateway's own HERMES_HOME disagree, so a "
+            "marker written here would never be read: this stop would be classified "
+            "as an unexpected kill. Fix the unit's Environment=HERMES_HOME to match "
+            "its --profile (CLAWD-3786)",
             file=sys.stderr,
         )
         return 1

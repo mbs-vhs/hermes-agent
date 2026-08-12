@@ -159,11 +159,36 @@ class TestExecStopNoOpCases:
         # wrote "999999\n", a bare int the product NEVER writes, which is why it
         # passed over a guard that refused every real stop: the fixture and the
         # subject disagreed about the file, and only the fixture was consulted.
+        # A LIVE foreign pid, not a dead one. Since the guard now validates
+        # liveness (a DEAD pid in the record is a STALE file in the right home,
+        # not a wrong home), the fixture has to name a process that actually
+        # exists and is not us — otherwise it tests the stale path and the
+        # refusal it asserts is the wrong behaviour to want.
+        from gateway.status import _get_process_start_time
+
+        foreign = os.getppid()
         (wrong_home / "gateway.pid").write_text(
-            json.dumps({"pid": 999999, "kind": "hermes-gateway"}), encoding="utf-8"
+            json.dumps({"pid": foreign, "kind": "hermes-gateway",
+                        "start_time": _get_process_start_time(foreign)}),
+            encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(wrong_home))
-        monkeypatch.setattr("gateway.status._get_pid_path", lambda: wrong_home / "gateway.pid")
+        # get_running_pid only counts a pid as a live gateway when its COMMAND
+        # LINE looks like one — which is stricter and safer than "some process
+        # exists". That means the guard refuses ONLY when a genuine foreign
+        # gateway is live in this home, so the fixture has to present one rather
+        # than merely name a live pid. Patching the cmdline reader is the honest
+        # way to do that without spawning a second gateway in a unit test.
+        monkeypatch.setattr(
+            "gateway.status._read_process_cmdline",
+            lambda p: "hermes --profile other gateway run" if p == foreign else None,
+        )
+        # A LIVE gateway also holds its runtime lock, and get_running_pid checks
+        # that FIRST — which is precisely why a crashed gateway's stale pid file
+        # resolves to None (lock released) and no longer refuses a legitimate
+        # stop. Simulating the lock is simulating the environmental condition of
+        # a live foreign gateway; it does not stub the decision under test.
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda p: True)
 
         wrote = []
         monkeypatch.setattr(
@@ -176,7 +201,7 @@ class TestExecStopNoOpCases:
         captured = capsys.readouterr()
         assert rc == 1, "a marker nobody will read is a refusal, not a success"
         assert wrote == [], "it must REFUSE before writing into the wrong home"
-        assert "999999" in captured.err, "name the PID actually recorded there"
+        assert str(foreign) in captured.err, "name the LIVE pid recorded there"
         assert str(os.getpid()) in captured.err, "and the PID we were asked to mark"
         assert "Environment=" in captured.err, "point at the unit directive to fix"
 
@@ -217,12 +242,33 @@ class TestExecStopNoOpCases:
         self, monkeypatch, tmp_path, capsys
     ):
         """The negative twin. Same real format, a record naming somebody else."""
+        from gateway.status import _get_process_start_time
+
         home = tmp_path / "other-home"
         home.mkdir()
+        foreign = os.getppid()          # live, and not us — see the note above
         (home / "gateway.pid").write_text(
-            json.dumps({"pid": 999999, "kind": "hermes-gateway"}), encoding="utf-8"
+            json.dumps({"pid": foreign, "kind": "hermes-gateway",
+                        "start_time": _get_process_start_time(foreign)}),
+            encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
+        # get_running_pid only counts a pid as a live gateway when its COMMAND
+        # LINE looks like one — which is stricter and safer than "some process
+        # exists". That means the guard refuses ONLY when a genuine foreign
+        # gateway is live in this home, so the fixture has to present one rather
+        # than merely name a live pid. Patching the cmdline reader is the honest
+        # way to do that without spawning a second gateway in a unit test.
+        monkeypatch.setattr(
+            "gateway.status._read_process_cmdline",
+            lambda p: "hermes --profile other gateway run" if p == foreign else None,
+        )
+        # A LIVE gateway also holds its runtime lock, and get_running_pid checks
+        # that FIRST — which is precisely why a crashed gateway's stale pid file
+        # resolves to None (lock released) and no longer refuses a legitimate
+        # stop. Simulating the lock is simulating the environmental condition of
+        # a live foreign gateway; it does not stub the decision under test.
+        monkeypatch.setattr("gateway.status.is_gateway_runtime_lock_active", lambda p: True)
         monkeypatch.setattr(
             "gateway.status.write_planned_stop_marker",
             lambda pid: pytest.fail("must refuse BEFORE writing"),
@@ -231,7 +277,7 @@ class TestExecStopNoOpCases:
         rc = planned_stop.main([str(os.getpid())])
 
         assert rc == 1
-        assert "999999" in capsys.readouterr().err
+        assert str(foreign) in capsys.readouterr().err
 
     def test_a_corrupt_pid_file_does_not_crash_ExecStop(
         self, monkeypatch, tmp_path, capsys
@@ -249,7 +295,41 @@ class TestExecStopNoOpCases:
         rc = planned_stop.main([str(os.getpid())])
 
         assert rc == 0, "a corrupt probe must not refuse a legitimate stop"
-        assert capsys.readouterr().err == "" or True  # message optional, crash is not
+        # `X or True` was here and is a TAUTOLOGY — it read as coverage of the
+        # stderr behaviour and asserted nothing. What matters is that a corrupt
+        # file does not CRASH the hook, so assert the absence of a traceback.
+        assert "Traceback" not in capsys.readouterr().err
+
+    def test_a_STALE_pid_file_in_the_CORRECT_home_does_not_refuse_the_stop(
+        self, monkeypatch, tmp_path
+    ):
+        """A gateway SIGKILLed or OOM-killed never runs its atexit remover, so
+        gateway.pid keeps naming the dead pid until get_running_pid() cleans it —
+        which happens after import + config load. A systemd stop in that window
+        was REFUSED by the previous guard, which read "the record names somebody
+        else" as proof of a wrong HERMES_HOME. It is equally the signature of a
+        stale file in the RIGHT home, and it correlates with exactly the moment an
+        operator restarts a flapping unit.
+
+        get_running_pid(cleanup_stale=False) validates liveness and identity, so a
+        stale record resolves to None and the stop proceeds."""
+        home = tmp_path / "stale-home"
+        home.mkdir()
+        (home / "gateway.pid").write_text(
+            json.dumps({"pid": 999999, "kind": "hermes-gateway"}), encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        wrote = []
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker",
+            lambda pid: (wrote.append(pid), True)[1],
+        )
+
+        rc = planned_stop.main([str(os.getpid())])
+
+        assert rc == 0, "a DEAD pid in the record is stale, not a wrong home"
+        assert wrote == [os.getpid()], "and the marker must still be written"
 
     def test_an_unreadable_pid_file_does_not_refuse_the_stop(
         self, monkeypatch, tmp_path, capsys

@@ -139,13 +139,23 @@ class TestRunPyWiring:
                     inner = scope
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         inner = scope + (child.name,)
-                    elif isinstance(child, ast.Lambda):
+                    elif isinstance(child, (ast.Lambda, ast.GeneratorExp,
+                                            ast.ListComp, ast.SetComp,
+                                            ast.DictComp)):
                         # A LAMBDA IS A NESTED CLOSURE and was invisible: the
                         # comment below claimed "or any other nested closure"
                         # while the walk tagged FunctionDef only, so
                         # `_make = lambda: ShutdownClassifier()` in start_gateway's
                         # body, called from the handler, defeated the guard
                         # completely at 9 passed / 0 failed. Measured.
+                        #
+                        # AND CLOSING ONLY Lambda LEFT THE ISOMORPHIC HOLE OPEN:
+                        # a generator expression is equally scope-creating, and
+                        # `_s = (ShutdownClassifier() for _ in iter(int,1))` with
+                        # `next(_s)` in the handler is the same per-invocation
+                        # construction — measured still GREEN at 9/0 with only
+                        # Lambda tagged. All four comprehension forms are tagged
+                        # now, which is what makes the sentence below true.
                         inner = scope + ("<lambda>",)
                     if isinstance(child, ast.Call):
                         func = child.func

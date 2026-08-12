@@ -139,6 +139,14 @@ class TestRunPyWiring:
                     inner = scope
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         inner = scope + (child.name,)
+                    elif isinstance(child, ast.Lambda):
+                        # A LAMBDA IS A NESTED CLOSURE and was invisible: the
+                        # comment below claimed "or any other nested closure"
+                        # while the walk tagged FunctionDef only, so
+                        # `_make = lambda: ShutdownClassifier()` in start_gateway's
+                        # body, called from the handler, defeated the guard
+                        # completely at 9 passed / 0 failed. Measured.
+                        inner = scope + ("<lambda>",)
                     if isinstance(child, ast.Call):
                         func = child.func
                         if (isinstance(func, ast.Name) and func.id == name) or (

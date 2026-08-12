@@ -18,12 +18,20 @@ a genuinely unexpected SIGTERM arriving mid-teardown now exits **0** where
 lines and exits 0.
 
 The window is the teardown, bounded by the agent-turn drain
-(``hermes_cli/gateway.py`` ``restart_timeout = max(60, _drain_timeout + 30)``,
-default ``agent.restart_drain_timeout=180``) — so it can be LARGER than the 60s
-marker TTL. This matters because the PR that shipped the latch rejected the
-alternative design specifically for leaving a marker live "for up to its 60s
-TTL", calling that the worse direction. Measured, the shipped design has the
-same false-success property over a window that can be longer. The choice is
+(``hermes_cli/gateway.py`` ``restart_timeout = max(60, _drain_timeout + 30)``).
+BE EXACT ABOUT THE NUMBER — the first version of this paragraph said the default
+``agent.restart_drain_timeout`` is ``180`` and concluded the window is
+"potentially LONGER" than the 60s marker TTL. Measured: the default is **0**
+(``hermes_cli/config_defaults.py:52``), so ``restart_timeout = max(60, 30) =
+60`` — exactly ``_PLANNED_STOP_MARKER_TTL_S``. On a default configuration the
+two windows are EQUAL, not longer; longer holds only for a configured drain
+above 30s.
+
+That correction weakens the paragraph without changing its point. The PR that
+shipped the latch rejected the alternative design specifically for leaving a
+marker live "for up to its 60s TTL", calling that the worse direction — and the
+shipped design has the same false-success property over a window that is, by
+default, the same size. The choice is
 still defensible — exiting 0 when somebody has already asked us to stop is
 reasonable — but it was made on a distinction that does not hold, and saying so
 is the point of this paragraph.

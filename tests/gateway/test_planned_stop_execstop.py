@@ -15,7 +15,10 @@ appeared would pass even if the two sides drifted apart.
 
 from __future__ import annotations
 
+import json
 import os
+
+import pytest
 import subprocess
 import sys
 from pathlib import Path
@@ -50,8 +53,13 @@ class TestExecStopMarkerRoundTrip:
         assert _get_planned_stop_marker_path().exists()
 
         assert consume_planned_stop_marker_for_self() is True
-        # The consume is destructive by design — a marker must not be able to
-        # silence a second, genuinely unexpected signal.
+        # The consume is destructive by design — a MARKER must not be able to
+        # silence a second, genuinely unexpected signal. That property is about
+        # the marker and does NOT extend to the ShutdownClassifier latch, which
+        # keeps a PLANNED_STOP verdict for the process's life; see that module's
+        # declared residual. This is the fourth site of that sentence and the one
+        # the first sweep missed, because it wraps across two comment lines and a
+        # single-line grep cannot see it.
         assert consume_planned_stop_marker_for_self() is False
 
     def test_the_exact_command_line_in_the_unit_marks_the_stop(self):
@@ -147,7 +155,13 @@ class TestExecStopNoOpCases:
         wrong_home = tmp_path / "wrong-home"
         wrong_home.mkdir()
         # Somebody else's gateway lives here — the hallmark of the wrong home.
-        (wrong_home / "gateway.pid").write_text("999999\n", encoding="utf-8")
+        # WRITTEN IN THE PRODUCT'S OWN FORMAT. The first version of this fixture
+        # wrote "999999\n", a bare int the product NEVER writes, which is why it
+        # passed over a guard that refused every real stop: the fixture and the
+        # subject disagreed about the file, and only the fixture was consulted.
+        (wrong_home / "gateway.pid").write_text(
+            json.dumps({"pid": 999999, "kind": "hermes-gateway"}), encoding="utf-8"
+        )
         monkeypatch.setenv("HERMES_HOME", str(wrong_home))
         monkeypatch.setattr("gateway.status._get_pid_path", lambda: wrong_home / "gateway.pid")
 
@@ -165,6 +179,77 @@ class TestExecStopNoOpCases:
         assert "999999" in captured.err, "name the PID actually recorded there"
         assert str(os.getpid()) in captured.err, "and the PID we were asked to mark"
         assert "Environment=" in captured.err, "point at the unit directive to fix"
+
+    def test_the_REAL_producer_round_trips_into_this_guard(self, monkeypatch, tmp_path):
+        """THE MISSING CONTROL, and the one that would have caught a total
+        regression: drive gateway.status.write_pid_file() — the actual producer —
+        and then this consumer, instead of hand-writing a fixture.
+
+        The guard shipped comparing the pid file's RAW TEXT to str(pid). The
+        product writes json.dumps(_build_pid_record()), so the comparison was
+        never equal and ExecStop refused EVERY stop on EVERY gateway, silently
+        reinstating the pre-CLAWD-3786 defect on the systemd-native path this
+        card exists to fix. Both hand-written fixtures passed over it because
+        both used a format the product does not produce.
+
+        This module's own docstring already declares the round trip as the
+        load-bearing property — for the marker. The guard reads what the GATEWAY
+        writes, and that direction had no round-trip test at all."""
+        from gateway import status as gw_status
+
+        home = tmp_path / "real-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        gw_status.write_pid_file()          # the real producer, real format
+
+        wrote = []
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker",
+            lambda pid: (wrote.append(pid), True)[1],
+        )
+
+        rc = planned_stop.main([str(os.getpid())])
+
+        assert rc == 0, "a HEALTHY stop in the CORRECT home must not be refused"
+        assert wrote == [os.getpid()], "and the marker must actually be written"
+
+    def test_the_real_producer_format_still_catches_a_genuine_mismatch(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The negative twin. Same real format, a record naming somebody else."""
+        home = tmp_path / "other-home"
+        home.mkdir()
+        (home / "gateway.pid").write_text(
+            json.dumps({"pid": 999999, "kind": "hermes-gateway"}), encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker",
+            lambda pid: pytest.fail("must refuse BEFORE writing"),
+        )
+
+        rc = planned_stop.main([str(os.getpid())])
+
+        assert rc == 1
+        assert "999999" in capsys.readouterr().err
+
+    def test_a_corrupt_pid_file_does_not_crash_ExecStop(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """read_text() on non-UTF-8 raises UnicodeDecodeError, which is NOT an
+        OSError — the first version caught only OSError, so a corrupt gateway.pid
+        killed ExecStop with a traceback and wrote no marker. gateway/status.py
+        catches (OSError, UnicodeDecodeError) twenty lines away, for this."""
+        home = tmp_path / "corrupt-home"
+        home.mkdir()
+        (home / "gateway.pid").write_bytes(b"\xff\xfe\x00binary garbage")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: True)
+
+        rc = planned_stop.main([str(os.getpid())])
+
+        assert rc == 0, "a corrupt probe must not refuse a legitimate stop"
+        assert capsys.readouterr().err == "" or True  # message optional, crash is not
 
     def test_an_unreadable_pid_file_does_not_refuse_the_stop(
         self, monkeypatch, tmp_path, capsys

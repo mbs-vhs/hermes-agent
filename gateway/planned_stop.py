@@ -118,28 +118,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # available cross-check: if our home does not hold a PID file naming the pid
     # we were asked to mark, we are looking at the wrong directory. Refuse
     # loudly rather than write a marker nobody will read.
-    from gateway.status import _get_pid_path
+    # THE PID FILE HOLDS A JSON RECORD, NOT A BARE INTEGER. The first version of
+    # this guard compared the file's raw text to str(pid), and gateway/status.py
+    # writes json.dumps(_build_pid_record()) — so `recorded` was always a JSON
+    # blob, never equal to the pid, and the guard REFUSED EVERY STOP ON EVERY
+    # GATEWAY. It reinstated the exact defect this card exists to fix, on the one
+    # path the card is about (systemd-native stop), while printing a line blaming
+    # the operator's unit for a HERMES_HOME mismatch that did not exist — with the
+    # SAME path on both sides of the accusation. `hermes gateway stop` writes its
+    # own marker first, so the CLI path masked it entirely.
+    #
+    # The predicate was DEGENERATE: it returned "refuse" for the right home and
+    # the wrong home alike, so it could not discriminate the thing it existed to
+    # detect. Use the module's own readers — they handle the JSON record and the
+    # legacy bare-int form, and they already catch UnicodeDecodeError (a corrupt
+    # or binary gateway.pid raised it uncaught here, killing ExecStop with a
+    # traceback, because this only caught OSError).
+    from gateway.status import _pid_from_record, _read_pid_record
 
     try:
-        pid_path = _get_pid_path()
-        recorded = pid_path.read_text(encoding="utf-8").strip() if pid_path.exists() else ""
-    except OSError as exc:
-        # Could-not-measure is not a finding. Say so and carry on to the write
-        # rather than refusing a stop on an unreadable probe.
+        recorded_pid = _pid_from_record(_read_pid_record())
+    except Exception as exc:  # noqa: BLE001 - a probe must not decide a stop
         print(
-            f"hermes: could not read the gateway PID file to confirm HERMES_HOME "
+            f"hermes: could not read the gateway PID record to confirm HERMES_HOME "
             f"({exc}) — proceeding with the marker write UNVERIFIED (CLAWD-3786)",
             file=sys.stderr,
         )
-        recorded = str(pid)
-    if recorded and recorded != str(pid):
+        recorded_pid = None
+
+    # DECLARED RESIDUAL: a MISSING or unparseable pid file leaves recorded_pid
+    # None and is NOT treated as a mismatch. The most likely wrong-home shape — a
+    # directory no gateway has ever run in — therefore passes silently. Refusing
+    # on absence would refuse every first stop after a pid file is cleaned up,
+    # which is worse than the gap; closing it properly needs a second signal.
+    if recorded_pid is not None and recorded_pid != pid:
         print(
             f"hermes: HERMES_HOME={os.environ.get('HERMES_HOME') or '<unset>'} holds "
-            f"gateway.pid={recorded}, but this stop is for PID {pid}. The unit's "
-            "Environment= and the gateway's own HERMES_HOME disagree, so a marker "
-            "written here would never be read: this stop would be classified as an "
-            "unexpected kill. Fix the unit's Environment=HERMES_HOME to match its "
-            "--profile (CLAWD-3786)",
+            f"a gateway.pid naming PID {recorded_pid}, but this stop is for PID "
+            f"{pid}. The unit's Environment= and the gateway's own HERMES_HOME "
+            "disagree, so a marker written here would never be read: this stop "
+            "would be classified as an unexpected kill. Fix the unit's "
+            "Environment=HERMES_HOME to match its --profile (CLAWD-3786)",
             file=sys.stderr,
         )
         return 1

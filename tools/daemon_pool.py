@@ -86,6 +86,50 @@ SPAWN_THREAD_NAME = "daemon-pool-spawn"
 # pathological case degrades to the old leak instead of to a hang.
 _SPAWN_UNWIND_GRACE_S = 5.0
 
+# The same, for an interrupt that landed in Thread.start().  Deliberately much
+# shorter: start() also raises when the OS refuses a new thread, and then no
+# runner exists and nothing will EVER set the completion Event, so the full
+# grace would be spent holding _global_shutdown_lock for a runner that cannot
+# arrive.  Still ~1500x the measured hop, so a runner that does exist is seen.
+_SPAWN_UNLAUNCHED_GRACE_S = 0.1
+
+
+def _wait_through_signals(event: threading.Event, grace_s: float) -> bool:
+    """Wait up to ``grace_s`` for ``event``, ignoring repeat signals.
+
+    Bounded on purpose.  The ``remaining <= 0`` break is the only thing that
+    bounds it: ``Event.wait()`` with a non-positive timeout returns
+    immediately, so without that line an expired deadline becomes an unbounded
+    busy-spin *while holding the process-global* ``_global_shutdown_lock`` —
+    every ``submit()`` in the process wedged, which is worse than the transient
+    window this wait exists to close.
+    """
+    deadline = time.monotonic() + grace_s
+    while not event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            event.wait(remaining)
+        except BaseException:  # noqa: BLE001,S110 - a repeat signal; only the
+            pass  # original is re-raised, by design (see _run_on_daemon_thread)
+    return event.is_set()
+
+
+def _await_spawn_completion(
+    done: threading.Event, entered: threading.Event, launched: bool
+) -> None:
+    """Hold an interrupted caller until the spawn thread has finished."""
+    if not launched and not _wait_through_signals(entered, _SPAWN_UNLAUNCHED_GRACE_S):
+        # The interrupt landed inside Thread.start(), which is also where
+        # start() raises when the OS refuses a new thread — and in that case no
+        # runner exists, so nothing will EVER set `done` and spending the full
+        # grace on the lock would be pure loss.  `entered` tells the two apart:
+        # a runner that exists sets it as its first act.  It did not appear, so
+        # there is nothing in flight to wait for.
+        return
+    _wait_through_signals(done, _SPAWN_UNWIND_GRACE_S)
+
 
 def _run_on_daemon_thread(fn: Callable[[], None]) -> None:
     """Run ``fn`` on a throwaway daemon thread, re-raising on the caller's.
@@ -94,14 +138,22 @@ def _run_on_daemon_thread(fn: Callable[[], None]) -> None:
     argument inherits ``daemon=True`` from this thread.
 
     ``fn`` must own **every** side effect that needs undoing: nothing sequenced
-    after the join is guaranteed to run.  ``Thread.join()`` on the main thread
-    is interruptible — a SIGINT arrives there as a KeyboardInterrupt and
-    unwinds the caller while this thread keeps going.  The grace wait below
-    holds that unwind until ``fn`` has finished.
+    after the hop is guaranteed to run.  BOTH halves of the hop are
+    signal-interruptible on the main thread — ``Thread.start()`` blocks in
+    ``self._started.wait()`` until the child bootstraps, and ``Thread.join()``
+    blocks in ``_wait_for_tstate_lock()`` — and a SIGINT in either unwinds the
+    caller while the runner keeps going.  Both are therefore inside the ``try``
+    and both are covered by the grace wait.
 
-    That wait keys on a completion Event, NOT on ``runner.is_alive()``, and the
-    difference is load-bearing rather than stylistic.  On CPython <= 3.13 an
-    interrupted ``join()`` reaches the ``except:`` limb of
+    Guarding only the join would leave the *majority* of the window open:
+    ``start()`` measures ~34 µs against a join whose length is whatever is left
+    of ``fn``, i.e. roughly two thirds of a real hop.  Measured on 3.11.15 and
+    3.14.6 with a delayed bootstrap, an interrupt inside an unguarded
+    ``start()`` unwound the caller a full second before the worker was created.
+
+    The wait keys on a completion Event, NOT on ``runner.is_alive()``, and that
+    is load-bearing rather than stylistic.  On CPython <= 3.13 an interrupted
+    ``join()`` reaches the ``except:`` limb of
     ``Thread._wait_for_tstate_lock()``, and because a *live* thread's
     ``_tstate_lock`` is always held, that limb unconditionally calls
     ``self._stop()`` — marking a still-running thread stopped.  Measured on
@@ -114,12 +166,24 @@ def _run_on_daemon_thread(fn: Callable[[], None]) -> None:
     NB the caller is unresponsive to further Ctrl-C for the duration of the
     grace wait — repeat KeyboardInterrupts are discarded, and only the first
     is re-raised.  In practice that window is the microseconds ``fn`` needs;
-    ``_SPAWN_UNWIND_GRACE_S`` is only the pathological cap.
+    the grace constants are only the pathological caps.
+
+    A note on how this function got its shape, because the shape is the lesson.
+    Rounds of review found, in order: the detach happening on the wrong thread;
+    a grace wait that was inert on 3.11; and then this — a guarded ``join()``
+    with an unguarded ``start()`` directly above it.  Each fix was scoped to
+    where the last defect was found rather than to where the property has to
+    hold.  If you change this function, restate the property first (*the caller
+    must not leave submit()'s critical section while ``fn`` is mid-flight*) and
+    then check every statement between ``fn``'s first side effect and the
+    caller's return against it — not just the line the bug report points at.
     """
     raised: list[BaseException] = []
+    entered = threading.Event()
     done = threading.Event()
 
     def _target() -> None:
+        entered.set()  # proof-of-life; see _await_spawn_completion
         try:
             fn()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
@@ -128,22 +192,19 @@ def _run_on_daemon_thread(fn: Callable[[], None]) -> None:
             done.set()
 
     runner = threading.Thread(target=_target, name=SPAWN_THREAD_NAME, daemon=True)
-    runner.start()
+    launched = False
     try:
+        runner.start()
+        # Only reached if start() returned; an interrupt inside it leaves this
+        # False, and _await_spawn_completion() then has to work out whether a
+        # runner exists at all before committing to the full grace.
+        launched = True
         runner.join()
     except BaseException:
         # Signal delivery. Let the runner finish before unwinding, so the
         # caller cannot leave submit()'s critical section (and let
         # _python_exit() in) while _threads_queues is still half-updated.
-        deadline = time.monotonic() + _SPAWN_UNWIND_GRACE_S
-        while not done.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                done.wait(remaining)
-            except BaseException:  # noqa: BLE001,S110 - a repeat signal; only
-                pass  # the original is re-raised, by design (see docstring)
+        _await_spawn_completion(done, entered, launched)
         raise
     if raised:
         raise raised[0]

@@ -227,6 +227,118 @@ def test_interrupt_during_the_spawn_hop_leaves_no_registered_worker():
         pool.shutdown(wait=True)
 
 
+def test_interrupt_during_thread_start_also_waits_for_the_detach():
+    """Thread.start() is interruptible too, and it is the bigger half.
+
+    start() blocks in self._started.wait() until the child bootstraps.  A
+    SIGINT there unwinds the caller with no grace at all unless start() is
+    inside the guarded region — and it is the majority of the hop (~34us
+    against a join that is whatever is left of fn).  Measured with a delayed
+    bootstrap, an interrupt in an unguarded start() unwound the caller a full
+    second before the worker existed.
+    """
+    real_start = threading.Thread.start
+    hopped = []
+
+    def _interrupted_start(self):
+        real_start(self)
+        if self.name == SPAWN_THREAD_NAME and not hopped:
+            hopped.append(self)
+            # The runner IS launched at this point — exactly the state a
+            # signal landing in the tail of _started.wait() produces.
+            raise KeyboardInterrupt("simulated SIGINT inside Thread.start()")
+
+    pool = DaemonThreadPoolExecutor(max_workers=2)
+    try:
+        with (
+            _stalled_detach(),
+            mock.patch.object(threading.Thread, "start", _interrupted_start),
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                pool.submit(time.sleep, 0)
+
+        assert hopped, "the spawn hop was never taken — test proves nothing"
+        assert pool._threads, "no worker was created"
+        for worker in pool._threads:
+            assert worker not in _threads_queues, worker.name
+            assert worker.daemon is True, worker.name
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_the_grace_wait_is_bounded_when_the_runner_outlives_it(monkeypatch):
+    """The `remaining <= 0` break is the only thing bounding the grace wait.
+
+    Event.wait() with a non-positive timeout returns immediately, so without
+    that line an expired deadline is an unbounded busy-spin holding the
+    process-global _global_shutdown_lock — every submit() in the process
+    wedged.  Grace is shortened to 0.2s here against a 2.0s detach, so a wait
+    that respects its deadline unwinds at ~0.2s and one that spins waits out
+    the full 2.0s.
+    """
+    monkeypatch.setattr(daemon_pool, "_SPAWN_UNWIND_GRACE_S", 0.2)
+    real_join = threading.Thread.join
+    hopped = []
+
+    def _interrupted_join(self, timeout=None):
+        if self.name == SPAWN_THREAD_NAME and not hopped:
+            hopped.append(self)
+            raise KeyboardInterrupt("simulated SIGINT inside Thread.join()")
+        return real_join(self, timeout)
+
+    pool = DaemonThreadPoolExecutor(max_workers=2)
+    try:
+        with (
+            _stalled_detach(delay=2.0),
+            mock.patch.object(threading.Thread, "join", _interrupted_join),
+        ):
+            started = time.monotonic()
+            with pytest.raises(KeyboardInterrupt):
+                pool.submit(time.sleep, 0)
+            elapsed = time.monotonic() - started
+
+        assert hopped, "the spawn hop was never taken — test proves nothing"
+        assert elapsed >= 0.15, (
+            f"unwound after {elapsed:.3f}s — the grace wait did not run at all"
+        )
+        assert elapsed < 1.5, (
+            f"unwound after {elapsed:.3f}s against a 0.2s grace — the wait is "
+            "not respecting its deadline"
+        )
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_a_failed_thread_creation_does_not_spend_the_grace(monkeypatch):
+    """The trap in guarding start(): no runner, so `done` is never set.
+
+    Thread.start() is where a signal can interrupt us AND where the OS
+    refuses a new thread.  Treating the second like the first would hold the
+    process-global _global_shutdown_lock for the full grace waiting on a
+    runner that cannot arrive.  The proof-of-life Event tells them apart.
+    """
+    monkeypatch.setattr(daemon_pool, "_SPAWN_UNWIND_GRACE_S", 5.0)
+    monkeypatch.setattr(daemon_pool, "_SPAWN_UNLAUNCHED_GRACE_S", 0.1)
+
+    def _cannot_start(self):
+        raise RuntimeError("can't start new thread")
+
+    pool = DaemonThreadPoolExecutor(max_workers=2)
+    try:
+        with mock.patch.object(threading.Thread, "start", _cannot_start):
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="can't start new thread"):
+                pool.submit(lambda: None)
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, (
+            f"a failed thread creation held the caller {elapsed:.3f}s against a "
+            "5s grace — it waited for a runner that was never launched"
+        )
+    finally:
+        pool.shutdown(wait=True)
+
+
 def test_detach_still_runs_when_the_spawn_itself_raises():
     """NEW-4: pin the try/finally around super()._adjust_thread_count().
 

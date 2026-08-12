@@ -259,10 +259,10 @@ class TestSystemdStopIsMarkedPlanned:
         # The marker is PID-targeted; the consumer ignores a marker naming
         # anyone else, so the unit must pass systemd's own main PID.
         assert line.endswith(" $MAINPID"), line
-        # Must run while the gateway is still alive. ExecStopPost fires after
-        # the main process is gone, which would be too late to classify the
-        # SIGTERM that killed it.
-        assert unit.index("\nExecStop=") < unit.index("\nExecStopPost="), unit
+        # Deliberately NOT asserted: that ExecStop= appears above ExecStopPost=
+        # in the file. systemd parses the two into separate lists and always
+        # runs the stop phase first, so file position is not the property that
+        # makes this correct — a unit with them transposed behaves identically.
 
     def test_user_unit_marks_the_stop_as_planned(self):
         self._assert_marks_planned_stop(gateway_cli.generate_systemd_unit(system=False))

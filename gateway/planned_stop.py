@@ -42,10 +42,16 @@ with a leading ``-`` so a failure here can never fail the stop job — and a
 missing/unexpanded/dead PID is a no-op rather than an error: if the main process
 is already gone there is nothing to classify, and writing a marker for a PID we
 do not own could mis-classify a later shutdown.
+
+Best-effort is not silent, though: because that leading ``-`` also discards the
+exit code, a marker write that FAILS says so on stderr (``StandardError=journal``
+puts it beside the unit's own stop lines).  Otherwise the one failure mode that
+reintroduces the original defect would be the one leaving no evidence.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Optional, Sequence
 
@@ -55,16 +61,24 @@ def _parse_main_pid(argv: Sequence[str]) -> Optional[int]:
 
     systemd drops the argument entirely when ``$MAINPID`` is unset, and hands
     over the literal, unexpanded text if expansion ever fails — both land here
-    as "no PID" rather than as an error.  Values that parse but name nothing
-    (0, negatives) are left to the liveness check in :func:`main`, which is the
-    single place that decides whether a PID is worth marking.
+    as "no PID" rather than as an error.
+
+    A non-positive PID is rejected HERE and not left to the liveness check,
+    because that check is not the same guard on every install: with psutil
+    present ``_pid_exists(-1)`` is False, but on the documented stdlib fallback
+    (``gateway/status.py`` — psutil missing, e.g. a stripped-down install or an
+    import error during scaffolding) it is ``os.kill(-1, 0)``, which addresses
+    every process the caller can signal and returns True. Measured both ways:
+    without the guard, ``main(["-1"])`` writes a marker naming ``target_pid:
+    -1`` on the fallback path.
     """
     if not argv:
         return None
     try:
-        return int(argv[0].strip())
+        pid = int(argv[0].strip())
     except ValueError:
         return None
+    return pid if pid > 0 else None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -82,7 +96,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # The main process exited on its own; there is no shutdown left to
         # classify, and the PID could already be recycled.
         return 0
-    return 0 if write_planned_stop_marker(pid) else 1
+    if write_planned_stop_marker(pid):
+        return 0
+
+    # SAY SO. The unit wires this with a leading '-', so systemd discards the
+    # exit code: without this line a failed marker write (permissions, a full
+    # disk, a HERMES_HOME that differs between the unit's Environment= and the
+    # gateway's own) would silently restore the pre-CLAWD-3786 behaviour — the
+    # next stop reported as a crash — with nothing anywhere saying why.
+    # StandardError=journal, so this lands next to the unit's own stop lines.
+    print(
+        f"hermes: could not write the planned-stop marker for PID {pid} under "
+        f"HERMES_HOME={os.environ.get('HERMES_HOME') or '<unset>'} — this stop "
+        "will be classified as an unexpected kill and the unit will report "
+        "failed (CLAWD-3786)",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

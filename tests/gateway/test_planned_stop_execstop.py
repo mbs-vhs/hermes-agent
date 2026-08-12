@@ -95,10 +95,14 @@ class TestExecStopNoOpCases:
         assert planned_stop.main(["not-a-pid"]) == 0
         assert not _get_planned_stop_marker_path().exists()
 
-    def test_no_marker_for_a_pid_that_names_nothing(self):
-        """A negative PID parses fine; nothing may be marked on its behalf."""
-        assert planned_stop.main(["-1"]) == 0
-        assert not _get_planned_stop_marker_path().exists()
+    def test_a_pid_that_names_nothing_is_rejected_before_the_liveness_check(self):
+        """Asserted at the parse, not end-to-end, because end-to-end this is
+        psutil's behaviour and not ours: with psutil present `_pid_exists(-1)`
+        is False, but on the documented stdlib fallback it is `os.kill(-1, 0)`
+        — every process the caller can signal — and returns True. Measured
+        there: without this guard `main(['-1'])` writes `target_pid: -1`."""
+        assert planned_stop._parse_main_pid(["-1"]) is None
+        assert planned_stop._parse_main_pid(["0"]) is None
 
     def test_no_marker_for_a_dead_pid(self):
         assert planned_stop.main([str(_unusable_pid())]) == 0
@@ -111,3 +115,26 @@ class TestExecStopNoOpCases:
             "gateway.status.write_planned_stop_marker", lambda pid: False
         )
         assert planned_stop.main([str(os.getpid())]) == 1
+
+    def test_a_failed_write_says_so_on_stderr(self, monkeypatch, capsys):
+        """systemd discards the exit code (leading ``-``), so stderr is the only
+        channel left. Without it, the single failure mode that reinstates the
+        original defect is also the one that leaves no evidence."""
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker", lambda pid: False
+        )
+
+        planned_stop.main([str(os.getpid())])
+
+        captured = capsys.readouterr()
+        assert str(os.getpid()) in captured.err
+        assert "HERMES_HOME" in captured.err
+
+    def test_a_successful_write_is_quiet(self, capsys):
+        """The stop path runs this on every gateway; a healthy stop must not
+        put a line in the journal."""
+        assert planned_stop.main([str(os.getpid())]) == 0
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert captured.out == ""

@@ -1752,6 +1752,10 @@ from gateway.hard_exit import (  # noqa: E402
     _resolve_hung_shutdown_exit_code,
     arm_post_stop_exit_watchdog,
 )
+from gateway.shutdown_classification import (  # noqa: E402
+    ShutdownCause,
+    ShutdownClassifier,
+)
 
 # Evaluated HERE, not in gateway/hard_exit.py, and that placement is behavioural:
 # this line runs BEFORE load_hermes_dotenv(...) below, which loads ~/.hermes/.env
@@ -25542,36 +25546,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # before signalling us so they can exit cleanly instead.
     _signal_initiated_shutdown = False
 
+    # Why this life is ending, decided ONCE (CLAWD-3786). This handler fires
+    # more than once for a single shutdown — the planned-stop watcher tick and
+    # the SIGTERM behind it are ~22ms apart — and the marker proving the stop
+    # was planned is consumed destructively by whichever arrives first.
+    # Re-deciding on the second would classify an operator stop as an
+    # unexpected kill and exit 1. See gateway/shutdown_classification.py.
+    _shutdown_classifier = ShutdownClassifier()
+
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
-        # Planned --replace takeover check: when a sibling gateway is
-        # taking over via --replace, it wrote a marker naming this PID
-        # before sending SIGTERM. If present, treat the signal as a
-        # planned shutdown and exit 0 so systemd's Restart=on-failure
-        # doesn't revive us (which would flap-fight the replacer when
-        # both services are enabled, e.g. hermes.service + hermes-
-        # gateway.service from pre-rename installs).
-        planned_takeover = False
-        try:
-            from gateway.status import consume_takeover_marker_for_self
-            planned_takeover = consume_takeover_marker_for_self()
-        except Exception as e:
-            logger.debug("Takeover marker check failed: %s", e)
-
-        # Planned stop check: service managers and `hermes gateway stop`
-        # also send SIGTERM, which is indistinguishable from an unexpected
-        # external kill unless the CLI marks it first. SIGINT comes from an
-        # interactive Ctrl+C and is likewise an intentional foreground stop.
-        planned_stop = False
-        if received_signal == signal.SIGINT:
-            planned_stop = True
-        elif not planned_takeover:
-            try:
-                from gateway.status import consume_planned_stop_marker_for_self
-                planned_stop = consume_planned_stop_marker_for_self()
-            except Exception as e:
-                logger.debug("Planned stop marker check failed: %s", e)
+        cause = _shutdown_classifier.classify(received_signal)
 
         # Fast (<10ms) snapshot of who's asking us to shut down — runs
         # synchronously inside the asyncio signal handler, so we keep it
@@ -25590,15 +25576,26 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
-        if planned_takeover:
+        if cause is ShutdownCause.TAKEOVER:
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
             )
-        elif planned_stop:
+        elif cause is ShutdownCause.PLANNED_STOP:
             logger.info(
                 "Received %s as a planned gateway stop — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
+            )
+        elif cause is ShutdownCause.ALREADY_CLASSIFIED:
+            # The shutdown is already under way and its cause is settled. Most
+            # often this is the SIGTERM arriving behind the planned-stop
+            # watcher's tick (CLAWD-3786); log it — a signal landing mid-drain
+            # is worth seeing — but do NOT re-classify the life.
+            logger.info(
+                "Received %s while already shutting down (%s) — keeping that "
+                "classification",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
+                _shutdown_classifier.cause.value,
             )
         else:
             _signal_initiated_shutdown = True
@@ -25606,8 +25603,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # gateway_state=stopped persist for unexpected signals
             # (container/s6 SIGTERM on restart, OOM, bare kill) — see
             # issue #42675. Operator-initiated stops set a planned-stop
-            # marker first, land in the `planned_stop` branch above, and
-            # leave this flag False so they DO persist "stopped".
+            # marker first, classify as PLANNED_STOP above, and leave this
+            # flag False so they DO persist "stopped".
             runner._signal_initiated_shutdown = True
             logger.info(
                 "Received %s — initiating shutdown",

@@ -122,20 +122,52 @@ class TestRunPyWiring:
 
         tree = ast.parse(inspect.getsource(gateway_run))
 
-        def calls_to(name: str) -> list:
+        # Every call site, tagged with the chain of function scopes enclosing it.
+        # COUNTING SITES IS NOT ENOUGH, and that was a real hole: the whole fix is
+        # that the classifier is built ONCE PER GATEWAY LIFE, and moving the
+        # constructor from start_gateway's body into shutdown_signal_handler makes
+        # it once per INVOCATION -- the pre-CLAWD-3786 race verbatim -- while the
+        # site count stays at exactly 1. Measured: that one-line move left
+        # tests/gateway/ + tests/hermes_cli/ at 8638 passed with a failure set
+        # IDENTICAL to the control, and the PR's own three test files at 93/93.
+        # An assertion whose message says "per life" must be able to see placement.
+        def call_sites(name: str) -> list:
             found = []
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                if isinstance(func, ast.Name) and func.id == name:
-                    found.append(node)
-                elif isinstance(func, ast.Attribute) and func.attr == name:
-                    found.append(node)
+
+            def walk(node, scope):
+                for child in ast.iter_child_nodes(node):
+                    inner = scope
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        inner = scope + (child.name,)
+                    if isinstance(child, ast.Call):
+                        func = child.func
+                        if (isinstance(func, ast.Name) and func.id == name) or (
+                            isinstance(func, ast.Attribute) and func.attr == name
+                        ):
+                            found.append(scope)
+                    walk(child, inner)
+
+            walk(tree, ())
             return found
 
-        assert len(calls_to("ShutdownClassifier")) == 1, "one classifier per life"
-        assert len(calls_to("classify")) == 1, "one place decides"
+        def calls_to(name: str) -> list:
+            return call_sites(name)
+
+        sites = call_sites("ShutdownClassifier")
+        assert len(sites) == 1, f"one classifier per life, found {len(sites)}: {sites}"
+        # ...and it is constructed in start_gateway's OWN body, not inside the
+        # handler (or any other nested closure), which is what makes it per-life.
+        assert sites[0] == ("start_gateway",), (
+            "the classifier must be built in start_gateway's body -- one per gateway "
+            f"LIFE. Found it at scope {sites[0]}, which rebuilds it per call and "
+            "restores the watcher race this card exists to close."
+        )
+        # Scoped to start_gateway deliberately (N1): an unscoped walk matches ANY
+        # attribute named `classify` anywhere in gateway/run.py's ~26k lines, so a
+        # future intent/router `.classify(...)` would redden this with the message
+        # "one place decides" while nothing about shutdown had changed.
+        decide = [s for s in call_sites("classify") if s and s[0] == "start_gateway"]
+        assert len(decide) == 1, f"one place decides, found {len(decide)}: {decide}"
         # The marker consumes are destructive, so a second caller anywhere is a
         # second verdict: whoever loses the race gets no evidence.
         assert calls_to("consume_planned_stop_marker_for_self") == []

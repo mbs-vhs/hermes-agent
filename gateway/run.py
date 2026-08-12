@@ -25644,10 +25644,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # grace, then force-exit so a hung teardown can't pin the gateway.
         # systemd reaps any orphaned cgroup children. The 180s drain is inside
         # stop(), so awaiting wait_for_shutdown() keeps the watchdog clear of it.
-        # signal_initiated is a CALLABLE, not a bool: shutdown_signal_handler can
-        # fire more than once (planned stop -> flag False, later unexpected signal
-        # -> flag True), and the watchdog must read the flag at FIRE time, after
-        # the grace sleep. Passing the bare name would snapshot it at arm time.
+        # signal_initiated is a CALLABLE, not a bool. The ORIGINAL reason was that
+        # shutdown_signal_handler could fire more than once and flip the flag
+        # False -> True (planned stop, then a later unexpected signal), so the
+        # watchdog had to read it at FIRE time rather than snapshot it at arm time.
+        #
+        # THAT TRANSITION IS NOW UNREACHABLE and the justification is gone (found
+        # in independent review of CLAWD-3786): ShutdownClassifier latches the
+        # first verdict for the gateway's life, the flag is set above before this
+        # arm, and no later signal can change it. Late binding is provably inert
+        # on every reachable path today.
+        #
+        # The callable SHAPE is kept deliberately — it is the correct shape for a
+        # value read after a grace sleep, and reverting it to a bool would be a
+        # silent semantic narrowing that only holds while the latch does. Keeping
+        # a now-redundant guard is recorded here rather than deleted, so the next
+        # reader does not "simplify" it back on the strength of a stale comment.
         arm_post_stop_exit_watchdog(
             runner,
             lambda: _signal_initiated_shutdown,

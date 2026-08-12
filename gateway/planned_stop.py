@@ -96,14 +96,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # The main process exited on its own; there is no shutdown left to
         # classify, and the PID could already be recycled.
         return 0
+    # WRONG-HOME CHECK — the one failure mode specific to this deployment gap,
+    # and the one a write-failure guard structurally CANNOT see (found in
+    # independent review; the comment below used to claim it was covered).
+    #
+    # A HERMES_HOME that differs between the unit's Environment= and the
+    # gateway's own does NOT make the write fail. It makes it SUCCEED into the
+    # wrong directory: write_planned_stop_marker returns True, this returns 0,
+    # nothing is printed, and the gateway — polling its OWN home — never sees a
+    # marker. REPRODUCED: execstop_rc=0, empty stdout AND stderr, marker present
+    # in the unit's home and absent from the gateway's, gateway exits 1 and
+    # persists state=running. That is the pre-CLAWD-3786 behaviour, silently.
+    #
+    # Not reachable through the unit GENERATOR (both templates derive
+    # Environment="HERMES_HOME=..." from the same value as --profile), but the
+    # fleet's 11 units are hand-provisioned and part 1 of this rollout is a
+    # hand-written ExecStop= drop-in. A hand-written unit carrying --profile
+    # without a matching Environment= is exactly this shape.
+    #
+    # The gateway writes gateway.pid under ITS OWN home, so that file is the
+    # available cross-check: if our home does not hold a PID file naming the pid
+    # we were asked to mark, we are looking at the wrong directory. Refuse
+    # loudly rather than write a marker nobody will read.
+    from gateway.status import _get_pid_path
+
+    try:
+        pid_path = _get_pid_path()
+        recorded = pid_path.read_text(encoding="utf-8").strip() if pid_path.exists() else ""
+    except OSError as exc:
+        # Could-not-measure is not a finding. Say so and carry on to the write
+        # rather than refusing a stop on an unreadable probe.
+        print(
+            f"hermes: could not read the gateway PID file to confirm HERMES_HOME "
+            f"({exc}) — proceeding with the marker write UNVERIFIED (CLAWD-3786)",
+            file=sys.stderr,
+        )
+        recorded = str(pid)
+    if recorded and recorded != str(pid):
+        print(
+            f"hermes: HERMES_HOME={os.environ.get('HERMES_HOME') or '<unset>'} holds "
+            f"gateway.pid={recorded}, but this stop is for PID {pid}. The unit's "
+            "Environment= and the gateway's own HERMES_HOME disagree, so a marker "
+            "written here would never be read: this stop would be classified as an "
+            "unexpected kill. Fix the unit's Environment=HERMES_HOME to match its "
+            "--profile (CLAWD-3786)",
+            file=sys.stderr,
+        )
+        return 1
+
     if write_planned_stop_marker(pid):
         return 0
 
     # SAY SO. The unit wires this with a leading '-', so systemd discards the
-    # exit code: without this line a failed marker write (permissions, a full
-    # disk, a HERMES_HOME that differs between the unit's Environment= and the
-    # gateway's own) would silently restore the pre-CLAWD-3786 behaviour — the
-    # next stop reported as a crash — with nothing anywhere saying why.
+    # exit code: without this line a FAILED marker write (permissions, a full
+    # disk, a read-only home) would silently restore the pre-CLAWD-3786
+    # behaviour — the next stop reported as a crash — with nothing anywhere
+    # saying why. The wrong-HOME case is NOT in this list: it is a successful
+    # write to the wrong place and is caught by the check above instead.
     # StandardError=journal, so this lands next to the unit's own stop lines.
     print(
         f"hermes: could not write the planned-stop marker for PID {pid} under "

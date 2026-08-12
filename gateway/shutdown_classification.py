@@ -6,7 +6,32 @@ The gateway exits non-zero for an *unexpected* SIGTERM so a service manager with
 ``Restart=on-failure`` revives it, and exits 0 for a stop somebody asked for.
 The evidence that a stop was asked for is a short-lived planned-stop marker file
 written before the signal — and consuming it is **destructive** by design: a
-marker must not be able to silence a second, genuinely unexpected signal.
+MARKER must not be able to silence a second, genuinely unexpected signal.
+
+THE RESIDUAL, STATED RATHER THAN IMPLIED (found in independent review, not by
+the author). That destructive-consume property is about the MARKER. The latch is
+a second mechanism and it does not inherit it: once a PLANNED_STOP verdict is
+reached, every later signal in this gateway's life keeps that classification, so
+a genuinely unexpected SIGTERM arriving mid-teardown now exits **0** where
+``origin/main`` exits 1. REPRODUCED on real processes: marker -> planned SIGTERM
+-> six further unannounced SIGTERMs logs six ``keeping that classification``
+lines and exits 0.
+
+The window is the teardown, bounded by the agent-turn drain
+(``hermes_cli/gateway.py`` ``restart_timeout = max(60, _drain_timeout + 30)``,
+default ``agent.restart_drain_timeout=180``) — so it can be LARGER than the 60s
+marker TTL. This matters because the PR that shipped the latch rejected the
+alternative design specifically for leaving a marker live "for up to its 60s
+TTL", calling that the worse direction. Measured, the shipped design has the
+same false-success property over a window that can be longer. The choice is
+still defensible — exiting 0 when somebody has already asked us to stop is
+reasonable — but it was made on a distinction that does not hold, and saying so
+is the point of this paragraph.
+
+What the latch CANNOT reach: a genuine fault during teardown still exits
+non-zero, because ``runner.should_exit_with_failure`` and ``runner.exit_code``
+are both checked BEFORE the ``_signal_initiated_shutdown`` branch in
+``start_gateway``'s tail. Verified in review.
 
 ``start_gateway``'s shutdown handler can fire more than once for a *single*
 shutdown, and the first invocation eats the evidence the second one needs:

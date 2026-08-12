@@ -94,11 +94,22 @@ async def test_returns_a_task_so_the_caller_can_track_it(captured):
 
 @pytest.mark.asyncio
 async def test_signal_initiated_is_read_at_fire_time_not_arm_time(captured, monkeypatch):
-    """THE trap this refactor had to avoid. shutdown_signal_handler can fire more
+    """THE trap this refactor had to avoid. shutdown_signal_handler could fire more
     than once: a planned stop (flag False) then a later unexpected signal (flag
     True). The original closure read the start_gateway local at FIRE time. If the
     extraction had taken a plain bool, the value would be snapshotted at arm time
     and shutdown semantics would change silently.
+
+    READ THE TENSE: since CLAWD-3786's ShutdownClassifier latch, that False -> True
+    transition is UNREACHABLE in the real gateway — the verdict is latched for the
+    process's life and the flag is set before the watchdog is armed. This test
+    still passes because it drives a synthetic lambda over a dict, not the real
+    closure, so it pins the CONTRACT of arm_post_stop_exit_watchdog (a callable is
+    read at fire time) and NOT a sequence the gateway can still produce.
+
+    Keeping it is deliberate: the contract is what a future caller relies on. But
+    do not read a green run here as evidence that the live double-signal path
+    works — nothing in this file exercises it, and it no longer exists.
 
     Here: arm with the flag False, flip it to True before the grace elapses, and
     assert the FIRED code reflects the new value (1, not 0)."""

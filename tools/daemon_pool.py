@@ -90,7 +90,17 @@ _SPAWN_UNWIND_GRACE_S = 5.0
 # shorter: start() also raises when the OS refuses a new thread, and then no
 # runner exists and nothing will EVER set the completion Event, so the full
 # grace would be spent holding _global_shutdown_lock for a runner that cannot
-# arrive.  Still ~1500x the measured hop, so a runner that does exist is seen.
+# arrive.  This is a CAP CHOSEN TO BOUND THE FAILED-CREATION CASE, not a margin
+# a live runner cannot exceed -- the ~1500x figure it was first justified with is
+# an IDLE-HOST number.  Measured on this 24-core host under 16 busy threads + 16
+# busy processes, start() -> first statement of _target has p95 378ms and exceeds
+# this 100ms budget on 26% of spawns (30% at 64+64).  The two effects are
+# positively correlated: start() blocks in _started.wait() precisely while the
+# child is slow to bootstrap.  So under oversubscription a live runner can be
+# mistaken for one that never launched, skipping the grace and leaving the same
+# TRANSIENT window this function exists to close -- bounded, never a leak, because
+# _spawn_and_detach's finally still runs on the runner.  The invariant above is
+# correct; this constant is a supporting trade-off and is declared, not claimed.
 _SPAWN_UNLAUNCHED_GRACE_S = 0.1
 
 

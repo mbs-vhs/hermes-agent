@@ -234,6 +234,61 @@ class TestGeneratedSystemdUnits:
 
 
 
+class TestSystemdStopIsMarkedPlanned:
+    """CLAWD-3786: a `systemctl stop` must be distinguishable from a crash.
+
+    Every other stop path Hermes owns writes a planned-stop marker naming the
+    gateway PID before signalling, and the shutdown handler exits 0 when it
+    finds one. systemd's own stop path had no such hook, so an operator stop
+    exited 1 and the unit landed in `failed` — identical to a real crash.
+    `ExecStop=` is that hook, and it must be on BOTH generated units.
+    """
+
+    def _exec_stop_line(self, unit: str) -> str:
+        lines = [ln for ln in unit.splitlines() if ln.startswith("ExecStop=")]
+        assert len(lines) == 1, f"expected exactly one ExecStop=, got {lines}"
+        return lines[0]
+
+    def _assert_marks_planned_stop(self, unit: str) -> None:
+        line = self._exec_stop_line(unit)
+        # Leading '-': a failure to mark the stop must never fail the stop job
+        # itself (systemd would then report the unit as failed for the very
+        # reason we are here).
+        assert line.startswith("ExecStop=-"), line
+        assert "-m gateway.planned_stop" in line, line
+        # The marker is PID-targeted; the consumer ignores a marker naming
+        # anyone else, so the unit must pass systemd's own main PID.
+        assert line.endswith(" $MAINPID"), line
+        # Must run while the gateway is still alive. ExecStopPost fires after
+        # the main process is gone, which would be too late to classify the
+        # SIGTERM that killed it.
+        assert unit.index("\nExecStop=") < unit.index("\nExecStopPost="), unit
+
+    def test_user_unit_marks_the_stop_as_planned(self):
+        self._assert_marks_planned_stop(gateway_cli.generate_systemd_unit(system=False))
+
+    def test_system_unit_marks_the_stop_as_planned(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli, "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths",
+            lambda home, existing: [],
+        )
+        self._assert_marks_planned_stop(
+            gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+        )
+
+    def test_exec_stop_runs_the_units_own_interpreter(self):
+        """A bare `python` (or another venv's) would not import gateway.*."""
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        exec_start_python = unit.split("ExecStart=", 1)[1].split(" ", 1)[0]
+        assert self._exec_stop_line(unit) == (
+            f"ExecStop=-{exec_start_python} -m gateway.planned_stop $MAINPID"
+        )
+
+
 class TestGatewayStopCleanup:
     def test_stop_only_kills_current_profile_by_default(self, tmp_path, monkeypatch):
         """Without --all, stop uses systemd (if available) and does NOT call

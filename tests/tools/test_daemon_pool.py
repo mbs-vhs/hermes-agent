@@ -12,15 +12,20 @@ positive control (test_stdlib_pool_is_the_positive_control): without it,
 passing for a reason unrelated to this class.
 """
 
+import logging
 import subprocess
 import sys
 import threading
 import time
+from unittest import mock
+
+import pytest
 
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import _threads_queues
 
-from tools.daemon_pool import DaemonThreadPoolExecutor
+import tools.daemon_pool as daemon_pool
+from tools.daemon_pool import SPAWN_THREAD_NAME, DaemonThreadPoolExecutor
 
 
 def test_workers_are_daemon_threads():
@@ -49,11 +54,12 @@ def test_stdlib_pool_is_the_positive_control():
 
 
 def test_every_worker_of_a_saturated_pool_is_detached():
-    """Cover the at-capacity branch, not just the first spawn.
+    """Every spawn honours the contract, not just a pool's first one.
 
-    _adjust_thread_count() takes a different path once len(_threads) reaches
-    max_workers, so a pool that only ever creates one worker does not
-    exercise it.  A barrier forces all four to exist simultaneously.
+    NB this does NOT reach _adjust_thread_count()'s at-capacity branch —
+    see test_at_capacity_submit_skips_the_spawn_hop for that.  Branch
+    instrumentation showed the 5th submit below returns on the idle fast
+    path instead, because by then a worker is parked.
     """
     max_workers = 4
     barrier = threading.Barrier(max_workers, timeout=30)
@@ -70,14 +76,119 @@ def test_every_worker_of_a_saturated_pool_is_detached():
         for worker in workers:
             assert worker.daemon is True, worker.name
             assert worker not in _threads_queues, worker.name
-        # Submitting again once the pool is at capacity must not create a
-        # registered/non-daemon worker either.
-        assert pool.submit(lambda: "ok").result(timeout=10) == "ok"
+    finally:
+        barrier.abort()
+        pool.shutdown(wait=True)
+
+
+def test_at_capacity_submit_skips_the_spawn_hop():
+    """The at-capacity branch: taken, and taken without a daemon hop.
+
+    This branch is hot for max_workers=1 pools (agent/memory_manager.py,
+    tools/delegate_tool.py) — every submit while the single worker is busy
+    lands here — and it is what keeps the saturated case at stdlib cost.
+    Nothing else in this file executes it.
+    """
+    gate = threading.Event()
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    hops = []
+    try:
+        pool.submit(gate.wait, 30)  # occupies the only worker
+        assert len(pool._threads) == 1
+
+        real_hop = daemon_pool._run_on_daemon_thread
+        with mock.patch.object(
+            daemon_pool,
+            "_run_on_daemon_thread",
+            lambda fn: (hops.append(fn), real_hop(fn))[1],
+        ):
+            # Worker is busy => no idle token; pool is at capacity => the
+            # at-capacity branch, which must run inline.
+            pool.submit(lambda: None)
+
+        assert hops == [], "at-capacity submit paid for a spawn hop"
+        assert len(pool._threads) == 1
         for worker in pool._threads:
             assert worker.daemon is True, worker.name
             assert worker not in _threads_queues, worker.name
     finally:
-        barrier.abort()
+        gate.set()
+        pool.shutdown(wait=True)
+
+
+def test_interrupt_during_the_spawn_hop_leaves_no_registered_worker():
+    """Ctrl-C in the caller's join() must not orphan a registered worker.
+
+    Thread.join() on the main thread is signal-interruptible, so a SIGINT
+    during a concurrent tool batch unwinds submit() while the spawn thread
+    runs on and registers the worker in _threads_queues.  If the removal
+    belongs to the caller it never happens, and _python_exit() then joins a
+    worker that may be wedged on network I/O — the exact exit hang this
+    module exists to prevent.
+
+    The assertion deliberately runs the instant KeyboardInterrupt escapes
+    submit(), with no wait for the spawn thread: the contract is that the
+    caller cannot leave submit()'s critical section before the registration
+    has been undone.
+    """
+    real_join = threading.Thread.join
+    hopped = []
+
+    def _interrupted_join(self, timeout=None):
+        if self.name == SPAWN_THREAD_NAME and not hopped:
+            hopped.append(self)
+            raise KeyboardInterrupt("simulated SIGINT inside Thread.join()")
+        return real_join(self, timeout)
+
+    pool = DaemonThreadPoolExecutor(max_workers=2)
+    try:
+        with mock.patch.object(threading.Thread, "join", _interrupted_join):
+            with pytest.raises(KeyboardInterrupt):
+                pool.submit(time.sleep, 0)
+
+        assert hopped, "the spawn hop was never taken — test proves nothing"
+        assert not hopped[0].is_alive(), (
+            "the caller unwound while the spawn thread was still running"
+        )
+        assert pool._threads, "no worker was created"
+        for worker in pool._threads:
+            assert worker not in _threads_queues, worker.name
+            assert worker.daemon is True, worker.name
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_a_non_daemon_worker_is_left_registered_rather_than_orphaned(caplog):
+    """Fail-safe for a CPython whose spawn condition changes under us.
+
+    _detach_new_workers() must not strip a non-daemon worker out of
+    _threads_queues: threading._shutdown() joins non-daemon threads
+    regardless, so detaching one removes the only thing (_python_exit's
+    sentinel) that could ever wake it — a permanent hang, strictly worse
+    than the registered case it was trying to avoid.
+    """
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    impostor = threading.Thread(target=lambda: None, name="not-a-daemon")
+    impostor.daemon = False
+    try:
+        # Stand in for a future CPython that created a worker where this
+        # module's branches assume it cannot.
+        pool._threads.add(impostor)
+        _threads_queues[impostor] = pool._work_queue
+        with caplog.at_level(logging.ERROR, logger="tools.daemon_pool"):
+            pool._detach_new_workers(frozenset())
+
+        assert impostor in _threads_queues, (
+            "a non-daemon worker was detached from the exit hook; nothing "
+            "would ever send it the sentinel"
+        )
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("non-daemon" in m for m in messages), (
+            f"the fail-safe was silent; records={messages}"
+        )
+    finally:
+        _threads_queues.pop(impostor, None)
+        pool._threads.discard(impostor)
         pool.shutdown(wait=True)
 
 

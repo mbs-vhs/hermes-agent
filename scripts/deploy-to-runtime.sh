@@ -28,7 +28,7 @@
 #       load-bearing for far more than this venv (profile tree, kanban/state
 #       DBs, skills, the shared auth.json credential pool, clawd + alloy
 #       bind-mounts) — do NOT read "chat.vhs.box is gone" as "~/.hermes is
-#       retirable". See devops-process/NEMESIS.md.
+#       retirable". See devops-process/TERMINUS.md.
 # The 11 ai.hermes.gateway-*.service units under the operator's own manager are
 # LEGACY LEFTOVERS and are all MASKED (the fleet relocated to per-user accounts).
 #

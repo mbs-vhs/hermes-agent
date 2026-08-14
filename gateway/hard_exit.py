@@ -64,6 +64,18 @@ time, not arm time. The handler can fire more than once — a planned stop first
 semantics. So this takes a **zero-argument callable**, evaluated after the grace
 sleep. ``run.py`` passes ``lambda: _signal_initiated_shutdown``.
 
+**THAT ORIGINAL JUSTIFICATION NO LONGER HOLDS, and saying so is the honest form**
+(found in independent review of CLAWD-3786, not by the author).
+``ShutdownClassifier`` now latches the first verdict for the gateway's life, and
+``run.py`` sets the flag BEFORE arming this watchdog, so the False -> True
+transition described above is unreachable on every path that exists today. Late
+binding is inert here, not load-bearing.
+
+The callable shape is kept anyway: it is the right shape for a value read after a
+grace sleep, and narrowing it to a ``bool`` would bake in an assumption that holds
+only while the latch does. This is a knowingly-redundant guard, recorded rather
+than deleted — do not "simplify" it back on the strength of the paragraph above.
+
 WHERE THE GRACE CONSTANT LIVES, AND WHY IT STAYED IN run.py
 
 ``_HARD_EXIT_GRACE_SEC = _hard_exit_grace_seconds()`` is deliberately **not**

@@ -237,7 +237,7 @@ revert_and_prove() {
   # branch was unreachable "without stubbing git at the harness level" was FALSE and
   # review refuted it by construction: a fixture interpreter that chmods a directory
   # read-only on the verify invocation makes `git reset --hard` genuinely fail. That
-  # one fixture kills BOTH this exit (44/1) and the readback mutation (43/2), each of
+  # one fixture kills BOTH this exit (RED=1) and the readback mutation (RED=3), each of
   # which previously survived at 38/0. The fixture is skipped as root, declared.
   printf '[hermes-advance] DANGER: revert did NOT restore %s (HEAD is now %s). The fleet OAuth path is in an UNKNOWN state; a human must look.\n' \
     "${ANCHOR:0:9}" "${now:0:9}" >&2

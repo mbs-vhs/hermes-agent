@@ -22,7 +22,23 @@
 # it could never have been evidence. The discriminating probe is the LIVE RUNTIME PATH,
 # which is `~/.hermes/hermes-agent`:
 #
-#     grep -c 'hermes/hermes-agent' scripts/test_advance_hermes_runtime.sh   -> 0
+#     S=$(sed 's/^[[:space:]]*#.*//' scripts/test_advance_hermes_runtime.sh)
+#     printf '%s' "$S" | grep -c 'bash "$SUT"'                     -> 24 invocations
+#     printf '%s' "$S" | grep -n 'bash "$SUT"' | grep -vc 'HERMES_RUNTIME=' -> 0 unguarded
+#
+# COMMENTS ARE STRIPPED FIRST and that is not tidiness: the un-stripped form reads 26 and 1,
+# because THIS PARAGRAPH contains the pattern twice and one of those lines carries no
+# override. A probe that counts its own text was the defect being fixed here; writing the
+# fix reproduced it a second time within the same edit.
+#
+# NOT a string count over the whole file. `grep -c 'hermes/hermes-agent'` returns 2,
+# not 0 — both matches are in THIS PARAGRAPH, so the published value was unattainable
+# while the recipe existed: the identical self-matching-probe defect the paragraph
+# replaced, committed inside the replacement. And `grep -c 'HERMES_RUNTIME='` cannot
+# read ZERO — strip the override from every drive line and it still reports nonzero
+# from this text, so it could not discriminate the condition it was offered to exclude.
+# Counting UNGUARDED INVOCATIONS can: the subject defaults RUNTIME to the live path, so
+# a drive that OMITS the override is the reachable hazard, and that is what is counted.
 #
 # with the positive control that every drive overrides the runtime explicitly
 # (`grep -c 'HERMES_RUNTIME=' ` is nonzero), so the zero is a measured absence rather

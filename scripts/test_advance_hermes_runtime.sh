@@ -40,9 +40,19 @@
 # Counting UNGUARDED INVOCATIONS can: the subject defaults RUNTIME to the live path, so
 # a drive that OMITS the override is the reachable hazard, and that is what is counted.
 #
-# with the positive control that every drive overrides the runtime explicitly
-# (`grep -c 'HERMES_RUNTIME=' ` is nonzero), so the zero is a measured absence rather
-# than a file that never mentions the variable at all.
+# THE CONTROL FOR THE ZERO IS THE DENOMINATOR, NOT `grep -c 'HERMES_RUNTIME='`.
+# A sentence naming the latter stood here for one commit — SIX LINES under the paragraph
+# proving that exact grep cannot read zero. It was orphaned by the commit that replaced
+# the recipe and left standing as this header's LAST WORD on how to believe the number,
+# which is the worse position: a reader who stops there is told to trust the refuted one.
+# Measured: with the override stripped from EVERY drive line it still reads 3 — nonzero,
+# therefore "passes" — while 24 invocations sit unguarded.
+# The 24 IS the control. An instrument reporting `unguarded=0` over `invocations=0` would
+# be matching nothing at all, so both figures are published together and the degenerate
+# state is VISIBLE rather than inferred. That is also not hypothetical here: under the
+# `grep` an agent in this repo actually gets (a harness function routing to ugrep -G,
+# which treats a mid-pattern `$` as an anchor) `grep -c 'bash "$SUT"'` reads 0 while the
+# refuted control reads 27 — the failure text containing the success token, live.
 set -uo pipefail
 
 SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime.sh}"
@@ -50,7 +60,7 @@ SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime
 # derived from the file it guards cannot catch an assertion VANISHING — e.g. into a loop
 # that stopped iterating, which case 7 below is (three `mk_runtime` calls in a `for`).
 # It pins cardinality, never identity: delete one and add another and this stays green.
-EXPECTED_ASSERTIONS=78
+EXPECTED_ASSERTIONS=83
 
 PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -417,6 +427,93 @@ else
     && ok "4quinquies-d the DANGER state LATCHED (an untracked marker survives reset --hard)" \
     || bad "4quinquies-d the DANGER state did not latch" "no marker at $RT/.hermes-advance-DANGER"
 fi
+# ── 4septies. DANGER SHAPE (b): THE ANCHOR CAME BACK AND THE TREE DID NOT ──────────
+# THIS CASE EXISTS BECAUSE REVIEW MEASURED THE B3 FIX SILENTLY REMOVABLE IN ONE LINE.
+# Deleting `&& [ -z "$dirty" ]` from the PROVEN branch — the exact pre-B3 shape — turned
+# ZERO assertions red, non-root AND under a root shim, and so did blanking the `dirty`
+# readback and disabling the shape-(b) branch outright. The subject's own comment claims
+# "The tree is now part of the proof"; the clause that makes that true was proved by
+# nothing, and the header's declared shape (b) was exercised by nothing. That is this
+# repo's named remedy-inherits-the-disease shape: the guard added to stop `head_is`-alone
+# from proving a revert was itself unpinned.
+#
+# MECHANISM — a smudge filter that is NOT the inverse of its clean filter. `clean` is
+# identity and `smudge` APPENDS, so every checkout writes content the index does not
+# hold. `git reset --hard` therefore SUCCEEDS (HEAD returns to the anchor, which is what
+# separates this from 4quinquies) while leaving the working tree DIRTY. No `git` stub and
+# no harness-level interception: this is git doing exactly what it is configured to do,
+# with the same `git -C "$RT" config` device case 12 already uses for `merge.ff`.
+#
+# NOT ROOT-GATED, deliberately, and that is a strict gain over 4quinquies: this mechanism
+# is filter configuration rather than file permissions, so uid 0 cannot walk past it. The
+# shape-(b) branch is therefore covered on EVERY host, including the ones where
+# 4quinquies degrades to four skips.
+RT="$(mk_runtime dangerb 0)"
+printf 'seed\n' > "$RT/smudged.txt"
+printf 'smudged.txt filter=noisy\n' > "$RT/.gitattributes"
+git -C "$RT" add smudged.txt .gitattributes >/dev/null; git -C "$RT" commit -qm "anchor carries a filtered file"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+printf 'seed\nadvanced\n' > "$RT/smudged.txt"
+git -C "$RT" add smudged.txt >/dev/null; git -C "$RT" commit -qm "target changes the filtered file"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" reset -q --hard HEAD~1; git -C "$RT" fetch -q origin 2>/dev/null
+ANCHOR_B="$(git -C "$RT" rev-parse HEAD)"
+# The smudge script lives under venv/, which .gitignore excludes, so it is UNTRACKED —
+# `reset --hard` cannot remove it, and `status --untracked-files=no` cannot mistake it
+# for the dirt this case is about.
+{ printf '%s\n' '#!/usr/bin/env bash'; printf '%s\n' 'cat'; printf '%s\n' 'echo NOISE'; } > "$RT/venv/bin/smudge.sh"
+chmod +x "$RT/venv/bin/smudge.sh"
+git -C "$RT" config filter.noisy.clean cat
+git -C "$RT" config filter.noisy.smudge "$RT/venv/bin/smudge.sh"
+# Fail the VERIFY (`-c`) so the revert is triggered at all; the preflight is a separate
+# executable and must still succeed, exactly as in 4quinquies.
+rm -f "$RT/venv/bin/python"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'if [ "$1" = "-c" ]; then exit 3; fi'
+  printf '%s\n' "exec $(command -v python3) \"\$@\""
+} > "$RT/venv/bin/python"
+chmod +x "$RT/venv/bin/python"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+NOW_B="$(git -C "$RT" rev-parse HEAD)"
+DIRTY_B="$(git -C "$RT" status --porcelain --untracked-files=no 2>/dev/null)"
+# FIXTURE CONTROL, and it must assert BOTH halves. HEAD back at the anchor is what makes
+# this shape (b) rather than 4quinquies' shape (a); a dirty tree is what makes it a
+# finding at all. Either half alone would let this case pass over the wrong state.
+if [ "$NOW_B" = "$ANCHOR_B" ] && [ -n "$DIRTY_B" ]; then
+  ok "4septies-0 control: the revert RESTORED the anchor and the tree is genuinely dirty"
+else
+  bad "4septies-0 fixture control" "need HEAD==anchor AND a dirty tree; HEAD=$NOW_B anchor=$ANCHOR_B dirty=[$DIRTY_B]"
+fi
+rc_is "$RC" 5 "4septies-a anchor restored + DIRTY tree exits 5 (DANGER), not 1"
+case "$OUT" in *"revert PROVEN"*) bad "4septies-b it must NOT claim PROVEN over a dirty tree" "$OUT";;
+                *) ok "4septies-b and it did not claim the working tree was clean";; esac
+case "$OUT" in *"WORKING TREE IS DIRTY"*) ok "4septies-c it names the tree as the reason, not the pointer";;
+                *) bad "4septies-c the shape-(b) message did not print" "$OUT";; esac
+[ -f "$RT/.hermes-advance-DANGER" ] \
+  && ok "4septies-d shape (b) LATCHES, so the next run cannot launder it" \
+  || bad "4septies-d shape (b) did not latch" "no marker at $RT/.hermes-advance-DANGER"
+
+# MEASURED, one mutation at a time against a same-pass PASS=83 FAIL=0 SKIP=0 control at
+# the same path, each verified APPLIED by hash and `bash -n`'d, subject restored
+# byte-identical under a sha256 pin. NON-ROOT and under a root shim (`id -u` -> 0) the
+# figures are IDENTICAL, which is the claim above about host-independence, measured
+# rather than asserted:
+#
+#   delete `&& [ -z "$dirty" ]` from the PROVEN branch (the pre-B3 shape)  -> 4 red
+#   `dirty="$(git … status …)"` -> `dirty=""`                              -> 4 red
+#   the shape-(b) `if` -> `if false`                                       -> 1 red
+#
+# All three read ZERO before this case existed.
+#
+# THE 1 IS DECLARED RATHER THAN LEFT TO LOOK WEAK. Disabling the shape-(b) branch does
+# not fall through to success — it falls through to shape (a), which ALSO exits 5 and
+# ALSO latches. So rc, the absence of "revert PROVEN" and the marker are all RESCUED BY
+# ACCIDENT, and the only thing that discriminates is WHICH CAUSE IS NAMED: the tree, or
+# the pointer. That is the repo's own rule — when an rc is rescued downstream by
+# accident, pin the ATTRIBUTION — and 4septies-c is the assertion that does it. A reader
+# who "strengthens" -c into an rc check would delete the only coverage this mutation has.
+
 # ── 5. --dry-run mutates nothing on the path that WOULD mutate ─────────────────────
 RT="$(mk_runtime dry 3)"; BEFORE="$(git -C "$RT" rev-parse HEAD)"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" --dry-run 2>&1)"; RC=$?
@@ -463,9 +560,18 @@ OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 # CORRECTED 2026-08-16. The paragraph that stood here declared these two as NOT
 # isolating the provenance assert, citing "the suite stays 28/0". That number is
 # from a SUPERSEDED commit and the conclusion is now INVERTED — measured on this
-# tree: deleting the provenance assert gives 75/2 (6a and 6b red — it read 36/2, a
+# tree: deleting the provenance assert gives 76/2 (6a and 6b red — it read 36/2, a
 # count from a 38-assertion tip), and weakening
-# it to `.startswith('/')` also gives 75/2. Repairing the case-6 fixture (the
+# it to `.startswith('/')` also gives 76/2.
+# RE-CORRECTED 2026-08-16 by review. The figures above read 75/2 for one commit, which
+# is ARITHMETICALLY IMPOSSIBLE beside EXPECTED_ASSERTIONS=78 — 75+2=77 — and that is a
+# check needing no measurement at all. `git log -S` places the paragraph in the SAME
+# commit that bumped the pin 77 -> 78, so the number was taken pre-bump and republished
+# under an explicit date-stamped "measured on this tree" label. The paragraph exists to
+# retire a stale number and shipped one. RE-MEASURE AFTER AN ASSERTION IS ADDED, not
+# only after a code change: a count is meaningless without the control it was taken
+# against, and adding an assertion invalidates every sibling figure exactly as changing
+# a fixture does. Repairing the case-6 fixture (the
 # `cat >` that followed a symlink and truncated the host interpreter) is what
 # restored real coverage here; the fixture was writing over /usr/bin/python3.14
 # instead of the stub, so case 6 had been exercising nothing.

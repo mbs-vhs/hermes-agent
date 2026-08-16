@@ -22,11 +22,20 @@ SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime
 # derived from the file it guards cannot catch an assertion VANISHING — e.g. into a loop
 # that stopped iterating, which case 7 below is (three `mk_runtime` calls in a `for`).
 # It pins cardinality, never identity: delete one and add another and this stays green.
-EXPECTED_ASSERTIONS=72
+EXPECTED_ASSERTIONS=77
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n       %s\n' "$1" "${2:-}"; }
+# BL-3. A SKIP IS NOT A PASS. The root branch below emitted unconditional `ok` lines,
+# so on any host running as uid 0 — the default in most container CI — this round's
+# headline live-code fix had ZERO coverage while the suite reported full green at
+# exit 0. Measured with `id -u` shimmed: deleting the DANGER latch CHECK went 69/3
+# non-root and 72/0 root; never ENGAGING it went 68/4 and 72/0. A could-not-measure
+# rendered as a measured zero, in the suite for the fix that exists to stop exactly
+# that. The counter is separate now, so a machine consumer reading the summary line
+# can see the difference a human reading stdout could always have seen.
+skip() { SKIP=$((SKIP+1)); printf '  SKIP %s\n' "$1"; }
 rc_is(){ [ "$1" = "$2" ] && ok "$3" || bad "$3" "rc=$1 want=$2"; }
 head_is(){ # head_is <dir> <want-sha> <case>
   local got; got="$(git -C "$1" rev-parse HEAD 2>/dev/null)"
@@ -55,7 +64,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 # ── build a synthetic runtime: an origin, a checkout behind it, a stub venv ─────────
 mk_runtime() { # mk_runtime <name> <commits-behind>
-  local n="$1" behind="$2" up="$WORK/$1.origin" rt="$WORK/$1"
+  local behind="$2" up="$WORK/$1.origin" rt="$WORK/$1"
   rm -rf "$up" "$rt"
   git init -q --bare "$up"
   git clone -q "$up" "$rt" 2>/dev/null
@@ -328,13 +337,10 @@ case "$OUT" in *REFUSING*) bad "4quater-c it must NOT refuse" "$OUT";;
 # exit 5 -> 0) and M14 (the revert readback -> true, which otherwise prints
 # "revert PROVEN" over a runtime still sitting on the ADVANCED sha).
 if [ "$(id -u)" = "0" ]; then
-  ok "4quinquies SKIPPED as root (chmod does not constrain uid 0) — declared, not silent"
-  ok "4quinquies-b skipped"
-  ok "4quinquies-c skipped"
-  ok "4quinquies-d skipped (DANGER latch)"
-  ok "4quinquies-e skipped (DANGER latch)"
-  ok "4quinquies-f skipped (DANGER latch)"
-  ok "4quinquies-g skipped (DANGER latch)"
+  skip "4quinquies-0 as root: chmod cannot constrain uid 0, so the revert cannot be made to fail"
+  skip "4quinquies-a as root"
+  skip "4quinquies-b as root"
+  skip "4quinquies-d as root (the latch ENGAGING needs a real rc 5)"
 else
   RT="$(mk_runtime danger 0)"
   # `other.txt` is load-bearing: it keeps subdir/ ALIVE at the target commit. First
@@ -382,14 +388,6 @@ else
   [ -e "$RT/.hermes-advance-DANGER" ] \
     && ok "4quinquies-d the DANGER state LATCHED (an untracked marker survives reset --hard)" \
     || bad "4quinquies-d the DANGER state did not latch" "no marker at $RT/.hermes-advance-DANGER"
-  OUT2="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC2=$?
-  rc_is "$RC2" 2 "4quinquies-e the NEXT run refuses (rc 2) instead of laundering rc 5 into rc 0"
-  case "$OUT2" in *"already current"*) bad "4quinquies-f it took the no-op early exit over a DANGER state" "$OUT2";;
-                   *) ok "4quinquies-f and it did not report the runtime as a clean no-op";; esac
-  # A refusal whose remedy is unstated loops the caller forever. The message must name
-  # the file to remove, or an operator reading it cannot re-arm the timer.
-  case "$OUT2" in *".hermes-advance-DANGER"*) ok "4quinquies-g and the refusal names the marker to remove";;
-                   *) bad "4quinquies-g refusal does not say how to clear it" "$OUT2";; esac
 fi
 # ── 5. --dry-run mutates nothing on the path that WOULD mutate ─────────────────────
 RT="$(mk_runtime dry 3)"; BEFORE="$(git -C "$RT" rev-parse HEAD)"
@@ -498,17 +496,21 @@ rc_is "$RC" 2 "7d a trailing unrecognised argument is refused, not ignored"
 # merge. A realistic force-push SHARES an ancestor. Measured across the 2x2:
 #
 #   shipped                     rc 2  HEAD unmoved   1 parent
-#   --ff-only -> --no-edit      rc 2  HEAD unmoved   1 parent    (redundant, see below)
+#   --ff-only -> --no-edit      rc 2  HEAD unmoved   1 parent
 #   AHEAD above the fetch       rc 1  HEAD unmoved   1 parent    (--ff-only holds it shut)
 #   BOTH                        rc 0  HEAD MOVED     2 PARENTS   VERIFIED, and the commit
 #                                                                exists NOWHERE upstream
 #
-# So the fail-open needed BOTH defects, `--ff-only` was the only thing holding it shut,
-# and measuring AHEAD after the fetch removes the window rather than adding a guard
-# behind it. `--ff-only` is now KNOWINGLY REDUNDANT (§19.2) — with AHEAD=0 measured
-# against a fresh ref, HEAD is an ancestor of the target and a fast-forward is always
-# possible, so `--no-edit` reds ZERO here. It is kept as the statement of intent at the
-# point it applies, and this comment is why, so nobody reads its 0 as a coverage hole.
+# THE ROUND-4 CONCLUSION DRAWN FROM THAT TABLE — "`--ff-only` is KNOWINGLY REDUNDANT
+# (§19.2)" — WAS FALSE AND IS WITHDRAWN. It was inferred from `--no-edit` reading RED=0
+# in the row above, and that 0 is an artefact of the fixture: every fixture here sets
+# only `user.email`/`user.name`, so the whole table was measured under DEFAULT `merge.ff`
+# — the one configuration the redundancy depends on. §19.7(a), committed by the author
+# in the act of declaring coverage. Review refuted it twice (a race at the ref-vs-sha
+# window, and `merge.ff=false` with no race at all), and a §19.2 declaration is a licence
+# to DELETE, so publishing a false one is worse than leaving the guard unexplained.
+#
+# `--ff-only` is LOAD-BEARING. Case 12 below pins the half a fixture can reach.
 RT="$(mk_runtime forced 0)"
 echo a > "$RT/a.txt"; git -C "$RT" add -A >/dev/null; git -C "$RT" commit -qm "A (the commit upstream will rewrite away)"
 git -C "$RT" push -q origin HEAD:main 2>/dev/null; git -C "$RT" fetch -q origin 2>/dev/null
@@ -627,8 +629,58 @@ else
 fi
 head_is "$RT" "$ANCHOR_SS" "11c and HEAD did not move"
 
-printf '\n=== PASS=%d FAIL=%d (expected assertions: %d) ===\n' "$PASS" "$FAIL" "$EXPECTED_ASSERTIONS"
-if [ $((PASS+FAIL)) -ne "$EXPECTED_ASSERTIONS" ]; then
-  printf 'FAIL count drift: ran %d, expected %d\n' $((PASS+FAIL)) "$EXPECTED_ASSERTIONS"; exit 1
+# ── 4sexies. THE LATCH'S REFUSAL, PINNED ON EVERY HOST ─────────────────────────────
+# 4quinquies-e/f/g used to live inside the root-gated block, so on a root host the
+# round's headline fix was covered by nothing while the suite read full green. Only
+# ENGAGING the latch needs a genuinely failed revert (hence -d stays gated); the
+# REFUSAL it produces needs only the marker to exist, and that is host-independent.
+RT="$(mk_runtime latched 0)"
+BEFORE="$(git -C "$RT" rev-parse HEAD)"
+printf 'DANGER latched by the suite\n' > "$RT/.hermes-advance-DANGER"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+rc_is "$RC" 2 "4sexies-a a latched DANGER refuses (rc 2) instead of laundering to rc 0"
+case "$OUT" in *"already current"*) bad "4sexies-b it took the no-op early exit over a DANGER state" "$OUT";;
+                *) ok "4sexies-b and it did not report the runtime as a clean no-op";; esac
+# A refusal whose remedy is unstated loops the caller forever.
+case "$OUT" in *".hermes-advance-DANGER"*) ok "4sexies-c and the refusal names the marker to remove";;
+                *) bad "4sexies-c refusal does not say how to clear it" "$OUT";; esac
+# NEGATIVE CONTROL: clearing the marker re-arms. Without this, every assertion above is
+# satisfied by a subject that refuses unconditionally — an always-refusing advancer is
+# the permanent-refusal regression 4quater exists to catch, reached a different way.
+rm -f "$RT/.hermes-advance-DANGER"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+case "$OUT" in *"DANGER state and no human"*) bad "4sexies-d clearing the marker RE-ARMS" "still refusing after the marker was cleared";;
+                *) ok "4sexies-d clearing the marker RE-ARMS the timer";; esac
+
+# ── 12. `--ff-only` IS LOAD-BEARING: `merge.ff=false` MAKES THE FORMS DIVERGE ───────
+# Round 4 declared `--ff-only` knowingly redundant (§19.2) because `--no-edit` reddened
+# ZERO. That 0 was an artefact of THIS FILE: every fixture sets only user.email/user.name,
+# so the whole 2x2 was measured under DEFAULT `merge.ff` — the one configuration the
+# redundancy depends on. §19.7(a), committed while declaring coverage. A §19.2 note is a
+# licence to DELETE, so the false declaration was more dangerous than the unexplained
+# guard. `merge.ff` is unset on this host today, which is why this is a latent config
+# vector rather than a live break — and exactly why a fixture, not a measurement of the
+# current host, is what pins it.
+RT="$(mk_runtime mergeff 1)"
+git -C "$RT" config merge.ff false            # repo-local; user- and system-level do the same
+TARGET_FF="$(git -C "$RT" rev-parse origin/main)"
+if [ "$(git -C "$RT" config --get merge.ff)" = "false" ]; then
+  ok "12-0 control: merge.ff=false is actually set in the runtime config"
+else
+  bad "12-0 control" "merge.ff was not set; this case measures nothing"
+fi
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+rc_is "$RC" 0 "12a it still advances under merge.ff=false"
+head_is "$RT" "$TARGET_FF" "12b and HEAD is EXACTLY the target, not a merge commit on top of it"
+# The discriminating assertion. rc and HEAD-equality are both satisfiable by a
+# fast-forward; parent count is what separates a fast-forward from a synthesised merge.
+_PF=$(( $(git -C "$RT" rev-list --parents -n1 HEAD 2>/dev/null | wc -w) - 1 ))
+[ "$_PF" -le 1 ] && ok "12c and it is a FAST-FORWARD, not a synthesised merge commit" \
+                 || bad "12c HEAD is a merge commit" "parents=$_PF — merge.ff=false was honoured, so --ff-only is gone"
+
+printf '\n=== PASS=%d FAIL=%d SKIP=%d (expected assertions: %d) ===\n' "$PASS" "$FAIL" "$SKIP" "$EXPECTED_ASSERTIONS"
+[ "$SKIP" -eq 0 ] || printf 'UNMEASURED: %d assertion(s) SKIPPED on this host — the run is NOT full coverage.\n' "$SKIP"
+if [ $((PASS+FAIL+SKIP)) -ne "$EXPECTED_ASSERTIONS" ]; then
+  printf 'FAIL count drift: ran %d, expected %d\n' $((PASS+FAIL+SKIP)) "$EXPECTED_ASSERTIONS"; exit 1
 fi
 [ "$FAIL" -eq 0 ] || exit 1

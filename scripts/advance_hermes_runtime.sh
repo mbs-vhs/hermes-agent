@@ -118,22 +118,57 @@ fi
 # than answered once. Deletions upstream ALSO makes are not a local change (that was the
 # entire content of the "19 dirty files" on 2026-08-12); the preflight distinguishes them.
 #
-# BL-3 ROOT CAUSE. This ran ABOVE the fetch, so the pin-vs-drift question — the one
-# guard standing between a timer and somebody's deliberately held checkout — was
-# answered against a CACHED CLAIM about the remote. That is the identical defect the
-# comment on the fetch above names, applied to a different measurement, twenty lines
-# from where it is spelled out. The reachable consequence is not a stale count: after an
-# upstream force-push to a divergent history, the stale ref reports AHEAD=0, the fetch
-# then makes HEAD genuinely divergent, and `merge --ff-only` is the only thing left
-# refusing. Review measured that `--ff-only` -> `--no-edit` survives the suite at 45/0
-# and produces rc 0, "VERIFIED", and a MERGE COMMIT THAT EXISTS NOWHERE UPSTREAM and was
-# never preflighted. Measuring AHEAD after the fetch removes the window rather than
-# adding a second guard behind it.
-AHEAD="$(git -C "$RUNTIME" rev-list --count origin/main..HEAD 2>/dev/null || echo '?')"
-[ "$AHEAD" = "0" ] || die2 "$AHEAD local commit(s) not on origin/main — this looks like a deliberate pin, not drift"
-
+# BL-3. This ran ABOVE the fetch, so the pin-vs-drift question — the one guard standing
+# between a timer and somebody's deliberately held checkout — was answered against a
+# CACHED CLAIM about the remote: the identical defect the comment on the fetch above
+# names, twenty lines from where it is spelled out. After an upstream force-push the
+# stale ref reported AHEAD=0, the fetch then made HEAD genuinely divergent, and
+# `merge --ff-only` was the only thing left refusing.
+#
+# ROUND 4 THEN DECLARED `--ff-only` KNOWINGLY REDUNDANT (§19.2) ON THE STRENGTH OF THIS
+# FIX. THAT DECLARATION WAS FALSE AND IS WITHDRAWN. Review refuted it twice, both
+# reproduced, and a §19.2 declaration is a LICENCE TO DELETE — so a false one is more
+# dangerous than the hole it describes, which is this repo's own
+# "the remedy inherits the disease" shape.
+#
+#   (i) Moving the guard below the fetch NARROWED the window; it did not close it.
+#       AHEAD counted against the REF while the merge used the SHA resolved on the next
+#       line, so a ref update landing between those two git invocations reproduced the
+#       whole fail-open with the "root cause fix" in place: shipped rc 1, `--no-edit`
+#       rc 0 with a 2-parent commit and VERIFIED. That is fixed properly below by
+#       measuring against $TARGET.
+#  (ii) `merge.ff=false` in ANY config scope makes the two forms diverge with NO race at
+#       all — `--no-edit` synthesises a merge commit that exists nowhere upstream, and
+#       the NEXT run then refuses it as a pin at rc 2, wedging the advancer permanently.
+#       `merge.ff` is unset on this host today (global, system and local all rc 1), so
+#       this is latent rather than live — and it is exactly why the round-4 measurement
+#       read RED=0: every fixture sets only user.email/user.name, i.e. the control was
+#       drawn from the one configuration the redundancy depends on (§19.7a).
+#
+# So `--ff-only` is LOAD-BEARING, not redundant: it is what makes this script immune to a
+# repo-, user- or system-level `merge.ff`, which nothing here controls.
+# RESOLVE THE SHA FIRST, THEN MEASURE AGAINST IT. Round 4 moved this guard below the
+# fetch and declared the window closed. It was NARROWED, not closed: AHEAD counted
+# against the REF `origin/main` while everything downstream merges the SHA in $TARGET,
+# resolved on the next line — so a ref update landing between these two git invocations
+# reproduced the fail-open with the "root cause fix" fully in place. Review injected the
+# race at exactly that window and measured `--no-edit` producing rc 0, a 2-parent merge
+# commit, and VERIFIED, against a shipped rc 1.
+#
+# This script already knew the rule and writes it down ~95 lines below, on the deletion
+# classifier: "Against $TARGET, not origin/main ... resolving the ref again here would
+# classify against a commit we are not merging — the same TOCTOU as B2, reintroduced by
+# its own fix." The AHEAD guard was the one guard that did not obey it. Measuring against
+# $TARGET makes AHEAD=0 PROVE that HEAD is an ancestor of the commit actually merged,
+# which is the property the guard was always claimed to have.
 ANCHOR="$(git -C "$RUNTIME" rev-parse HEAD)"
 TARGET="$(git -C "$RUNTIME" rev-parse origin/main)"
+
+# A local commit means somebody is holding this checkout deliberately. Advancing would
+# discard it, so this refuses instead of guessing — the same pin-vs-drift question this
+# whole thing exists to answer, asked every run rather than answered once.
+AHEAD="$(git -C "$RUNTIME" rev-list --count "$TARGET"..HEAD 2>/dev/null || echo '?')"
+[ "$AHEAD" = "0" ] || die2 "$AHEAD local commit(s) not on the target ${TARGET:0:9} — this looks like a deliberate pin, not drift"
 BEHIND="$(git -C "$RUNTIME" rev-list --count HEAD.."$TARGET" 2>/dev/null || echo '?')"
 
 if [ "$ANCHOR" = "$TARGET" ]; then

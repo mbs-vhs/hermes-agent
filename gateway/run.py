@@ -15889,10 +15889,56 @@ class GatewayRunner(
             # BEFORE emitting session:start for the new one.  Mirrors the
             # explicit /new path so external observers see start/end pairs
             # even on idle-driven turnover.  See #28746.
-            _prior_session_id = getattr(
-                session_entry, "auto_reset_prior_session_id", None
+            # ``prev_session_id`` is upstream's persisted prior-session field
+            # (it also drives the Slack/Discord continuity hint), so it must
+            # NOT be cleared to mark the emit done — ``session_end_emitted_for``
+            # records which prior id already fired instead (CLAWD-3534).
+            #
+            # Two guards, answering two different questions, neither redundant:
+            #
+            #  * the boundary CLASSIFIER decides this was an auto-reset at all.
+            #    We do NOT own ``prev_session_id`` and upstream already threads
+            #    it into lineage columns ("parent_session_id", "_reset_from"),
+            #    so a later upstream release could set it on a path that is not
+            #    an auto-reset — an explicit /new recording its parent, say.
+            #    Keying on the id alone would then fire a spurious
+            #    reason="auto_reset" close on every /new across the fleet.
+            #  * ``session_end_emitted_for`` gives idempotence.
+            #
+            # The classifier reads ``auto_reset_reason`` as well as the flag,
+            # and the OR is load-bearing rather than belt-and-braces:
+            # ``was_auto_reset`` has a second consumer at
+            # gateway/slash_commands.py:2229, which eats the flag on the /model
+            # path (also #48031) and emits no session:end of its own.  An idle
+            # reset whose next inbound is /model would therefore lose the close
+            # outright.  ``auto_reset_reason`` is set by the same two arms
+            # (session.py), is persisted, is untouched by that path, and is
+            # cleared only inside ``if _was_auto_reset:`` further down — so it
+            # survives exactly the case that would otherwise drop the close,
+            # and it is None on /new and /switch, keeping the tripwire closed.
+            #
+            # That same asymmetry is what makes the marker load-bearing: on the
+            # /model path the reason is never cleared, so every later turn that
+            # gets in here — ``_is_new_session`` still gates entry — re-classifies,
+            # and only the marker stops a duplicate close.
+            #
+            # Concurrent double-emit (two tasks reading the marker unset across
+            # the await) is NOT reachable here: same-key arrivals are serialised
+            # by _claim_active_session_slot before this point.  The
+            # clear-after-emit protocol this replaces had no such argument.
+            _prior_session_id = getattr(session_entry, "prev_session_id", None)
+            _session_end_emitted_for = getattr(
+                session_entry, "session_end_emitted_for", None
             )
-            if _prior_session_id:
+            _is_auto_reset_boundary = bool(
+                _was_auto_reset
+                or getattr(session_entry, "auto_reset_reason", None)
+            )
+            if (
+                _is_auto_reset_boundary
+                and _prior_session_id
+                and _session_end_emitted_for != _prior_session_id
+            ):
                 try:
                     await self.hooks.emit("session:end", {
                         "platform": (
@@ -15909,10 +15955,14 @@ class GatewayRunner(
                         _prior_session_id,
                         exc_info=True,
                     )
-                # Consume the field so it never fires twice for the same
-                # auto-reset event.
+                # Mark this prior id emitted so it never fires twice for the
+                # same auto-reset.  Set after the emit — matching the clear it
+                # replaces — so a hard failure (e.g. cancellation, which the
+                # ``except Exception`` above deliberately does not swallow)
+                # leaves the boundary event still owed rather than silently
+                # dropped.
                 try:
-                    session_entry.auto_reset_prior_session_id = None
+                    session_entry.session_end_emitted_for = _prior_session_id
                 except Exception:
                     pass
             await self.hooks.emit("session:start", {

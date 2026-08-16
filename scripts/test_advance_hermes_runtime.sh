@@ -23,13 +23,18 @@
 # which is `~/.hermes/hermes-agent`:
 #
 #     S=$(sed 's/^[[:space:]]*#.*//' scripts/test_advance_hermes_runtime.sh)
-#     printf '%s' "$S" | grep -c 'bash "$SUT"'                     -> 24 invocations
+#     printf '%s' "$S" | grep -c 'bash "$SUT"'                     -> 25 invocations
 #     printf '%s' "$S" | grep -n 'bash "$SUT"' | grep -vc 'HERMES_RUNTIME=' -> 0 unguarded
 #
-# COMMENTS ARE STRIPPED FIRST and that is not tidiness: the un-stripped form reads 26 and 1,
-# because THIS PARAGRAPH contains the pattern twice and one of those lines carries no
-# override. A probe that counts its own text was the defect being fixed here; writing the
-# fix reproduced it a second time within the same edit.
+# COMMENTS ARE STRIPPED FIRST and that is not tidiness: the un-stripped form reads 28 and 2.
+# RE-MEASURED 2026-08-16 (round 8). It read `26 and 1` for one commit, and the REASON given
+# was false as well as the figures: it said "THIS PARAGRAPH contains the pattern twice".
+# The drive pattern occurs in THREE comment lines across TWO paragraphs — this recipe's own
+# two lines above, plus the ugrep sentence added further down, which is itself the third
+# occurrence and the second unguarded one. A probe that counts its own text was the defect
+# being fixed here; the fix reproduced it, and then the fix FOR the fix reproduced it again
+# by adding a fourth counted line without re-running the count. Comment-stripping is what
+# makes the number stable; publishing both forms is what makes the drift legible.
 #
 # NOT a string count over the whole file. `grep -c 'hermes/hermes-agent'` returns 2,
 # not 0 — both matches are in THIS PARAGRAPH, so the published value was unattainable
@@ -46,13 +51,13 @@
 # the recipe and left standing as this header's LAST WORD on how to believe the number,
 # which is the worse position: a reader who stops there is told to trust the refuted one.
 # Measured: with the override stripped from EVERY drive line it still reads 3 — nonzero,
-# therefore "passes" — while 24 invocations sit unguarded.
-# The 24 IS the control. An instrument reporting `unguarded=0` over `invocations=0` would
+# therefore "passes" — while 25 invocations sit unguarded.
+# The 25 IS the control. An instrument reporting `unguarded=0` over `invocations=0` would
 # be matching nothing at all, so both figures are published together and the degenerate
 # state is VISIBLE rather than inferred. That is also not hypothetical here: under the
 # `grep` an agent in this repo actually gets (a harness function routing to ugrep -G,
 # which treats a mid-pattern `$` as an anchor) `grep -c 'bash "$SUT"'` reads 0 while the
-# refuted control reads 27 — the failure text containing the success token, live.
+# refuted control reads 28 — the failure text containing the success token, live.
 set -uo pipefail
 
 SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime.sh}"
@@ -513,6 +518,43 @@ case "$OUT" in *"WORKING TREE IS DIRTY"*) ok "4septies-c it names the tree as th
 # the pointer. That is the repo's own rule — when an rc is rescued downstream by
 # accident, pin the ATTRIBUTION — and 4septies-c is the assertion that does it. A reader
 # who "strengthens" -c into an rc check would delete the only coverage this mutation has.
+#
+# DECLARED RESIDUAL (round 8) — THE RULE ABOVE IS PINNED IN ONE DIRECTION ONLY, and saying
+# so is the whole point of declaring it rather than leaving the next round to find it.
+# Shape (b)'s message is pinned by 4septies-c. Shape (a)'s is pinned by NOTHING, in BOTH of
+# its channels, measured one mutation at a time, non-root and under a root shim:
+#
+#   shape (a)'s message text rewritten to shape (b)'s wording     -> 0 red
+#   latch_danger "tree-not-restored" -> "anchor-not-restored"      -> 0 red
+#
+# The first is the worse one. A genuinely FAILED revert — HEAD not back at the anchor, which
+# the exit-code table calls an UNKNOWN state and is strictly more dangerous than a dirty
+# tree — would tell the operator the working tree is dirty, and once both shapes emit the
+# same string the discriminator 4septies-c relies on has stopped existing. The second leaves
+# the marker's machine-readable `shape:` field — the thing a triaging human reads out of
+# .hermes-advance-DANGER — unpinned in both branches.
+#
+# 4quinquies (the shape-(a) case) asserts only rc 5, the ABSENCE of "revert PROVEN", and
+# marker existence; nothing pins its wording. It is also root-gated, so on a uid-0 host
+# shape (a) has NO coverage at all. Not closed here: this round's subject is shape (b), and
+# closing (a) means giving 4quinquies a message assertion plus a non-permission-based
+# fixture so it survives root — which is its own change.
+#
+# THREE FURTHER RESIDUALS from the same round, declared rather than silently carried:
+#   * 4septies-0's LABEL says "the revert RESTORED the anchor" and it measures POST-run
+#     state, which cannot separate that from "HEAD never moved". Injecting a dirty tree
+#     before the drive makes the subject refuse at the working-tree guard (rc 2, no revert
+#     runs) and -0 still prints ok. It fails LOUDLY (-a/-c/-d red), so this is a label
+#     overstating its assertion, not a false green. The missing half is a PRE-run clean-tree
+#     assertion, the way 4quater-0 / 10-0 / 11-0 / 12-0 all do it.
+#   * `{ ... } > "$RT/venv/bin/python"` FOLLOWS the symlink mk_runtime created. Deleting the
+#     `rm -f` above it truncates the host interpreter and builds a wrapper that execs
+#     itself — an exec loop, not a failing assertion. Same shape as the B4 incident this
+#     file already records; the `rm -f` is present and correct, and now says why.
+#   * Two added fixture lines are INERT: the first `push` (the later one already carries the
+#     anchor commit) and `filter.noisy.clean cat` (git already uses identity with no clean
+#     filter). Blanking either leaves 83/0/0. Kept as statements of intent per 19.2, and
+#     named here so neither reads as coverage.
 
 # ── 5. --dry-run mutates nothing on the path that WOULD mutate ─────────────────────
 RT="$(mk_runtime dry 3)"; BEFORE="$(git -C "$RT" rev-parse HEAD)"
@@ -560,9 +602,9 @@ OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 # CORRECTED 2026-08-16. The paragraph that stood here declared these two as NOT
 # isolating the provenance assert, citing "the suite stays 28/0". That number is
 # from a SUPERSEDED commit and the conclusion is now INVERTED — measured on this
-# tree: deleting the provenance assert gives 76/2 (6a and 6b red — it read 36/2, a
+# tree: deleting the provenance assert gives 81/2 (6a and 6b red — it read 36/2, a
 # count from a 38-assertion tip), and weakening
-# it to `.startswith('/')` also gives 76/2.
+# it to `.startswith('/')` also gives 81/2.
 # RE-CORRECTED 2026-08-16 by review. The figures above read 75/2 for one commit, which
 # is ARITHMETICALLY IMPOSSIBLE beside EXPECTED_ASSERTIONS=78 — 75+2=77 — and that is a
 # check needing no measurement at all. `git log -S` places the paragraph in the SAME
@@ -571,7 +613,16 @@ OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 # retire a stale number and shipped one. RE-MEASURE AFTER AN ASSERTION IS ADDED, not
 # only after a code change: a count is meaningless without the control it was taken
 # against, and adding an assertion invalidates every sibling figure exactly as changing
-# a fixture does. Repairing the case-6 fixture (the
+# a fixture does.
+#
+# AND THAT SENTENCE WAS BROKEN BY THE COMMIT THAT WROTE IT — round 8, measured. It shipped
+# `76/2` while adding five assertions (78 -> 83), so `76+2=78` disagreed with its own pin
+# by five: the identical arithmetic self-refutation the paragraph above exists to retire
+# (`75+2=77` against a pin of 78), one layer out, six lines under the rule forbidding it.
+# `76/2` was CORRECT for the 78-assertion parent and was invalidated by its own commit.
+# The figure for this tip is 81/2, re-derived here rather than adjusted. THE LESSON IS NOT
+# THE NUMBER: a rule written into a file does not apply itself, and the author who writes
+# it is the one least likely to re-read it in the same sitting. Repairing the case-6 fixture (the
 # `cat >` that followed a symlink and truncated the host interpreter) is what
 # restored real coverage here; the fixture was writing over /usr/bin/python3.14
 # instead of the stub, so case 6 had been exercising nothing.

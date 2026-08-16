@@ -36,7 +36,9 @@
 #   0  advanced and verified, or already current (no-op)
 #   1  advance failed or verification failed -> REVERTED to the recorded anchor
 #   2  refused BEFORE mutating (preflight says unsafe/unmeasured, or bad state)
-#   5  DANGER: reverted but the anchor did not come back. A human must look.
+#   5  DANGER, two shapes: (a) the revert ran and the anchor did NOT come back,
+#      or (b) the anchor came back but the WORKING TREE did not, so the
+#      consumers still load the advanced code. Both need a human.
 
 set -uo pipefail
 
@@ -123,12 +125,12 @@ revert_and_prove() {
       "${ANCHOR:0:9}" "$dirty" >&2
     exit 5
   fi
-  # DECLARED RESIDUAL (uncovered): no test drives this branch. Measured — mutating
-  # this `exit 5` to `exit 0` leaves the suite GREEN at 38/0, so a revert that
-  # FAILED would report success and nothing would catch the regression. Reaching it
-  # needs `git reset --hard` itself to fail, which a fixture cannot arrange without
-  # stubbing git at the harness level; a fragile test here would be worse than an
-  # honest gap. The DIRTY-TREE danger path above IS covered (M22 reddens 5).
+  # COVERED as of 2026-08-16 by case 4quinquies. My earlier declaration that this
+  # branch was unreachable "without stubbing git at the harness level" was FALSE and
+  # review refuted it by construction: a fixture interpreter that chmods a directory
+  # read-only on the verify invocation makes `git reset --hard` genuinely fail. That
+  # one fixture kills BOTH this exit (44/1) and the readback mutation (43/2), each of
+  # which previously survived at 38/0. The fixture is skipped as root, declared.
   printf '[hermes-advance] DANGER: revert did NOT restore %s (HEAD is now %s). The fleet OAuth path is in an UNKNOWN state; a human must look.\n' \
     "${ANCHOR:0:9}" "${now:0:9}" >&2
   exit 5
@@ -162,9 +164,14 @@ if [ -n "$DIRTY" ]; then
     LOCAL_WORK="${LOCAL_WORK}${_line}"$'\n'
   done <<< "$DIRTY"
   if [ -n "$LOCAL_WORK" ]; then
+    # EXIT 2, not 1. The header defines 1 as "advance failed -> REVERTED to the
+    # anchor" and 2 as "refused BEFORE mutating". This refusal mutates NOTHING:
+    # HEAD is unmoved, no merge was attempted, no revert ran. Returning 1 told a
+    # reader (and any log rule keying on rc) to go looking for a rollback that
+    # never happened. rc is the only machine-readable signal this script emits.
     printf '[hermes-advance] REFUSING: %s carries local working-tree changes upstream does not make.\n%s\nCommit, stash or discard them deliberately; this script will not do it for you.\n' \
       "$RUNTIME" "$LOCAL_WORK" >&2
-    exit 1
+    exit 2
   fi
 fi
 

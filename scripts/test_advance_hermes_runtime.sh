@@ -18,7 +18,7 @@
 set -uo pipefail
 
 SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime.sh}"
-EXPECTED_ASSERTIONS=38
+EXPECTED_ASSERTIONS=45
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -202,8 +202,10 @@ BEFORE="$(git -C "$RT" rev-parse HEAD)"
 MARK="do-not-destroy-$$"
 printf '\n# %s\n' "$MARK" >> "$RT/agent/anthropic_adapter.py"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
-[ "$RC" != "0" ] && ok "4bis-a uncommitted work -> NON-zero rc (it refused)" \
-  || bad "4bis-a uncommitted work -> non-zero rc" "rc=0: it proceeded over local work"
+# rc 2 SPECIFICALLY, not merely non-zero: the header defines 1 as "advanced then
+# reverted" and 2 as "refused before mutating". A refusal returning 1 sends a
+# reader hunting a rollback that never happened, and `!= 0` cannot see that.
+rc_is "$RC" 2 "4bis-a uncommitted work -> rc 2 (REFUSED before mutating, not 1)"
 file_has "$RT" "agent/anthropic_adapter.py" "$MARK" \
   "4bis-b and the uncommitted edit SURVIVED on disk"
 head_is "$RT" "$BEFORE" "4bis-c and HEAD did not move"
@@ -251,6 +253,97 @@ if [ "$LANDED" = "$RACED" ]; then
 else
   ok "4ter-c no un-preflighted commit was left executing"
 fi
+# ── 4quater. B1 PERMISSIVE DIRECTION: an upstream-deletion tree must STILL ADVANCE ──
+# The refusal direction was covered (4bis); the PERMIT direction was not, and review
+# measured the consequence: `UPSTREAM_DELETES=""` or breaking the deletion classifier
+# turns the advancer into a PERMANENT REFUSAL and this suite stayed 38/0. That is the
+# regression this whole PR exists to prevent -- a guard that refuses forever on the
+# runtime that reached 10,078 commits behind is worse than the drift it replaced.
+#
+# The shape is the real one: the "19 dirty files" on 2026-08-12 were deletions that
+# UPSTREAM ALSO MAKES. The guard must classify those as NOT-local-work and proceed.
+RT="$(mk_runtime updel 0)"
+# A NEUTRAL tracked file -- deliberately NOT one the consumer contract imports.
+# First attempt deleted hermes_cli/auth.py and the run failed rc=1: the guard
+# PERMITTED it correctly (no REFUSING) and the consumer verification then failed
+# on the missing module, exactly as designed. The fixture was wrong, not the
+# subject, and 4quater-c is what distinguished the two.
+printf 'legacy\n' > "$RT/docs_legacy.txt"
+git -C "$RT" add docs_legacy.txt >/dev/null
+git -C "$RT" commit -qm "add a neutral tracked file"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+# upstream deletes it...
+git -C "$RT" rm -q docs_legacy.txt
+git -C "$RT" commit -qm "upstream removes the neutral file"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" reset -q --hard HEAD~1
+git -C "$RT" fetch -q origin 2>/dev/null
+# ...and the runtime working tree has the SAME deletion pending, unstaged.
+rm -f "$RT/docs_legacy.txt"
+TARGET_UD="$(git -C "$RT" rev-parse origin/main)"
+# FIXTURE CONTROL: the tree must actually be dirty, or this proves nothing.
+if [ -z "$(git -C "$RT" status --porcelain --untracked-files=no)" ]; then
+  bad "4quater-0 fixture control" "tree is CLEAN; the permissive path is not being exercised"
+else
+  ok "4quater-0 control: the tree carries a pending deletion"
+fi
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+rc_is "$RC" 0 "4quater-a a deletion UPSTREAM ALSO MAKES is not local work -> advance proceeds"
+head_is "$RT" "$TARGET_UD" "4quater-b and HEAD reached the target"
+case "$OUT" in *REFUSING*) bad "4quater-c it must NOT refuse" "$OUT";;
+                *) ok "4quater-c and it did not refuse";; esac
+# ── 4quinquies. THE FAILED-REVERT DANGER PATH (rc 5) ───────────────────────────────
+# I declared this "unreachable without stubbing git at the harness level". That was
+# FALSE and review refuted it by construction, using a technique THIS SUITE ALREADY
+# USES (case 6 replaces venv/bin/python with a wrapper). Recording the refutation
+# rather than the claim, because a declared residual is the line nobody re-measures.
+#
+# Mechanism: the anchor contains subdir/keep.txt and the target DELETES it. The
+# fixture interpreter, on the VERIFY invocation only, chmods the directory read-only
+# and fails. `git reset --hard` then cannot recreate the file, so HEAD does not return
+# to the anchor -- a genuinely failed revert, which is the rc 5 DANGER case.
+#
+# This one fixture kills TWO survivors the previous commit accepted: M24 (the DANGER
+# exit 5 -> 0) and M14 (the revert readback -> true, which otherwise prints
+# "revert PROVEN" over a runtime still sitting on the ADVANCED sha).
+if [ "$(id -u)" = "0" ]; then
+  ok "4quinquies SKIPPED as root (chmod does not constrain uid 0) — declared, not silent"
+  ok "4quinquies-b skipped"
+  ok "4quinquies-c skipped"
+else
+  RT="$(mk_runtime danger 0)"
+  # `other.txt` is load-bearing: it keeps subdir/ ALIVE at the target commit. First
+  # attempt put only keep.txt there, the target deleted it, git does not track empty
+  # directories, so subdir/ did not exist at target and the chmod hit nothing -- the
+  # revert then succeeded and the fixture control caught it.
+  mkdir -p "$RT/subdir"; printf 'keep\n' > "$RT/subdir/keep.txt"; printf 'stay\n' > "$RT/subdir/other.txt"
+  git -C "$RT" add subdir >/dev/null; git -C "$RT" commit -qm "anchor has keep.txt + other.txt"
+  git -C "$RT" push -q origin HEAD:main 2>/dev/null
+  git -C "$RT" rm -q subdir/keep.txt; git -C "$RT" commit -qm "target deletes keep.txt"
+  git -C "$RT" push -q origin HEAD:main 2>/dev/null
+  git -C "$RT" reset -q --hard HEAD~1; git -C "$RT" fetch -q origin 2>/dev/null
+  ANCHOR_D="$(git -C "$RT" rev-parse HEAD)"
+  # interpreter: succeeds for the preflight, sabotages the tree then fails on verify
+  rm -f "$RT/venv/bin/python"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' "if [ \"\$1\" = \"-c\" ]; then chmod 0555 \"$RT/subdir\"; exit 3; fi"
+    printf '%s\n' "exec $(command -v python3) \"\$@\""
+  } > "$RT/venv/bin/python"
+  chmod +x "$RT/venv/bin/python"
+  OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+  chmod 0755 "$RT/subdir" 2>/dev/null || true   # let the trap clean up
+  NOW_D="$(git -C "$RT" rev-parse HEAD)"
+  # FIXTURE CONTROL: the revert must genuinely have FAILED, or rc 5 proves nothing.
+  if [ "$NOW_D" = "$ANCHOR_D" ]; then
+    bad "4quinquies-0 fixture control" "the revert SUCCEEDED; this fixture cannot reach the DANGER path"
+  else
+    ok "4quinquies-0 control: the revert genuinely failed (HEAD is not the anchor)"
+  fi
+  rc_is "$RC" 5 "4quinquies-a a FAILED revert exits 5 (DANGER), not 0 or 1"
+  case "$OUT" in *"revert PROVEN"*) bad "4quinquies-b it must NOT claim PROVEN over a failed revert" "$OUT";;
+                  *) ok "4quinquies-b and it did not claim PROVEN";; esac
+fi
 # ── 5. --dry-run mutates nothing on the path that WOULD mutate ─────────────────────
 RT="$(mk_runtime dry 3)"; BEFORE="$(git -C "$RT" rev-parse HEAD)"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" --dry-run 2>&1)"; RC=$?
@@ -294,11 +387,18 @@ PYW
 chmod +x "$RT/venv/bin/python"
 BEFORE="$(git -C "$RT" rev-parse HEAD)"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
-# DECLARED: these two DO NOT ISOLATE the provenance assert. Measured — with the assert
-# reverted the suite stays 28/0, so 6a/6b are satisfied by something else in the chain
-# and are not evidence for it. They are kept because they pin a real property (an advance
-# whose module is missing from the tree must not stand), and they are labelled rather
-# than presented as coverage they do not provide.
+# CORRECTED 2026-08-16. The paragraph that stood here declared these two as NOT
+# isolating the provenance assert, citing "the suite stays 28/0". That number is
+# from a SUPERSEDED commit and the conclusion is now INVERTED — measured on this
+# tree: deleting the provenance assert gives 36/2 (6a and 6b red), and weakening
+# it to `.startswith('/')` also gives 36/2. Repairing the case-6 fixture (the
+# `cat >` that followed a symlink and truncated the host interpreter) is what
+# restored real coverage here; the fixture was writing over /usr/bin/python3.14
+# instead of the stub, so case 6 had been exercising nothing.
+#
+# The prior review named that paragraph as a durable false explanation that
+# "froze the bug in place". The one-line bug was fixed and the explanation it
+# justified was left behind verbatim, which is the same defect one layer out.
 #
 # The assert IS load-bearing; that is measured directly rather than through this suite:
 #     $ cd / && PYTHONPATH=<good> python3 -c "import sys; sys.path.insert(0,'<rt>');

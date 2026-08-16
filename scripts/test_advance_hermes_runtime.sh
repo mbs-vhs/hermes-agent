@@ -23,10 +23,22 @@
 # which is `~/.hermes/hermes-agent`:
 #
 #     S=$(sed 's/^[[:space:]]*#.*//' scripts/test_advance_hermes_runtime.sh)
-#     printf '%s' "$S" | grep -c 'bash "$SUT"'                     -> 25 invocations
+#     printf '%s' "$S" | grep -c 'bash "$SUT"'                     -> 26 invocations
 #     printf '%s' "$S" | grep -n 'bash "$SUT"' | grep -vc 'HERMES_RUNTIME=' -> 0 unguarded
 #
-# COMMENTS ARE STRIPPED FIRST and that is not tidiness: the un-stripped form reads 28 and 2.
+# COMMENTS ARE STRIPPED FIRST and that is not tidiness: the un-stripped form reads 30 and 3.
+# RE-MEASURED 2026-08-16 (round 9, retroactive tester gate). It read `25 / 0` and `28 / 2`
+# for the merged tip fb6737022d, and BOTH were re-derived there and reproduced exactly —
+# the numbers were honest. Round 9 adds ONE drive line (case 4octies), so the stripped form
+# is 26 / 0. The un-stripped form went to 30 / 3 rather than 29 / 2, because THIS PARAGRAPH
+# grew two more comment lines carrying the pattern — I wrote `29 and 2`, then my own next
+# edit invalidated it, and only re-running the count caught it. That is the fourth
+# consecutive round in which the self-counting form drifted inside the commit that
+# published it, and it is why the STRIPPED figure is the one to read. USE THE REAL BINARY:
+# `grep` in an agent
+# session here is a harness function routing to `ugrep -G`, under which the mid-pattern
+# `$` is an anchor and `grep -c 'bash "$SUT"'` reads 0 — the sentence below already says
+# so, and the figures above were taken with /usr/bin/grep.
 # RE-MEASURED 2026-08-16 (round 8). It read `26 and 1` for one commit, and the REASON given
 # was false as well as the figures: it said "THIS PARAGRAPH contains the pattern twice".
 # The drive pattern occurs in THREE comment lines across TWO paragraphs — this recipe's own
@@ -65,7 +77,7 @@ SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime
 # derived from the file it guards cannot catch an assertion VANISHING — e.g. into a loop
 # that stopped iterating, which case 7 below is (three `mk_runtime` calls in a `for`).
 # It pins cardinality, never identity: delete one and add another and this stays green.
-EXPECTED_ASSERTIONS=83
+EXPECTED_ASSERTIONS=91
 
 PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -479,9 +491,42 @@ rm -f "$RT/venv/bin/python"
   printf '%s\n' "exec $(command -v python3) \"\$@\""
 } > "$RT/venv/bin/python"
 chmod +x "$RT/venv/bin/python"
+# ── PRE-RUN HALF OF THE CONTROL (round 9). ─────────────────────────────────────────
+# -0 below asserts POST-run state only, so its label — "the revert RESTORED the anchor" —
+# could not separate that from "HEAD NEVER MOVED". Round 8 declared this as a residual and
+# left it open; this is the missing half. Measured: injecting a dirty tree before the drive
+# makes the subject refuse at the working-tree guard (rc 2, no revert runs at all) and -0
+# still printed `ok`.
+#
+# TWO assertions, because a clean pre-tree ALONE still cannot show that HEAD moved:
+#   -0pre  the dirt measured after the run was produced BY the run (the shape 4quater-0 /
+#          10-0 / 11-0 / 12-0 all use, and the one round 8 named as missing).
+#   -0move HEAD genuinely REACHED the target during the run and came back — which is what
+#          the word "RESTORED" in -0's label actually claims.
+#
+# THE REFLOG DELTA IS LOAD-BEARING, AND A PLAIN "the reflog contains the target" WOULD BE
+# VACUOUS: measured on this fixture, the setup's own `reset -q --hard HEAD~1` leaves the
+# target in the reflog (count 1) BEFORE the subject is ever invoked, so that form is
+# satisfied by a run that never happened. Only entries the RUN appended are counted.
+if [ -z "$(git -C "$RT" status --porcelain --untracked-files=no)" ]; then
+  ok "4septies-0pre control: the tree is CLEAN before the drive, so the dirt below is the RUN's"
+else
+  bad "4septies-0pre control" "tree was ALREADY dirty pre-drive — -0 cannot tell a revert from a refusal"
+fi
+TARGET_B="$(git -C "$RT" rev-parse origin/main)"
+PRE_REFLOG_B="$(git -C "$RT" reflog --format=%H 2>/dev/null | wc -l)"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 NOW_B="$(git -C "$RT" rev-parse HEAD)"
 DIRTY_B="$(git -C "$RT" status --porcelain --untracked-files=no 2>/dev/null)"
+POST_REFLOG_B="$(git -C "$RT" reflog --format=%H 2>/dev/null | wc -l)"
+NEW_N_B=$((POST_REFLOG_B - PRE_REFLOG_B))
+NEW_REFLOG_B="$(git -C "$RT" reflog --format=%H 2>/dev/null | head -n "$NEW_N_B")"
+if [ "$NEW_N_B" -ge 2 ] && printf '%s\n' "$NEW_REFLOG_B" | grep -qxF "$TARGET_B"; then
+  ok "4septies-0move control: HEAD genuinely REACHED the target during the run and came back"
+else
+  bad "4septies-0move control" \
+      "the run appended $NEW_N_B reflog entries and none was the target ${TARGET_B:0:9} — HEAD may never have moved, so -0 is measuring a REFUSAL, not a revert"
+fi
 # FIXTURE CONTROL, and it must assert BOTH halves. HEAD back at the anchor is what makes
 # this shape (b) rather than 4quinquies' shape (a); a dirty tree is what makes it a
 # finding at all. Either half alone would let this case pass over the wrong state.
@@ -498,34 +543,163 @@ case "$OUT" in *"WORKING TREE IS DIRTY"*) ok "4septies-c it names the tree as th
 [ -f "$RT/.hermes-advance-DANGER" ] \
   && ok "4septies-d shape (b) LATCHES, so the next run cannot launder it" \
   || bad "4septies-d shape (b) did not latch" "no marker at $RT/.hermes-advance-DANGER"
+# THE MARKER'S MACHINE-READABLE `shape:` FIELD (round 9). Round 8 declared this unpinned in
+# BOTH branches and measured it: `latch_danger "tree-not-restored"` -> `"anchor-not-restored"`
+# reddened ZERO, non-root and under a root shim. -d asserts only that the marker EXISTS, so a
+# marker that misattributes the failure to the pointer while the tree is the actual cause reads
+# as full coverage. This is the field a triaging human reads out of .hermes-advance-DANGER;
+# 4octies-c pins the same field for shape (a).
+file_has "$RT" ".hermes-advance-DANGER" "shape   : tree-not-restored" \
+  "4septies-e and the marker attributes it to the TREE (shape: tree-not-restored)"
 
-# MEASURED, one mutation at a time against a same-pass PASS=83 FAIL=0 SKIP=0 control at
-# the same path, each verified APPLIED by hash and `bash -n`'d, subject restored
-# byte-identical under a sha256 pin. NON-ROOT and under a root shim (`id -u` -> 0) the
-# figures are IDENTICAL, which is the claim above about host-independence, measured
-# rather than asserted:
+# ── 4octies. DANGER SHAPE (a) — ON EVERY HOST, AND ITS ATTRIBUTION PINNED ──────────
+# ROUND 8 DECLARED TWO RESIDUALS HERE AND CLOSED NEITHER; this case closes both. Measured
+# on the merged tip before this case existed, one mutation at a time, non-root AND under an
+# `id -u`->0 shim:
 #
-#   delete `&& [ -z "$dirty" ]` from the PROVEN branch (the pre-B3 shape)  -> 4 red
-#   `dirty="$(git … status …)"` -> `dirty=""`                              -> 4 red
-#   the shape-(b) `if` -> `if false`                                       -> 1 red
+#   shape (a)'s message text rewritten to shape (b)'s wording   -> 0 red
+#   shape (a)'s `latch_danger` shape argument swapped            -> 0 red
 #
-# All three read ZERO before this case existed.
+# The first is the dangerous one. Shape (a) is HEAD NOT BACK AT THE ANCHOR — what the exit-code
+# table calls an UNKNOWN state, strictly worse than a dirty tree — and once both shapes emit the
+# same string, the discriminator 4septies-c depends on has stopped existing. 4quinquies is the
+# shape-(a) case and asserts only rc 5, the ABSENCE of "revert PROVEN", and marker existence;
+# nothing pins its wording, and it is ROOT-GATED, so on a uid-0 host shape (a) had NO coverage
+# whatsoever — including the M14/M24 killers 4quinquies is credited with.
 #
-# THE 1 IS DECLARED RATHER THAN LEFT TO LOOK WEAK. Disabling the shape-(b) branch does
+# MECHANISM, AND WHY IT SURVIVES uid 0 — MEASURED, NOT ASSERTED. 4quinquies fails the revert by
+# `chmod 0555` on a directory, and DAC is exactly what uid 0 walks past, which is why it is
+# gated. This case plants `.git/index.lock` instead: git takes that lock with O_CREAT|O_EXCL and
+# EEXIST is not a permission, so CAP_DAC_OVERRIDE buys nothing. `git reset --hard` then fails
+# BEFORE it moves HEAD, so HEAD is stranded on the advanced target — a genuinely failed revert.
+# Measured at BOTH uids in a user namespace (`unshare -r`), which is the both-answers control
+# for the claim, since a probe that reported "the revert failed" unconditionally would prove
+# nothing:
+#
+#   uid=1000  chmod 0555   reset rc=128   REVERT FAILED   (the mechanism 4quinquies uses)
+#   uid=0     chmod 0555   reset rc=0     REVERT SUCCEEDED  <- the gate is real, and this is why
+#   uid=1000  index.lock   reset rc=128   REVERT FAILED
+#   uid=0     index.lock   reset rc=128   REVERT FAILED     <- uid 0 does not walk past it
+#
+# So this case is NOT root-gated, and shape (a) is covered on every host 4quinquies degrades on.
+RT="$(mk_runtime dangera 0)"
+printf 'anchor\n' > "$RT/keep.txt"
+git -C "$RT" add keep.txt >/dev/null; git -C "$RT" commit -qm "anchor content"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+printf 'advanced\n' > "$RT/keep.txt"
+git -C "$RT" add keep.txt >/dev/null; git -C "$RT" commit -qm "target changes it"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" reset -q --hard HEAD~1; git -C "$RT" fetch -q origin 2>/dev/null
+ANCHOR_A="$(git -C "$RT" rev-parse HEAD)"
+TARGET_A="$(git -C "$RT" rev-parse origin/main)"
+# B4 AGAIN: `rm -f` FIRST. `{ ... } >` FOLLOWS the symlink mk_runtime created, so without this
+# the write truncates the HOST interpreter and builds a wrapper that execs itself.
+rm -f "$RT/venv/bin/python"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' "if [ \"\$1\" = \"-c\" ]; then : > \"$RT/.git/index.lock\"; exit 3; fi"
+  printf '%s\n' "exec $(command -v python3) \"\$@\""
+} > "$RT/venv/bin/python"
+chmod +x "$RT/venv/bin/python"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+rm -f "$RT/.git/index.lock"       # release it so the assertions below and the trap can work
+NOW_A="$(git -C "$RT" rev-parse HEAD)"
+# FIXTURE CONTROL, BOTH HALVES. "HEAD is not the anchor" alone is also true of a fixture that
+# simply never advanced; requiring HEAD == the TARGET is what says the advance LANDED and the
+# revert then failed, which is the only state shape (a) is about.
+if [ "$NOW_A" != "$ANCHOR_A" ] && [ "$NOW_A" = "$TARGET_A" ]; then
+  ok "4octies-0 control: the revert genuinely FAILED — HEAD is stranded on the advanced target"
+else
+  bad "4octies-0 fixture control" \
+      "need HEAD==target!=anchor; HEAD=${NOW_A:0:9} anchor=${ANCHOR_A:0:9} target=${TARGET_A:0:9}"
+fi
+rc_is "$RC" 5 "4octies-a a FAILED revert exits 5 (DANGER) on EVERY host, uid 0 included"
+# THE ATTRIBUTION ASSERTION, and the forbidden token is tested FIRST deliberately: a message
+# carrying both wordings must fail, not pass on the strength of the half that survived.
+case "$OUT" in
+  *"WORKING TREE IS DIRTY"*)
+    bad "4octies-b it must name the POINTER, not the tree" \
+        "shape (a) printed shape (b)'s wording — an UNKNOWN-state failure reported as a dirty tree" ;;
+  *"revert did NOT restore"*)
+    ok "4octies-b it names the POINTER as the cause (revert did NOT restore), not the tree" ;;
+  *)
+    bad "4octies-b the shape-(a) message did not print" "$OUT" ;;
+esac
+file_has "$RT" ".hermes-advance-DANGER" "shape   : anchor-not-restored" \
+  "4octies-c and the marker attributes it to the POINTER (shape: anchor-not-restored)"
+# HOST-INDEPENDENT M14/M24 COVER. 4quinquies-b is the only other assertion that kills
+# "readback -> true" and "exit 5 -> exit 0", and it is skipped as root.
+case "$OUT" in *"revert PROVEN"*) bad "4octies-d it must NOT claim PROVEN over a failed revert" "$OUT";;
+                *) ok "4octies-d and it did not claim PROVEN, on a host where 4quinquies-b is skipped";; esac
+
+# MEASURED (round 9), one mutation at a time against a same-pass PASS=91 FAIL=0 SKIP=0
+# control at the same scratch path, each verified APPLIED by sha256 and `bash -n`'d, and the
+# unmutated subject first run through the identical scratch path to prove the harness is
+# neutral (assertion lines byte-identical to the in-repo run). Non-root / under an
+# `id -u`->0 shim:
+#
+#   shape (a) message text -> shape (b)'s wording          -> 1 / 1 red  (4octies-b)
+#   shape (a) message text -> BOTH wordings                -> 1 / 1 red  (4octies-b)
+#   latch_danger "anchor-not-restored" -> "tree-not-..."   -> 1 / 1 red  (4octies-c)
+#   latch_danger "tree-not-restored" -> "anchor-not-..."   -> 1 / 1 red  (4septies-e)
+#   shape (a) `exit 5` -> `exit 0`                         -> 2 / 1 red  (4octies-a)
+#   revert readback -> `now="$ANCHOR"`                     -> 7 / 4 red  (4octies a/b/c/d)
+#
+# Every one of those six read 0 red UNDER THE ROOT SHIM before this case existed; the last
+# two read 0 red under the shim while the suite exited 0.
+#
+# DECLARED RESIDUAL (§19.5) — WHAT IS STILL SILENTLY REMOVABLE HERE, MEASURED, WITH COUNTS:
+#   * 4octies-b tests the FORBIDDEN token FIRST so a message carrying BOTH wordings fails
+#     rather than passing on the surviving half. Swapping the two case arms reds ZERO
+#     (91/0/0 both uids), because no fixture makes the subject emit both — only the
+#     deliberate mutation above does, and a suite does not carry its own mutants. The
+#     ordering is load-bearing against that mutant and unpinned without it. Not layered
+#     further: the pin for the ordering would need its own pin.
+#   * `rm -f "$RT/.git/index.lock"` after the drive reds ZERO if deleted (91/0/0). It is
+#     hygiene, not coverage — nothing below it needs the index — and is kept so a future
+#     assertion in this case cannot be poisoned by a lock the fixture planted. §19.2.
+#   * The mechanism claim ("uid 0 does not walk past `index.lock`") is pinned by 4octies-0,
+#     which reds if the revert ever succeeds. What is NOT pinned is that this suite was
+#     actually RUN as uid 0: the root shim fakes `id -u` only. The uid-0 rows in the table
+#     above were measured under `unshare -r`, out of band, and nothing in this file re-runs
+#     them.
+
+# MEASURED, one mutation at a time against a same-pass control at the same path, each
+# verified APPLIED by hash and `bash -n`'d, subject restored byte-identical under a sha256
+# pin. NON-ROOT and under a root shim (`id -u` -> 0) the figures are IDENTICAL, which is the
+# claim above about host-independence, measured rather than asserted.
+#
+# ROUND 8 SHIPPED 4 / 4 / 1 AGAINST A PASS=83 CONTROL. Round 9's retroactive tester gate
+# re-derived all three at that tip and reproduced them exactly — and then INVALIDATED them
+# by adding 4septies-e, which reds on all three. Against the PASS=91 control they are:
+#
+#   delete `&& [ -z "$dirty" ]` from the PROVEN branch (the pre-B3 shape)  -> 5 red (was 4)
+#   `dirty="$(git … status …)"` -> `dirty=""`                              -> 5 red (was 4)
+#   the shape-(b) `if` -> `if false`                                       -> 2 red (was 1)
+#
+# All three read ZERO before this case existed. This is the file's own rule applied to
+# itself — "adding an assertion invalidates every sibling figure exactly as changing a
+# fixture does" — and it is the third round in which that rule was broken by the commit
+# that restated it, so the figures are re-derived here rather than left to be inferred.
+#
+# THE 2 IS DECLARED RATHER THAN LEFT TO LOOK WEAK. Disabling the shape-(b) branch does
 # not fall through to success — it falls through to shape (a), which ALSO exits 5 and
 # ALSO latches. So rc, the absence of "revert PROVEN" and the marker are all RESCUED BY
 # ACCIDENT, and the only thing that discriminates is WHICH CAUSE IS NAMED: the tree, or
 # the pointer. That is the repo's own rule — when an rc is rescued downstream by
-# accident, pin the ATTRIBUTION — and 4septies-c is the assertion that does it. A reader
-# who "strengthens" -c into an rc check would delete the only coverage this mutation has.
+# accident, pin the ATTRIBUTION — and 4septies-c and -e are the two assertions that do it
+# (the human-readable message and the marker's machine-readable field). A reader who
+# "strengthens" either into an rc check would delete the only coverage this mutation has.
 #
-# DECLARED RESIDUAL (round 8) — THE RULE ABOVE IS PINNED IN ONE DIRECTION ONLY, and saying
-# so is the whole point of declaring it rather than leaving the next round to find it.
-# Shape (b)'s message is pinned by 4septies-c. Shape (a)'s is pinned by NOTHING, in BOTH of
-# its channels, measured one mutation at a time, non-root and under a root shim:
+# ROUND-8 RESIDUAL — CLOSED BY ROUND 9 (retroactive tester gate on the merged tip). Kept as
+# a record rather than deleted, because the figures are the evidence that 4septies-e and
+# 4octies below are not decoration. Round 8's declaration was accurate: independently
+# re-measured at fb6737022d, one mutation at a time, non-root AND under an `id -u`->0 shim,
+# each verified APPLIED by sha256 and `bash -n`:
 #
-#   shape (a)'s message text rewritten to shape (b)'s wording     -> 0 red
-#   latch_danger "tree-not-restored" -> "anchor-not-restored"      -> 0 red
+#   shape (a)'s message text rewritten to shape (b)'s wording  -> 0 red   (now 4octies-b: 1)
+#   latch_danger "tree-not-restored" -> "anchor-not-restored"   -> 0 red   (now 4septies-e: 1)
+#   latch_danger "anchor-not-restored" -> "tree-not-restored"   -> 0 red   (now 4octies-c: 1)
 #
 # The first is the worse one. A genuinely FAILED revert — HEAD not back at the anchor, which
 # the exit-code table calls an UNKNOWN state and is strictly more dangerous than a dirty
@@ -534,19 +708,28 @@ case "$OUT" in *"WORKING TREE IS DIRTY"*) ok "4septies-c it names the tree as th
 # the marker's machine-readable `shape:` field — the thing a triaging human reads out of
 # .hermes-advance-DANGER — unpinned in both branches.
 #
-# 4quinquies (the shape-(a) case) asserts only rc 5, the ABSENCE of "revert PROVEN", and
-# marker existence; nothing pins its wording. It is also root-gated, so on a uid-0 host
-# shape (a) has NO coverage at all. Not closed here: this round's subject is shape (b), and
-# closing (a) means giving 4quinquies a message assertion plus a non-permission-based
-# fixture so it survives root — which is its own change.
+# Round 8 named the remedy exactly right — "closing (a) means giving 4quinquies a message
+# assertion plus a non-permission-based fixture so it survives root" — and round 9 did that
+# as case 4octies rather than by editing 4quinquies, so the chmod path keeps its own
+# coverage where it works. The cost of leaving it open was measured on the merged tip, and
+# it is larger than "wording": on a uid-0 host BOTH mutations 4quinquies is credited with
+# killing scored RED=0 and the suite exited 0 —
+#
+#   shape (a) `exit 5` -> `exit 0`   (M24)   root RED=0 rc=0   (now 4octies-a: RED=1 rc=1)
+#   revert readback -> `now="$ANCHOR"` (M14) root RED=0 rc=0   (now 4octies a/b/c/d: RED=4)
+#
+# — i.e. a subject that prints "revert PROVEN" over a runtime still sitting on the ADVANCED
+# sha passed the whole suite at rc 0 on any uid-0 host. The `UNMEASURED:` line was printed,
+# but rc is what a timer or a CI gate reads.
 #
 # THREE FURTHER RESIDUALS from the same round, declared rather than silently carried:
 #   * 4septies-0's LABEL says "the revert RESTORED the anchor" and it measures POST-run
-#     state, which cannot separate that from "HEAD never moved". Injecting a dirty tree
-#     before the drive makes the subject refuse at the working-tree guard (rc 2, no revert
-#     runs) and -0 still prints ok. It fails LOUDLY (-a/-c/-d red), so this is a label
-#     overstating its assertion, not a false green. The missing half is a PRE-run clean-tree
-#     assertion, the way 4quater-0 / 10-0 / 11-0 / 12-0 all do it.
+#     state, which cannot separate that from "HEAD never moved". CLOSED round 9 by
+#     4septies-0pre + 4septies-0move. Reproduced first: injecting a dirty tree before the
+#     drive makes the subject refuse at the working-tree guard (rc 2, no revert runs) and
+#     -0 STILL PRINTS `ok`. It fails loudly elsewhere (-a/-c/-d/-e red), so it was a label
+#     overstating its assertion rather than a false green — and -0 remains `ok` under that
+#     fixture even now, which is why the two new assertions carry the claim instead of it.
 #   * `{ ... } > "$RT/venv/bin/python"` FOLLOWS the symlink mk_runtime created. Deleting the
 #     `rm -f` above it truncates the host interpreter and builds a wrapper that execs
 #     itself — an exec loop, not a failing assertion. Same shape as the B4 incident this
@@ -602,9 +785,9 @@ OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 # CORRECTED 2026-08-16. The paragraph that stood here declared these two as NOT
 # isolating the provenance assert, citing "the suite stays 28/0". That number is
 # from a SUPERSEDED commit and the conclusion is now INVERTED — measured on this
-# tree: deleting the provenance assert gives 81/2 (6a and 6b red — it read 36/2, a
+# tree: deleting the provenance assert gives 89/2 (6a and 6b red — it read 36/2, a
 # count from a 38-assertion tip), and weakening
-# it to `.startswith('/')` also gives 81/2.
+# it to `.startswith('/')` also gives 89/2.
 # RE-CORRECTED 2026-08-16 by review. The figures above read 75/2 for one commit, which
 # is ARITHMETICALLY IMPOSSIBLE beside EXPECTED_ASSERTIONS=78 — 75+2=77 — and that is a
 # check needing no measurement at all. `git log -S` places the paragraph in the SAME
@@ -620,7 +803,12 @@ OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 # by five: the identical arithmetic self-refutation the paragraph above exists to retire
 # (`75+2=77` against a pin of 78), one layer out, six lines under the rule forbidding it.
 # `76/2` was CORRECT for the 78-assertion parent and was invalidated by its own commit.
-# The figure for this tip is 81/2, re-derived here rather than adjusted. THE LESSON IS NOT
+# ROUND 9 IS THE FOURTH INSTANCE OF THE SAME SHAPE AND IT WAS CAUGHT BY RE-RUNNING, NOT BY
+# READING: the merged tip's `81/2` was re-derived at fb6737022d and reproduced EXACTLY, and
+# was then invalidated by round 9's own eight added assertions. FAIL stays 2 (6a, 6b — the
+# provenance assert's blast radius did not change); PASS moves 81 -> 89. Publishing the pair
+# rather than the FAIL alone is what makes that legible.
+# The figure for this tip is 89/2, re-derived here rather than adjusted. THE LESSON IS NOT
 # THE NUMBER: a rule written into a file does not apply itself, and the author who writes
 # it is the one least likely to re-read it in the same sitting. Repairing the case-6 fixture (the
 # `cat >` that followed a symlink and truncated the host interpreter) is what
@@ -886,8 +1074,12 @@ fi
 # DECLARED RESIDUAL (§19.5) — THE TRAILER CANNOT ASSERT ITSELF, and review measured what
 # that costs. `EXPECTED_ASSERTIONS` is not a counted assertion and the `FAIL -eq 0` gate
 # lives in the same block: delete the block and the suite exits 0 over any number of
-# failures; delete it AND assertion 12c and it prints `PASS=77 ... (expected: 78)` at rc 0.
-# Control: deleting 12c with the ratchet intact correctly reds at rc 1. The `UNMEASURED:`
+# failures; delete it AND assertion 12c and it prints `PASS=90 ... (expected: 91)` at rc 0.
+# (Round 8 published `PASS=77 ... (expected: 78)`, correct for its own 78-assertion pin and
+# invalidated by round 9's eight additions. RE-DERIVED at this tip, not adjusted.)
+# Control: deleting 12c with the ratchet intact correctly reds at rc 1 with
+# `FAIL count drift: ran 90, expected 91` — regenerated in the same run, not read back from
+# a stored baseline. The `UNMEASURED:`
 # line below is likewise emitted after the last assertion, so nothing can observe it.
 # 11bis pins the one line whose reversion restores the pre-fix false green; the rest of
 # the trailer is stated here rather than wrapped in another layer that would need its own.

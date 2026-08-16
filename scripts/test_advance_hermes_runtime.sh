@@ -18,7 +18,11 @@
 set -uo pipefail
 
 SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime.sh}"
-EXPECTED_ASSERTIONS=45
+# Hand-set, and it must be bumped in the same commit that adds an assertion. A count
+# derived from the file it guards cannot catch an assertion VANISHING — e.g. into a loop
+# that stopped iterating, which case 7 below is (three `mk_runtime` calls in a `for`).
+# It pins cardinality, never identity: delete one and add another and this stays green.
+EXPECTED_ASSERTIONS=72
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -226,6 +230,13 @@ PREFLIGHTED="$(git -C "$RT" rev-parse origin/main)"
 RACE_PF="$WORK/pf-race.py"
 {
   printf '%s\n' 'import subprocess, sys, tempfile'
+  # BL-2. RECORD THE ARGV THE PREFLIGHT WAS HANDED. Without this the block below
+  # derives PREFLIGHTED from its OWN pre-run `rev-parse` and never observes what the
+  # subject actually passed — so `--target "$TARGET"` -> `--target origin/main`, the
+  # verbatim mirror of the B2 defect, survived at 45/0. Review built the differential
+  # externally and measured `handed origin/main -> resolved 6fef7e3a7 ; MERGED
+  # daabbe3c2`: an unmeasured commit executing. The observation belongs in the suite.
+  printf '%s\n' "open('$WORK/toctou.handed','w').write(sys.argv[sys.argv.index('--target')+1] if '--target' in sys.argv else 'NO-TARGET-FLAG')"
   printf '%s\n' 'tmp = tempfile.mkdtemp()'
   printf '%s\n' "subprocess.run(['git','clone','-q','--branch','main','$WORK/toctou.origin',tmp], check=False)"
   printf '%s\n' "subprocess.run(['git','-C',tmp,'config','user.email','t@t'], check=False)"
@@ -252,6 +263,16 @@ if [ "$LANDED" = "$RACED" ]; then
   bad "4ter-c it landed an UN-PREFLIGHTED commit" "landed=${LANDED:0:9} raced=${RACED:0:9}"
 else
   ok "4ter-c no un-preflighted commit was left executing"
+fi
+# The assertion that closes B2 rather than restating it: what the preflight was HANDED
+# must be, exactly, the commit that ended up executing. A ref name here is a finding on
+# its own — the preflight resolves it a SECOND time, so "preflighted" and "merged" would
+# name two different commits while every rc stayed 0.
+HANDED="$(cat "$WORK/toctou.handed" 2>/dev/null || echo 'STUB-DID-NOT-RECORD')"
+if [ "$HANDED" = "$LANDED" ]; then
+  ok "4ter-d the preflight was handed the EXACT sha that landed (not a ref it re-resolves)"
+else
+  bad "4ter-d preflight/merge disagree" "handed=$HANDED landed=${LANDED:0:9}"
 fi
 # ── 4quater. B1 PERMISSIVE DIRECTION: an upstream-deletion tree must STILL ADVANCE ──
 # The refusal direction was covered (4bis); the PERMIT direction was not, and review
@@ -310,6 +331,10 @@ if [ "$(id -u)" = "0" ]; then
   ok "4quinquies SKIPPED as root (chmod does not constrain uid 0) — declared, not silent"
   ok "4quinquies-b skipped"
   ok "4quinquies-c skipped"
+  ok "4quinquies-d skipped (DANGER latch)"
+  ok "4quinquies-e skipped (DANGER latch)"
+  ok "4quinquies-f skipped (DANGER latch)"
+  ok "4quinquies-g skipped (DANGER latch)"
 else
   RT="$(mk_runtime danger 0)"
   # `other.txt` is load-bearing: it keeps subdir/ ALIVE at the target commit. First
@@ -343,6 +368,28 @@ else
   rc_is "$RC" 5 "4quinquies-a a FAILED revert exits 5 (DANGER), not 0 or 1"
   case "$OUT" in *"revert PROVEN"*) bad "4quinquies-b it must NOT claim PROVEN over a failed revert" "$OUT";;
                   *) ok "4quinquies-b and it did not claim PROVEN";; esac
+
+  # ── BL-5: rc 5 MUST NOT LAUNDER TO rc 0 ON THE NEXT RUN ──────────────────────────
+  # The suite built this exact state and then never invoked the script again, so the
+  # whole laundering path was unobserved. Measured before the latch:
+  #     RUN 1  rc=5  "DANGER: revert did NOT restore …"   HEAD left at TARGET
+  #     RUN 2  rc=0  "already current — no-op"
+  # HEAD equals origin/main after the failed revert, so the already-current early exit
+  # fires — and that exit runs NEITHER the preflight NOR the consumer verification. The
+  # fleet's OAuth path sits on a tree that FAILED verification and every later run
+  # reports success. `OnFailure=` fires once and is cleared, so the single rc 5 was the
+  # only signal that ever existed.
+  [ -e "$RT/.hermes-advance-DANGER" ] \
+    && ok "4quinquies-d the DANGER state LATCHED (an untracked marker survives reset --hard)" \
+    || bad "4quinquies-d the DANGER state did not latch" "no marker at $RT/.hermes-advance-DANGER"
+  OUT2="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC2=$?
+  rc_is "$RC2" 2 "4quinquies-e the NEXT run refuses (rc 2) instead of laundering rc 5 into rc 0"
+  case "$OUT2" in *"already current"*) bad "4quinquies-f it took the no-op early exit over a DANGER state" "$OUT2";;
+                   *) ok "4quinquies-f and it did not report the runtime as a clean no-op";; esac
+  # A refusal whose remedy is unstated loops the caller forever. The message must name
+  # the file to remove, or an operator reading it cannot re-arm the timer.
+  case "$OUT2" in *".hermes-advance-DANGER"*) ok "4quinquies-g and the refusal names the marker to remove";;
+                   *) bad "4quinquies-g refusal does not say how to clear it" "$OUT2";; esac
 fi
 # ── 5. --dry-run mutates nothing on the path that WOULD mutate ─────────────────────
 RT="$(mk_runtime dry 3)"; BEFORE="$(git -C "$RT" rev-parse HEAD)"
@@ -411,6 +458,174 @@ OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 # has hermes-agent installed.
 rc_is "$RC" 1 "6a an advance whose module is missing from the tree does not stand"
 head_is "$RT" "$BEFORE" "6b and it was reverted"
+
+# ── 7. BL-7: AN UNRECOGNISED ARGUMENT IS NOT A LIVE RUN ────────────────────────────
+# `[ "${1:-}" = "--dry-run" ] && DRY_RUN=1` had no else, so everything that was not
+# exactly that string fell through and ADVANCED FOR REAL. Measured: `--dryrun`,
+# `--dry_run` and `-n` each rc 0 having mutated the fleet's OAuth path — near-misses of
+# the one flag whose entire purpose is "do not mutate", i.e. the typo a human makes at
+# the moment they are being careful. `5a` cannot see this: it passes the flag correctly.
+for _arg in --dryrun -n --dry_run; do
+  RT="$(mk_runtime "arg$(printf '%s' "$_arg" | tr -dc 'a-z')" 3)"
+  BEFORE="$(git -C "$RT" rev-parse HEAD)"
+  OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" "$_arg" 2>&1)"; RC=$?
+  if [ "$RC" = "2" ] && [ "$(git -C "$RT" rev-parse HEAD)" = "$BEFORE" ]; then
+    ok "7 '$_arg' is REFUSED (rc 2) and HEAD did not move"
+  else
+    bad "7 '$_arg' is REFUSED (rc 2) and HEAD did not move" \
+        "rc=$RC head=$(git -C "$RT" rev-parse --short HEAD) before=${BEFORE:0:9}"
+  fi
+done
+# A trailing correct flag must not rescue a typo'd first one, and vice versa: the whole
+# argv is refused, not the first token.
+RT="$(mk_runtime argextra 3)"; BEFORE="$(git -C "$RT" rev-parse HEAD)"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" --dry-run --and-also 2>&1)"; RC=$?
+rc_is "$RC" 2 "7d a trailing unrecognised argument is refused, not ignored"
+
+# ── 8. BL-3 ROOT CAUSE: THE PIN GUARD IS MEASURED AGAINST A FRESH REF ──────────────
+# The AHEAD (pin-vs-drift) guard ran ABOVE the fetch, so the one check standing between
+# a timer and somebody's deliberately-held checkout was answered from a CACHED CLAIM —
+# the identical defect the fetch's own comment names, twenty lines away. The reachable
+# consequence is not a stale count: after an upstream force-push to a divergent history
+# the stale ref reports AHEAD=0, the fetch then makes HEAD genuinely divergent, and only
+# `merge --ff-only` is left refusing. Review measured `--ff-only` -> `--no-edit` at 45/0,
+# producing rc 0, "VERIFIED", and a MERGE COMMIT THAT EXISTS NOWHERE UPSTREAM.
+#
+# THE FIXTURE IS A REWRITE, NOT AN ORPHAN, AND THAT IS LOAD-BEARING. The first version
+# force-pushed an UNRELATED history, which `git merge` refuses on its own ("refusing to
+# merge unrelated histories") — so it exercised the pin guard but could never reproduce
+# the shape the downstream guard fails open on, and measured rc 1 for BOTH forms of the
+# merge. A realistic force-push SHARES an ancestor. Measured across the 2x2:
+#
+#   shipped                     rc 2  HEAD unmoved   1 parent
+#   --ff-only -> --no-edit      rc 2  HEAD unmoved   1 parent    (redundant, see below)
+#   AHEAD above the fetch       rc 1  HEAD unmoved   1 parent    (--ff-only holds it shut)
+#   BOTH                        rc 0  HEAD MOVED     2 PARENTS   VERIFIED, and the commit
+#                                                                exists NOWHERE upstream
+#
+# So the fail-open needed BOTH defects, `--ff-only` was the only thing holding it shut,
+# and measuring AHEAD after the fetch removes the window rather than adding a guard
+# behind it. `--ff-only` is now KNOWINGLY REDUNDANT (§19.2) — with AHEAD=0 measured
+# against a fresh ref, HEAD is an ancestor of the target and a fast-forward is always
+# possible, so `--no-edit` reds ZERO here. It is kept as the statement of intent at the
+# point it applies, and this comment is why, so nobody reads its 0 as a coverage hole.
+RT="$(mk_runtime forced 0)"
+echo a > "$RT/a.txt"; git -C "$RT" add -A >/dev/null; git -C "$RT" commit -qm "A (the commit upstream will rewrite away)"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null; git -C "$RT" fetch -q origin 2>/dev/null
+ANCHOR_F="$(git -C "$RT" rev-parse HEAD)"
+FDIR="$WORK/forced.push"
+# `--branch main` is load-bearing and its absence made this whole case VACUOUS on its
+# first run: the bare origin's HEAD names a branch that does not exist there, so a plain
+# clone checks nothing out, `--orphan` has an empty index, the commit fails "nothing to
+# commit", the push fails, and the remote never diverges. Both assertions below then
+# measured a runtime that was simply current. The suite already records this trap for
+# the 4ter stub; it was rebuilt here anyway.
+git clone -q --branch main "$WORK/forced.origin" "$FDIR" 2>/dev/null
+git -C "$FDIR" config user.email t@t; git -C "$FDIR" config user.name t
+git -C "$FDIR" reset -q --hard HEAD~1                    # back to the shared ancestor
+echo b > "$FDIR/b.txt"; git -C "$FDIR" add -A >/dev/null
+git -C "$FDIR" commit -qm "A-prime — the rewrite that drops A"
+git -C "$FDIR" push -q -f origin HEAD:main 2>/dev/null
+# FIXTURE CONTROL, BOTH HALVES. The first version checked only that the CACHED ref reads
+# AHEAD=0 — which is also true when nothing happened at all, so it passed green over an
+# inert fixture. A control must distinguish "the window is open" from "the setup did
+# nothing", and only the second half does that.
+CACHED_AHEAD="$(git -C "$RT" rev-list --count origin/main..HEAD 2>/dev/null || echo '?')"
+REMOTE_TIP="$(git -C "$WORK/forced.origin" rev-parse main 2>/dev/null || echo none)"
+if [ "$CACHED_AHEAD" = "0" ] && [ "$REMOTE_TIP" != "$ANCHOR_F" ] && [ "$REMOTE_TIP" != "none" ]; then
+  ok "8-0 control: the remote genuinely diverged AND the cached ref still reads AHEAD=0"
+else
+  bad "8-0 control" "window not open: cached_ahead=$CACHED_AHEAD remote_tip=${REMOTE_TIP:0:9} anchor=${ANCHOR_F:0:9}"
+fi
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+rc_is "$RC" 2 "8a a force-push that DIVERGES is caught by the pin guard (rc 2), not by --ff-only"
+head_is "$RT" "$ANCHOR_F" "8b and HEAD did not move"
+case "$OUT" in *"deliberate pin"*) ok "8c and it refused as a PIN, naming the measurement that fired";;
+                *) bad "8c wrong guard fired" "$OUT";; esac
+# The OUTCOME assertion, not the rc one: what the 2x2 above produces when both guards
+# are defeated is a MERGE COMMIT that exists nowhere upstream and was never preflighted.
+# rc and HEAD-position assertions are satisfied by a revert; this one is not.
+_P=$(( $(git -C "$RT" rev-list --parents -n1 HEAD 2>/dev/null | wc -w) - 1 ))
+[ "$_P" -le 1 ] && ok "8d and HEAD is not a MERGE COMMIT synthesised from a divergent remote" \
+                || bad "8d HEAD is a merge commit" "parents=$_P — this commit exists nowhere upstream"
+
+# ── 9. BL-3b: A FAILED MERGE MUST REVERT, NOT REPORT SUCCESS ───────────────────────
+# Dropping the revert on merge failure measured 45/0, rc 0, "consumers verified" — with
+# HEAD NEVER MOVED. A permanent green over a runtime that never advanced is the worst
+# shape available: the drift this whole script exists to end, reported as health.
+# Reached without the stale-ref window: an UNTRACKED file colliding with a path the
+# merge must create. `checkout -- .` deliberately does not remove untracked files, so
+# the collision survives to the merge.
+RT="$(mk_runtime collide 0)"
+printf 'upstream\n' > "$RT/collide.txt"
+git -C "$RT" add collide.txt >/dev/null; git -C "$RT" commit -qm "upstream adds collide.txt"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" reset -q --hard HEAD~1; git -C "$RT" fetch -q origin 2>/dev/null
+ANCHOR_C="$(git -C "$RT" rev-parse HEAD)"
+printf 'local untracked\n' > "$RT/collide.txt"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+case "$OUT" in *"fast-forward failed"*) ok "9-0 control: the merge genuinely failed (not a vacuous pass)";;
+                *) bad "9-0 control" "the merge did not fail; this case measures nothing: $OUT";; esac
+rc_is "$RC" 1 "9a a failed merge exits 1 (applied-then-reverted), never 0"
+head_is "$RT" "$ANCHOR_C" "9b and HEAD is back at the anchor"
+case "$OUT" in *"revert PROVEN"*) ok "9c and the revert was proven";;
+                *) bad "9c the revert did not run or was not proven" "$OUT";; esac
+case "$OUT" in *"consumers verified"*) bad "9d it must NOT report success over a merge that failed" "$OUT";;
+                *) ok "9d and it claimed no success";; esac
+
+# ── 10. BL-4a: THE DELETION CLASSIFIER, PINNED IN THE PERMISSIVE DIRECTION ─────────
+# §19.7(a): every existing fixture was written in the shape the guard already matches,
+# so `if [ "$_st" = " D" ] || [ "$_st" = "D " ]` -> `if true` survived at 45/0 — the
+# suite pinned only over-REFUSING. With the classifier defeated, a MODIFIED file whose
+# path merely appears in the upstream-deletion list takes the exemption, and the
+# operator's edit is destroyed under a clean rc 0. That is B1 restored.
+RT="$(mk_runtime moddel 0)"
+printf 'legacy\n' > "$RT/docs_legacy.txt"
+git -C "$RT" add docs_legacy.txt >/dev/null; git -C "$RT" commit -qm "add a file upstream will delete"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" rm -q docs_legacy.txt; git -C "$RT" commit -qm "upstream deletes it"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" reset -q --hard HEAD~1; git -C "$RT" fetch -q origin 2>/dev/null
+ANCHOR_MD="$(git -C "$RT" rev-parse HEAD)"
+MARK2="operator-edit-$$"
+printf '# %s\n' "$MARK2" >> "$RT/docs_legacy.txt"     # MODIFIED — deliberately not deleted
+if [ -n "$(git -C "$RT" status --porcelain --untracked-files=no)" ]; then
+  ok "10-0 control: the tree carries a MODIFICATION to a file upstream deletes"
+else
+  bad "10-0 control" "tree is clean; this case measures nothing"
+fi
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+rc_is "$RC" 2 "10a a MODIFIED file is local work even where upstream deletes that path"
+file_has "$RT" "docs_legacy.txt" "$MARK2" "10b and the operator's edit SURVIVED on disk"
+head_is "$RT" "$ANCHOR_MD" "10c and HEAD did not move"
+
+# ── 11. BL-4b: THE EXEMPTION IS WHOLE-LINE, AND THE `-x` IS LOAD-BEARING ───────────
+# `grep -qxF` -> `grep -qF` survived at 45/0. Substring matching exempts a deletion the
+# operator made because some OTHER path upstream deletes CONTAINS it: the operator
+# deletes `notes.txt`, upstream deletes `old/notes.txt.bak`, and `checkout -- .` then
+# silently restores the operator's deletion under a clean rc 0.
+RT="$(mk_runtime substr 0)"
+mkdir -p "$RT/old"; printf 'notes\n' > "$RT/notes.txt"; printf 'bak\n' > "$RT/old/notes.txt.bak"
+git -C "$RT" add -A >/dev/null; git -C "$RT" commit -qm "add notes.txt and old/notes.txt.bak"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" rm -q old/notes.txt.bak; git -C "$RT" commit -qm "upstream deletes ONLY the .bak"
+git -C "$RT" push -q origin HEAD:main 2>/dev/null
+git -C "$RT" reset -q --hard HEAD~1; git -C "$RT" fetch -q origin 2>/dev/null
+ANCHOR_SS="$(git -C "$RT" rev-parse HEAD)"
+rm -f "$RT/notes.txt"     # the OPERATOR deletes a file upstream KEEPS
+if [ -n "$(git -C "$RT" status --porcelain --untracked-files=no)" ]; then
+  ok "11-0 control: the tree carries the operator's own deletion"
+else
+  bad "11-0 control" "tree is clean; this case measures nothing"
+fi
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+rc_is "$RC" 2 "11a a deletion upstream does NOT make is local work, even as a substring of one it does"
+if [ -e "$RT/notes.txt" ]; then
+  bad "11b the operator's deletion SURVIVED" "notes.txt was silently restored"
+else
+  ok "11b and the operator's deletion survived (the file is still absent)"
+fi
+head_is "$RT" "$ANCHOR_SS" "11c and HEAD did not move"
 
 printf '\n=== PASS=%d FAIL=%d (expected assertions: %d) ===\n' "$PASS" "$FAIL" "$EXPECTED_ASSERTIONS"
 if [ $((PASS+FAIL)) -ne "$EXPECTED_ASSERTIONS" ]; then

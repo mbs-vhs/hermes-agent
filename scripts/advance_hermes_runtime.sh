@@ -35,33 +35,71 @@
 # EXIT CODES
 #   0  advanced and verified, or already current (no-op)
 #   1  advance failed or verification failed -> REVERTED to the recorded anchor
-#   2  refused BEFORE mutating (preflight says unsafe/unmeasured, or bad state)
+#   2  refused BEFORE mutating (preflight says unsafe/unmeasured, bad state, an
+#      unrecognised argument, or a DANGER latch a human has not cleared)
 #   5  DANGER, two shapes: (a) the revert ran and the anchor did NOT come back,
 #      or (b) the anchor came back but the WORKING TREE did not, so the
-#      consumers still load the advanced code. Both need a human.
+#      consumers still load the advanced code. Both need a human — and both LATCH
+#      (see the DANGER latch below), because rc 5 that a later run can launder
+#      into rc 0 is not a signal, it is a delay.
 
 set -uo pipefail
 
 RUNTIME="${HERMES_RUNTIME:-$HOME/.hermes/hermes-agent}"
 PREFLIGHT="${HERMES_PREFLIGHT:-$RUNTIME/scripts/preflight_hermes_runtime_advance.py}"
 VENV_PY="$RUNTIME/venv/bin/python"
-DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+DANGER_MARK="$RUNTIME/.hermes-advance-DANGER"
 
 log()  { printf '[hermes-advance] %s\n' "$*"; }
 die2() { printf '[hermes-advance] REFUSED: %s\n' "$*" >&2; exit 2; }
+
+# ---- arguments ----------------------------------------------------------------------
+# BL-7. This was `[ "${1:-}" = "--dry-run" ] && DRY_RUN=1` with no else, so EVERY
+# unrecognised argument fell through to a LIVE ADVANCE: `--dryrun`, `--dry_run` and
+# `-n` each measured rc 0 having advanced the fleet's OAuth path for real. A near-miss
+# of the one flag whose entire purpose is "do not mutate" is exactly the input a human
+# types, and the header two dozen lines up promises this script "refuses rather than
+# advancing on anything it could not measure". An unparsed argument IS something it
+# could not measure. Refuse the whole argv rather than the first token — a trailing
+# `--dry-run` after a typo'd first flag must not rescue the run either.
+DRY_RUN=0
+case "${1:-}" in
+  "")        [ "$#" -eq 0 ] || die2 "unrecognised argument: '$1' (only --dry-run is accepted)" ;;
+  --dry-run) DRY_RUN=1 ;;
+  *)         die2 "unrecognised argument: '$1' (only --dry-run is accepted). Refusing rather than guessing — this script advances the fleet's OAuth path." ;;
+esac
+[ "$#" -le 1 ] || die2 "too many arguments (got $#). Only an optional --dry-run is accepted; refusing rather than ignoring the rest."
 
 # ---- preconditions -----------------------------------------------------------------
 [ -d "$RUNTIME/.git" ] || die2 "no git checkout at $RUNTIME"
 [ -x "$VENV_PY" ]      || die2 "no venv interpreter at $VENV_PY"
 
-# A local commit or a real working-tree change means somebody is holding this checkout
-# deliberately. Advancing would discard it, so this refuses instead of guessing — the
-# same pin-vs-drift question this whole thing exists to answer, asked every run rather
-# than answered once. Deletions upstream ALSO makes are not a local change (that was the
-# entire content of the "19 dirty files" on 2026-08-12); the preflight distinguishes them.
-AHEAD="$(git -C "$RUNTIME" rev-list --count origin/main..HEAD 2>/dev/null || echo '?')"
-[ "$AHEAD" = "0" ] || die2 "$AHEAD local commit(s) not on origin/main — this looks like a deliberate pin, not drift"
+# BL-5. THE DANGER LATCH, and it is checked HERE — above the already-current no-op —
+# because that no-op is precisely how the laundering happened. Measured:
+#
+#   RUN 1  rc=5  "DANGER: revert did NOT restore …"   HEAD left at TARGET
+#   RUN 2  rc=0  "already current — no-op"
+#
+# After any rc 5 the fleet's OAuth path is sitting on a tree that FAILED consumer
+# verification, and because HEAD equals origin/main the next run took the early exit
+# below — which runs neither the preflight nor the consumer verification — and reported
+# success. Every run after that reported success too. `OnFailure=` fires once and is
+# then cleared, so the single rc 5 was the only signal that ever existed and it was
+# overwritten within the hour.
+#
+# The latch is an UNTRACKED file inside the checkout, which is load-bearing three ways:
+# `status --porcelain --untracked-files=no` cannot see it (so it does not trip the
+# working-tree guard and read as local work), `git checkout -- .` does not touch it, and
+# `git reset --hard` does not remove it. It therefore survives exactly the operations a
+# recovery attempt performs, which is the point — only a human clears it.
+if [ -e "$DANGER_MARK" ]; then
+  printf '[hermes-advance] REFUSED: a previous run left this runtime in a DANGER state and no human has cleared it.\n%s\n' \
+    "$(cat "$DANGER_MARK" 2>/dev/null || printf '  (the marker exists but could not be read)')" >&2
+  printf '[hermes-advance] The OAuth path may be executing code that FAILED consumer verification. Inspect the checkout, then remove %s to re-arm this timer.\n' \
+    "$DANGER_MARK" >&2
+  exit 2
+fi
+
 for f in .pinned-ref .deployed-ref PIN; do
   [ -e "$RUNTIME/$f" ] && die2 "pin file $f present — refusing to advance a declared pin"
 done
@@ -73,6 +111,26 @@ done
 if ! git -C "$RUNTIME" fetch --quiet origin 2>/dev/null; then
   die2 "could not fetch origin — every distance below would be against a stale ref, and a stale ref makes a BEHIND runtime look CURRENT"
 fi
+
+# A local commit or a real working-tree change means somebody is holding this checkout
+# deliberately. Advancing would discard it, so this refuses instead of guessing — the
+# same pin-vs-drift question this whole thing exists to answer, asked every run rather
+# than answered once. Deletions upstream ALSO makes are not a local change (that was the
+# entire content of the "19 dirty files" on 2026-08-12); the preflight distinguishes them.
+#
+# BL-3 ROOT CAUSE. This ran ABOVE the fetch, so the pin-vs-drift question — the one
+# guard standing between a timer and somebody's deliberately held checkout — was
+# answered against a CACHED CLAIM about the remote. That is the identical defect the
+# comment on the fetch above names, applied to a different measurement, twenty lines
+# from where it is spelled out. The reachable consequence is not a stale count: after an
+# upstream force-push to a divergent history, the stale ref reports AHEAD=0, the fetch
+# then makes HEAD genuinely divergent, and `merge --ff-only` is the only thing left
+# refusing. Review measured that `--ff-only` -> `--no-edit` survives the suite at 45/0
+# and produces rc 0, "VERIFIED", and a MERGE COMMIT THAT EXISTS NOWHERE UPSTREAM and was
+# never preflighted. Measuring AHEAD after the fetch removes the window rather than
+# adding a second guard behind it.
+AHEAD="$(git -C "$RUNTIME" rev-list --count origin/main..HEAD 2>/dev/null || echo '?')"
+[ "$AHEAD" = "0" ] || die2 "$AHEAD local commit(s) not on origin/main — this looks like a deliberate pin, not drift"
 
 ANCHOR="$(git -C "$RUNTIME" rev-parse HEAD)"
 TARGET="$(git -C "$RUNTIME" rev-parse origin/main)"
@@ -104,6 +162,20 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 # ---- apply ---------------------------------------------------------------------------
+# BL-5. Engage the latch checked in the preconditions. A write that FAILS is announced
+# rather than swallowed, and the announcement says what the failure costs — the rc is 5
+# either way, but without the marker the NEXT run launders it back to 0 and this one was
+# the only signal. That is the whole defect, so a silent failure to latch would leave it
+# open while looking closed.
+latch_danger() { # latch_danger <shape> <detail>
+  if ! { printf 'DANGER latched %s\n  shape   : %s\n  runtime : %s\n  anchor  : %s\n  detail  : %s\n' \
+           "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown-time')" \
+           "$1" "$RUNTIME" "$ANCHOR" "$2" > "$DANGER_MARK"; } 2>/dev/null; then
+    printf '[hermes-advance] AND THE LATCH DID NOT ENGAGE: could not write %s. This run exits 5, but nothing stops the next run reporting success over the same state — treat this as unlatched DANGER and clear it by hand.\n' \
+      "$DANGER_MARK" >&2
+  fi
+}
+
 revert_and_prove() {
   local why="$1"
   log "$why — reverting to ${ANCHOR:0:9}"
@@ -123,6 +195,7 @@ revert_and_prove() {
   if [ "$now" = "$ANCHOR" ] && [ -n "$dirty" ]; then
     printf '[hermes-advance] DANGER: HEAD is back at %s but the WORKING TREE IS DIRTY — the revert restored the pointer and not the files, so the consumers still load the advanced code:\n%s\n' \
       "${ANCHOR:0:9}" "$dirty" >&2
+    latch_danger "tree-not-restored" "HEAD returned to the anchor but the working tree did not; the consumers load the advanced files"
     exit 5
   fi
   # COVERED as of 2026-08-16 by case 4quinquies. My earlier declaration that this
@@ -133,6 +206,7 @@ revert_and_prove() {
   # which previously survived at 38/0. The fixture is skipped as root, declared.
   printf '[hermes-advance] DANGER: revert did NOT restore %s (HEAD is now %s). The fleet OAuth path is in an UNKNOWN state; a human must look.\n' \
     "${ANCHOR:0:9}" "${now:0:9}" >&2
+  latch_danger "anchor-not-restored" "revert did not return HEAD to the anchor; HEAD is now ${now:0:9}"
   exit 5
 }
 

@@ -13,8 +13,20 @@
 #
 # NO LIVE RUNTIME IS TOUCHED. Each case builds a synthetic git checkout with a stub
 # venv and a stub preflight under $TMPDIR, and points the subject at it via
-# HERMES_RUNTIME / HERMES_PREFLIGHT. `grep -c '\.hermes' ` over this file matches only
-# this paragraph.
+# HERMES_RUNTIME / HERMES_PREFLIGHT.
+#
+# VERIFY THAT BY THE RIGHT PROBE. This paragraph used to claim `grep -c '\.hermes'`
+# matches only itself. It measured 6 — and THREE of those were added by the commit that
+# repeated the claim, because the DANGER marker is named `.hermes-advance-DANGER` and
+# shares the prefix. The probe was matching a string the suite legitimately contains, so
+# it could never have been evidence. The discriminating probe is the LIVE RUNTIME PATH,
+# which is `~/.hermes/hermes-agent`:
+#
+#     grep -c 'hermes/hermes-agent' scripts/test_advance_hermes_runtime.sh   -> 0
+#
+# with the positive control that every drive overrides the runtime explicitly
+# (`grep -c 'HERMES_RUNTIME=' ` is nonzero), so the zero is a measured absence rather
+# than a file that never mentions the variable at all.
 set -uo pipefail
 
 SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime.sh}"
@@ -22,7 +34,7 @@ SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime
 # derived from the file it guards cannot catch an assertion VANISHING — e.g. into a loop
 # that stopped iterating, which case 7 below is (three `mk_runtime` calls in a `for`).
 # It pins cardinality, never identity: delete one and add another and this stays green.
-EXPECTED_ASSERTIONS=77
+EXPECTED_ASSERTIONS=78
 
 PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -435,8 +447,9 @@ OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 # CORRECTED 2026-08-16. The paragraph that stood here declared these two as NOT
 # isolating the provenance assert, citing "the suite stays 28/0". That number is
 # from a SUPERSEDED commit and the conclusion is now INVERTED — measured on this
-# tree: deleting the provenance assert gives 36/2 (6a and 6b red), and weakening
-# it to `.startswith('/')` also gives 36/2. Repairing the case-6 fixture (the
+# tree: deleting the provenance assert gives 75/2 (6a and 6b red — it read 36/2, a
+# count from a 38-assertion tip), and weakening
+# it to `.startswith('/')` also gives 75/2. Repairing the case-6 fixture (the
 # `cat >` that followed a symlink and truncated the host interpreter) is what
 # restored real coverage here; the fixture was writing over /usr/bin/python3.14
 # instead of the stub, so case 6 had been exercising nothing.
@@ -645,8 +658,11 @@ case "$OUT" in *"already current"*) bad "4sexies-b it took the no-op early exit 
 case "$OUT" in *".hermes-advance-DANGER"*) ok "4sexies-c and the refusal names the marker to remove";;
                 *) bad "4sexies-c refusal does not say how to clear it" "$OUT";; esac
 # NEGATIVE CONTROL: clearing the marker re-arms. Without this, every assertion above is
-# satisfied by a subject that refuses unconditionally — an always-refusing advancer is
-# the permanent-refusal regression 4quater exists to catch, reached a different way.
+# satisfied by a subject that refuses unconditionally WITH THIS MESSAGE — review built the
+# counterexample: a `die2` inserted above the pin-file loop refuses unconditionally with a
+# DIFFERENT message and passes all four 4sexies assertions including this one (50/27
+# overall). What kills that shape is 4quater-a/-b, not this control. §19.7(c): the clause
+# is true of the same-message mutant (M16 `if true` reds -d) and false in general.
 rm -f "$RT/.hermes-advance-DANGER"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 case "$OUT" in *"DANGER state and no human"*) bad "4sexies-d clearing the marker RE-ARMS" "still refusing after the marker was cleared";;
@@ -678,6 +694,30 @@ _PF=$(( $(git -C "$RT" rev-list --parents -n1 HEAD 2>/dev/null | wc -w) - 1 ))
 [ "$_PF" -le 1 ] && ok "12c and it is a FAST-FORWARD, not a synthesised merge commit" \
                  || bad "12c HEAD is a merge commit" "parents=$_PF — merge.ff=false was honoured, so --ff-only is gone"
 
+# ── 11bis. THE SKIP COUNTER ITSELF — BL-3's fix was removable in ONE LINE ──────────
+# Reverting `skip()` to `PASS=$((PASS+1))` restores the exact pre-fix false green: under a
+# root shim the suite prints SKIP=0 with NO `UNMEASURED` line and exits 0, and does so WITH
+# the never-engage-the-latch mutant applied. Nothing asserted it — the fix for a false-green
+# defect was one line away from being undone silently.
+#
+# STRUCTURAL, and declared as such: it reads the FUNCTION rather than driving a skip, because
+# the only skip this suite can produce is the root-gated one and a non-root run would have to
+# manufacture a fake to observe it. It catches the reversion; it does not prove the counter
+# is correct on a host that takes the branch.
+if declare -f skip | grep -q 'SKIP=$((SKIP+1))' && ! declare -f skip | grep -q 'PASS='; then
+  ok "11bis skip() increments SKIP and never PASS (a skip folded into PASS is the false green)"
+else
+  bad "11bis skip() increments SKIP and never PASS" "skip() body: $(declare -f skip | tr '\n' ' ')"
+fi
+
+# DECLARED RESIDUAL (§19.5) — THE TRAILER CANNOT ASSERT ITSELF, and review measured what
+# that costs. `EXPECTED_ASSERTIONS` is not a counted assertion and the `FAIL -eq 0` gate
+# lives in the same block: delete the block and the suite exits 0 over any number of
+# failures; delete it AND assertion 12c and it prints `PASS=77 ... (expected: 78)` at rc 0.
+# Control: deleting 12c with the ratchet intact correctly reds at rc 1. The `UNMEASURED:`
+# line below is likewise emitted after the last assertion, so nothing can observe it.
+# 11bis pins the one line whose reversion restores the pre-fix false green; the rest of
+# the trailer is stated here rather than wrapped in another layer that would need its own.
 printf '\n=== PASS=%d FAIL=%d SKIP=%d (expected assertions: %d) ===\n' "$PASS" "$FAIL" "$SKIP" "$EXPECTED_ASSERTIONS"
 [ "$SKIP" -eq 0 ] || printf 'UNMEASURED: %d assertion(s) SKIPPED on this host — the run is NOT full coverage.\n' "$SKIP"
 if [ $((PASS+FAIL+SKIP)) -ne "$EXPECTED_ASSERTIONS" ]; then

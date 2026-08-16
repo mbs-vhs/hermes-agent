@@ -18,7 +18,7 @@
 set -uo pipefail
 
 SUT="${SUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/advance_hermes_runtime.sh}"
-EXPECTED_ASSERTIONS=28
+EXPECTED_ASSERTIONS=38
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -27,6 +27,23 @@ rc_is(){ [ "$1" = "$2" ] && ok "$3" || bad "$3" "rc=$1 want=$2"; }
 head_is(){ # head_is <dir> <want-sha> <case>
   local got; got="$(git -C "$1" rev-parse HEAD 2>/dev/null)"
   [ "$got" = "$2" ] && ok "$3" || bad "$3" "HEAD moved: want ${2:0:9} got ${got:0:9}"
+}
+# HEAD IS NOT THE REVERT. `head_is` alone is why three mutations stayed green at
+# 28/0: `--hard` -> `--soft` (HEAD returns, BROKEN FILES STAY ON DISK), deleting
+# the readback, and `exit 5` -> `exit 0`. A revert that restores the pointer and
+# leaves the tree modified is not a revert -- it is the shape that made B1 a
+# data-loss bug. These two assert the DISK.
+tree_clean(){ # tree_clean <dir> <case>
+  local dirty; dirty="$(git -C "$1" status --porcelain 2>/dev/null)"
+  [ -z "$dirty" ] && ok "$2" \
+    || bad "$2" "working TREE dirty after revert (HEAD alone would pass): $dirty"
+}
+file_has(){ # file_has <dir> <relpath> <want-substring> <case>
+  local got; got="$(cat "$1/$2" 2>/dev/null || true)"
+  case "$got" in
+    *"$3"*) ok "$4" ;;
+    *) bad "$4" "content NOT restored in $2 (wanted substring: $3)" ;;
+  esac
 }
 
 WORK="$(mktemp -d "${TMPDIR:-/var/tmp}/advtest.XXXXXX")" || { echo "mktemp failed"; exit 2; }
@@ -168,9 +185,72 @@ BEFORE="$(git -C "$RT" rev-parse HEAD)"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
 rc_is "$RC" 1 "4a a broken consumer contract -> rc 1 (applied then reverted)"
 head_is "$RT" "$BEFORE" "4b and the anchor came BACK"
+tree_clean "$RT" "4b2 and the working TREE came back too, not just HEAD"
+file_has "$RT" "hermes_cli/auth.py" "def " \
+  "4b3 and the DELETED symbol is back on disk (HEAD alone cannot see this)"
 case "$OUT" in *"revert PROVEN"*) ok "4c the revert is proven, not assumed";;
                 *) bad "4c revert not proven" "$OUT";; esac
 
+# ── 4bis. B1: UNCOMMITTED WORK IS NOT DISCARDED ───────────────────────────────────
+# The regression test for the data-loss defect. `git checkout -- .` destroyed an
+# uncommitted edit and the run still exited 0 printing "consumers verified".
+# The script's own comment claimed it refused on "a real working-tree change";
+# only the local-COMMIT half was implemented. Asserted on the DISK, because the
+# whole point is that HEAD never moved and so HEAD could never have caught it.
+RT="$(mk_runtime dirty 3)"
+BEFORE="$(git -C "$RT" rev-parse HEAD)"
+MARK="do-not-destroy-$$"
+printf '\n# %s\n' "$MARK" >> "$RT/agent/anthropic_adapter.py"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" 2>&1)"; RC=$?
+[ "$RC" != "0" ] && ok "4bis-a uncommitted work -> NON-zero rc (it refused)" \
+  || bad "4bis-a uncommitted work -> non-zero rc" "rc=0: it proceeded over local work"
+file_has "$RT" "agent/anthropic_adapter.py" "$MARK" \
+  "4bis-b and the uncommitted edit SURVIVED on disk"
+head_is "$RT" "$BEFORE" "4bis-c and HEAD did not move"
+case "$OUT" in *"consumers verified"*) bad "4bis-d it must NOT claim success" "$OUT";;
+                *) ok "4bis-d and it did not report success";; esac
+
+# ── 4ter. B2: IT MERGES THE SHA IT PREFLIGHTED, NOT THE REF ────────────────────────────
+# The TOCTOU regression test. `origin/main` used to be resolved THREE times -- the SHA
+# for TARGET, the ref again for the preflight, and the ref a THIRD time at the merge --
+# and the real preflight fetches by default, so the window opened on EVERY run.
+# Reproduced before the fix: preflighted one commit, LANDED another, logged the first,
+# rc 0, leaving an un-preflighted commit executing.
+#
+# The race is simulated where it actually occurs: the preflight stub ADVANCES
+# origin/main as a side effect, exactly as a fetch landing mid-run would.
+RT="$(mk_runtime toctou 3)"
+PREFLIGHTED="$(git -C "$RT" rev-parse origin/main)"
+RACE_PF="$WORK/pf-race.py"
+{
+  printf '%s\n' 'import subprocess, sys, tempfile'
+  printf '%s\n' 'tmp = tempfile.mkdtemp()'
+  printf '%s\n' "subprocess.run(['git','clone','-q','--branch','main','$WORK/toctou.origin',tmp], check=False)"
+  printf '%s\n' "subprocess.run(['git','-C',tmp,'config','user.email','t@t'], check=False)"
+  printf '%s\n' "subprocess.run(['git','-C',tmp,'config','user.name','t'], check=False)"
+  printf '%s\n' "subprocess.run(['git','-C',tmp,'commit','-q','--allow-empty','-m','raced-in commit'], check=False)"
+  printf '%s\n' "subprocess.run(['git','-C',tmp,'push','-q','origin','HEAD:main'], check=False)"
+  printf '%s\n' "subprocess.run(['git','-C','$RT','fetch','-q','origin'], check=False)"
+  printf '%s\n' 'print("stub preflight rc=0 (advanced origin/main as a side effect)")'
+  printf '%s\n' 'sys.exit(0)'
+} > "$RACE_PF"
+OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$RACE_PF" bash "$SUT" 2>&1)"; RC=$?
+RACED="$(git -C "$RT" rev-parse origin/main)"
+LANDED="$(git -C "$RT" rev-parse HEAD)"
+# FIXTURE CONTROL FIRST: if the stub did not actually move the ref, every assertion
+# below passes vacuously and this test measures nothing.
+if [ "$PREFLIGHTED" = "$RACED" ]; then
+  bad "4ter-0 fixture control" "the stub did NOT advance origin/main; this test measures nothing"
+else
+  ok "4ter-0 control: origin/main genuinely moved during the run"
+fi
+rc_is "$RC" 0 "4ter-a the raced advance still exits 0"
+head_is "$RT" "$PREFLIGHTED" "4ter-b HEAD is the PREFLIGHTED sha, not the raced ref"
+if [ "$LANDED" = "$RACED" ]; then
+  bad "4ter-c it landed an UN-PREFLIGHTED commit" "landed=${LANDED:0:9} raced=${RACED:0:9}"
+else
+  ok "4ter-c no un-preflighted commit was left executing"
+fi
 # ── 5. --dry-run mutates nothing on the path that WOULD mutate ─────────────────────
 RT="$(mk_runtime dry 3)"; BEFORE="$(git -C "$RT" rev-parse HEAD)"
 OUT="$(HERMES_RUNTIME="$RT" HERMES_PREFLIGHT="$PF" bash "$SUT" --dry-run 2>&1)"; RC=$?
@@ -200,6 +280,12 @@ rm -f "$RT/hermes_cli/auth.py"
 git -C "$RT" add -A >/dev/null; git -C "$RT" commit -qm "break tree only"
 git -C "$RT" push -q origin HEAD:main 2>/dev/null
 git -C "$RT" reset -q --hard HEAD~1; git -C "$RT" fetch -q origin 2>/dev/null
+# B4. `rm -f` FIRST. mk_runtime creates venv/bin/python as a SYMLINK to the real
+# interpreter (line ~86), and `cat >` FOLLOWS a symlink — so this write did not
+# replace the fixture's stub, it truncated and overwrote the HOST's python3
+# (readlink -f resolves it to /usr/bin/python3.14). A test suite that can destroy
+# the system interpreter is not a declared design limit; it is one line.
+rm -f "$RT/venv/bin/python"
 # An interpreter that injects the good copy — i.e. the site-packages situation.
 cat > "$RT/venv/bin/python" <<PYW
 #!/usr/bin/env bash

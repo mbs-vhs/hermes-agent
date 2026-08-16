@@ -74,7 +74,7 @@ fi
 
 ANCHOR="$(git -C "$RUNTIME" rev-parse HEAD)"
 TARGET="$(git -C "$RUNTIME" rev-parse origin/main)"
-BEHIND="$(git -C "$RUNTIME" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
+BEHIND="$(git -C "$RUNTIME" rev-list --count HEAD.."$TARGET" 2>/dev/null || echo '?')"
 
 if [ "$ANCHOR" = "$TARGET" ]; then
   log "already current at ${ANCHOR:0:9} — no-op"
@@ -87,7 +87,7 @@ if [ ! -f "$PREFLIGHT" ]; then
   die2 "preflight not found at $PREFLIGHT — refusing to advance the fleet's OAuth path unverified"
 fi
 log "preflight …"
-PF_OUT="$("$VENV_PY" "$PREFLIGHT" --target origin/main 2>&1)"; PF_RC=$?
+PF_OUT="$("$VENV_PY" "$PREFLIGHT" --target "$TARGET" 2>&1)"; PF_RC=$?
 printf '%s\n' "$PF_OUT" | sed 's/^/[preflight] /'
 case "$PF_RC" in
   0) log "preflight: advance is safe for the measured consumers" ;;
@@ -96,7 +96,7 @@ case "$PF_RC" in
 esac
 
 if [ "$DRY_RUN" = "1" ]; then
-  log "[dry-run] would: git checkout -- . && git merge --ff-only origin/main"
+  log "[dry-run] would: git checkout -- . && git merge --ff-only ${TARGET:0:9} (the preflighted SHA)"
   log "[dry-run] would then verify the consumer imports and revert on failure"
   exit 0
 fi
@@ -106,20 +106,78 @@ revert_and_prove() {
   local why="$1"
   log "$why — reverting to ${ANCHOR:0:9}"
   git -C "$RUNTIME" reset --hard "$ANCHOR" >/dev/null 2>&1
-  local now; now="$(git -C "$RUNTIME" rev-parse HEAD 2>/dev/null || echo none)"
-  if [ "$now" = "$ANCHOR" ]; then
-    log "revert PROVEN (anchor restored)"
+  # B3. "revert PROVEN" used to read HEAD ALONE, which is not a revert: measured,
+  # `reset --hard` -> `--soft` returns the pointer and leaves the BROKEN FILES ON
+  # DISK, and the run still printed PROVEN. Mutations that stayed green on the old
+  # proof: --hard -> --soft, deleting this readback entirely, and exit 5 -> exit 0.
+  # The tree is now part of the proof, because the tree is what the consumers load.
+  local now dirty
+  now="$(git -C "$RUNTIME" rev-parse HEAD 2>/dev/null || echo none)"
+  dirty="$(git -C "$RUNTIME" status --porcelain --untracked-files=no 2>/dev/null)"
+  if [ "$now" = "$ANCHOR" ] && [ -z "$dirty" ]; then
+    log "revert PROVEN (anchor restored, working tree clean)"
     exit 1
   fi
+  if [ "$now" = "$ANCHOR" ] && [ -n "$dirty" ]; then
+    printf '[hermes-advance] DANGER: HEAD is back at %s but the WORKING TREE IS DIRTY — the revert restored the pointer and not the files, so the consumers still load the advanced code:\n%s\n' \
+      "${ANCHOR:0:9}" "$dirty" >&2
+    exit 5
+  fi
+  # DECLARED RESIDUAL (uncovered): no test drives this branch. Measured — mutating
+  # this `exit 5` to `exit 0` leaves the suite GREEN at 38/0, so a revert that
+  # FAILED would report success and nothing would catch the regression. Reaching it
+  # needs `git reset --hard` itself to fail, which a fixture cannot arrange without
+  # stubbing git at the harness level; a fragile test here would be worse than an
+  # honest gap. The DIRTY-TREE danger path above IS covered (M22 reddens 5).
   printf '[hermes-advance] DANGER: revert did NOT restore %s (HEAD is now %s). The fleet OAuth path is in an UNKNOWN state; a human must look.\n' \
     "${ANCHOR:0:9}" "${now:0:9}" >&2
   exit 5
 }
 
+# WORKING-TREE GUARD (B1). The comment at the top of this script has ALWAYS
+# claimed this refusal — "a real working-tree change means somebody is holding
+# this checkout deliberately ... this refuses instead of guessing". It was never
+# implemented: only the local-commit (AHEAD) half existed, and the
+# `git checkout -- .` below then DESTROYED the work while the run reported
+# success (rc 0, "consumers verified"). Reproduced twice, independently.
+#
+# The distinction the comment already draws is the right one and is kept:
+# deletions that UPSTREAM ALSO MAKES are not local work (that was the entire
+# content of the "19 dirty files" on 2026-08-12). Everything else is, and is
+# fatal. Untracked files are ignored deliberately — `checkout -- .` does not
+# touch them, so they are not at risk here.
+DIRTY="$(git -C "$RUNTIME" status --porcelain --untracked-files=no 2>/dev/null)"
+if [ -n "$DIRTY" ]; then
+  # Against $TARGET, not origin/main: this guard decides which deletions are "not
+  # local work", so resolving the ref again here would classify against a commit we
+  # are not merging — the same TOCTOU as B2, reintroduced by its own fix.
+  UPSTREAM_DELETES="$(git -C "$RUNTIME" diff --name-only --diff-filter=D HEAD "$TARGET" 2>/dev/null || true)"
+  LOCAL_WORK=""
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    _st="${_line:0:2}"; _f="${_line:3}"
+    if [ "$_st" = " D" ] || [ "$_st" = "D " ]; then
+      printf '%s\n' "$UPSTREAM_DELETES" | grep -qxF -- "$_f" && continue
+    fi
+    LOCAL_WORK="${LOCAL_WORK}${_line}"$'\n'
+  done <<< "$DIRTY"
+  if [ -n "$LOCAL_WORK" ]; then
+    printf '[hermes-advance] REFUSING: %s carries local working-tree changes upstream does not make.\n%s\nCommit, stash or discard them deliberately; this script will not do it for you.\n' \
+      "$RUNTIME" "$LOCAL_WORK" >&2
+    exit 1
+  fi
+fi
+
 # The working tree carries deletions that upstream also makes; restore them so the
 # fast-forward can apply cleanly, then let the merge delete them properly.
 git -C "$RUNTIME" checkout -- . 2>/dev/null
-if ! git -C "$RUNTIME" merge --ff-only origin/main >/dev/null 2>&1; then
+# B2 (TOCTOU). `origin/main` used to be resolved THREE separate times — the SHA at
+# TARGET, the ref again for the preflight, and the ref a THIRD time here — and the
+# preflight fetches by default, so the window opened on EVERY run, not rarely.
+# Reproduced: preflighted bcff885f2, LANDED fe8c39385, logged "advanced to bcff885f2",
+# rc 0. An un-preflighted commit left executing under a log line naming a different
+# one. Everything downstream now merges the SHA that was actually measured.
+if ! git -C "$RUNTIME" merge --ff-only "$TARGET" >/dev/null 2>&1; then
   revert_and_prove "fast-forward failed"
 fi
 log "advanced to ${TARGET:0:9}"

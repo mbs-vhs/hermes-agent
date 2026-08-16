@@ -325,98 +325,291 @@ async def test_idle_expiry_clears_conversation_scoped_state(mock_invoke_hook):
     assert runner._pending_model_notes.get(other_key) == "keep-me"
 
 
-@pytest.mark.asyncio
-async def test_auto_reset_emits_session_end_for_prior_session():
-    """Regression test for #28746 (auto-reset path).
+class _StopAfterEmit(Exception):
+    """Sentinel raised from the first call *after* the boundary-emit block."""
 
-    When ``SessionStore.get_or_create_session`` rolls a stale session over
-    to a fresh ``session_id`` (idle/daily/suspended auto-reset, NOT an
-    explicit /new), the new ``SessionEntry`` carries
-    ``auto_reset_prior_session_id``.  The subsequent emit pass in
-    ``_handle_message_with_agent`` must fire ``session:end`` for that
-    prior id before ``session:start`` for the new one.
+
+def _make_emit_runner(session_entry: SessionEntry):
+    """Runner wired just far enough to reach the boundary-emit block.
+
+    The predecessor of these tests re-implemented the emit fragment inline
+    and asserted against its own copy, so it passed no matter what
+    ``_handle_message_with_agent`` actually did — deleting the production
+    emit outright would not have turned it red.  This drives the real
+    method instead and stops it, via ``_StopAfterEmit``, at the first call
+    that follows the block (``build_session_context``), which keeps the
+    agent/tool plumbing out of scope without faking the code under test.
     """
+    runner = _make_runner()
+
+    # ``async_session_store`` is a read-only property returning the real
+    # AsyncSessionStore facade, so stub the synchronous store it offloads to
+    # rather than replacing the facade.
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._cache_session_source = MagicMock()
+    runner._is_telegram_topic_lane = MagicMock(return_value=False)
+    runner._record_telegram_topic_binding = MagicMock()
+    runner._clear_conversation_scope = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    return runner
+
+
+async def _drive_to_emit(runner):
+    """Run ``_handle_message_with_agent`` through the boundary-emit block."""
     from gateway.run import GatewayRunner
 
-    runner = _make_runner()
-    # Configure a fresh SessionEntry that was just produced by an
-    # auto-reset.  The is_new_session detection picks up was_auto_reset
-    # and the prior id is consumed by the new session:end emit path.
-    source = _make_source()
-    session_key = build_session_key(source)
-    fresh_entry = SessionEntry(
+    with patch(
+        "gateway.run.build_session_context", side_effect=_StopAfterEmit
+    ):
+        with pytest.raises(_StopAfterEmit):
+            await GatewayRunner._handle_message_with_agent(
+                runner,
+                _make_event("hello"),
+                _make_source(),
+                _quick_key="qk",
+                run_generation=1,
+            )
+
+
+def _auto_reset_entry(session_key: str, **overrides) -> SessionEntry:
+    # created_at and updated_at come from ONE timestamp because production
+    # does (``SessionStore._get_or_create_session_impl`` passes the same
+    # ``now`` to both).  Two separate ``datetime.now()`` calls would make
+    # them differ by microseconds and silently switch off the
+    # ``created_at == updated_at`` half of the is-new-session test.
+    now = datetime.now()
+    kwargs = dict(
         session_key=session_key,
         session_id="sess-new",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
+        created_at=now,
+        updated_at=now,
         platform=Platform.TELEGRAM,
         chat_type="dm",
         was_auto_reset=True,
         auto_reset_reason="idle",
-        auto_reset_prior_session_id="sess-old-prior",
+        prev_session_id="sess-old-prior",
     )
+    kwargs.update(overrides)
+    return SessionEntry(**kwargs)
 
-    # Stub the cache/agent plumbing so _handle_message_with_agent runs
-    # only the emit segment we care about and exits early.
-    runner._maybe_load_user_skill = MagicMock(return_value=None)
-    runner.session_store.get_or_create_session.return_value = fresh_entry
 
-    # Drive only the relevant section by calling the runner method we
-    # patched into _make_runner — the rest of _handle_message_with_agent
-    # depends on agent caching and tool plumbing that's out of scope for
-    # this unit test.  Instead we exercise the emit code directly by
-    # running the post-session-resolve fragment in isolation.
+@pytest.mark.asyncio
+async def test_auto_reset_emits_session_end_for_prior_session():
+    """Regression test for #28746 (auto-reset path), rekeyed by CLAWD-3534.
 
-    # Simulate the relevant fragment from _handle_message_with_agent:
-    session_entry = fresh_entry
-    _is_new_session = (
-        session_entry.created_at == session_entry.updated_at
-        or getattr(session_entry, "was_auto_reset", False)
-        or getattr(session_entry, "is_fresh_reset", False)
-    )
-    assert _is_new_session is True
+    When ``SessionStore.get_or_create_session`` rolls a stale session over
+    to a fresh ``session_id`` (idle/daily/suspended auto-reset, NOT an
+    explicit /new), the new ``SessionEntry`` carries ``prev_session_id``.
+    The emit pass in ``_handle_message_with_agent`` must fire
+    ``session:end`` for that prior id before ``session:start`` for the new
+    one.  Before CLAWD-3534 this was keyed off the fork-local transient
+    ``auto_reset_prior_session_id``; it is now keyed off upstream's
+    persisted field.
+    """
+    source = _make_source()
+    session_key = build_session_key(source)
+    fresh_entry = _auto_reset_entry(session_key)
+    runner = _make_emit_runner(fresh_entry)
 
-    if _is_new_session:
-        _prior_session_id = getattr(
-            session_entry, "auto_reset_prior_session_id", None
-        )
-        if _prior_session_id:
-            await runner.hooks.emit("session:end", {
-                "platform": (
-                    source.platform.value if source.platform else ""
-                ),
-                "user_id": source.user_id,
-                "session_id": _prior_session_id,
-                "session_key": session_key,
-                "reason": "auto_reset",
-            })
-            session_entry.auto_reset_prior_session_id = None
-        await runner.hooks.emit("session:start", {
-            "platform": source.platform.value if source.platform else "",
-            "user_id": source.user_id,
-            "session_id": session_entry.session_id,
-            "session_key": session_key,
-        })
+    await _drive_to_emit(runner)
 
-    # session:end fired before session:start, with the prior session_id
-    # and reason="auto_reset".
-    emit_calls = runner.hooks.emit.call_args_list
-    event_sequence = [c[0][0] for c in emit_calls]
+    event_sequence = [c[0][0] for c in runner.hooks.emit.call_args_list]
     assert event_sequence == ["session:end", "session:start"], (
         f"Expected session:end before session:start; got {event_sequence}"
     )
-    end_ctx = emit_calls[0][0][1]
+    end_ctx = runner.hooks.emit.call_args_list[0][0][1]
     assert end_ctx["session_id"] == "sess-old-prior"
     assert end_ctx["reason"] == "auto_reset"
     assert end_ctx["session_key"] == session_key
-    # The transient field was consumed (cleared) so a follow-up turn
-    # won't re-emit session:end for the same prior session.
-    assert fresh_entry.auto_reset_prior_session_id is None
+    assert end_ctx["platform"] == "telegram"
 
 
-def test_session_entry_has_auto_reset_prior_session_id_field():
-    """The dataclass exposes the transient prior-id field required by
-    the gateway emit pipeline (#28746)."""
+@pytest.mark.asyncio
+async def test_auto_reset_emit_does_not_clear_prev_session_id():
+    """CLAWD-3534: the emit must not consume upstream's field.
+
+    ``prev_session_id`` has a second consumer:
+    ``build_channel_continuity_note`` reads it to point Slack/Discord at the
+    prior same-channel session.  The retired fork field was cleared after
+    one read; doing that
+    to ``prev_session_id`` would silently drop the continuity hint, so the
+    exactly-once marker is a separate field and this pins that.
+    """
+    source = _make_source()
+    fresh_entry = _auto_reset_entry(build_session_key(source))
+    runner = _make_emit_runner(fresh_entry)
+
+    await _drive_to_emit(runner)
+
+    assert fresh_entry.prev_session_id == "sess-old-prior", (
+        "session:end emit cleared prev_session_id — the Slack/Discord "
+        "continuity hint reads that field and would go silent"
+    )
+    assert fresh_entry.session_end_emitted_for == "sess-old-prior", (
+        "emit did not record the already-emitted marker"
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_reset_session_end_fires_exactly_once():
+    """CLAWD-3534: re-entering the block must not re-fire session:end.
+
+    ``prev_session_id`` persists for the life of the entry, unlike the
+    transient field it replaced, so something has to make the close
+    idempotent.  This drives the state where that is not academic: the
+    /model path (``slash_commands.py``) consumes ``was_auto_reset`` without
+    emitting anything, so the entry keeps ``auto_reset_reason`` forever —
+    ``run.py`` clears it only inside ``if _was_auto_reset:``, which never
+    runs on that path.  Every later turn that reaches the emit block —
+    ``_is_new_session`` still gates entry, see the sibling test's docstring
+    for what masks that today — therefore re-classifies as an auto-reset
+    boundary, and the marker is the only thing between that and a duplicate
+    close on each one.
+    """
+    source = _make_source()
+    fresh_entry = _flag_consumed_elsewhere_entry(build_session_key(source))
+    runner = _make_emit_runner(fresh_entry)
+
+    await _drive_to_emit(runner)
+    first_pass = [c[0][0] for c in runner.hooks.emit.call_args_list]
+    assert first_pass == ["session:end", "session:start"]
+    assert fresh_entry.session_end_emitted_for == "sess-old-prior"
+
+    # Second turn on the same entry.  Nothing is mutated between passes —
+    # the entry re-classifies on its own, which is the point.
+    assert fresh_entry.auto_reset_reason == "idle", (
+        "precondition lost: the entry no longer re-classifies, so the "
+        "assertion below would hold without the marker doing anything"
+    )
+    runner.hooks.emit.reset_mock()
+    await _drive_to_emit(runner)
+
+    assert "session:start" in [
+        c[0][0] for c in runner.hooks.emit.call_args_list
+    ], "second pass never reached the emit block; the assertion below is vacuous"
+
+    second_pass = [c[0][0] for c in runner.hooks.emit.call_args_list]
+    assert "session:end" not in second_pass, (
+        f"session:end re-fired for an already-closed prior session; "
+        f"got {second_pass}"
+    )
+
+
+def _flag_consumed_elsewhere_entry(session_key: str) -> SessionEntry:
+    """An auto-reset entry whose ``was_auto_reset`` was eaten by /model.
+
+    ``gateway/slash_commands.py:2229`` consumes the flag so the model
+    override it is about to store survives the next turn's cleanup
+    (#48031).  That path emits no ``session:end``, and it leaves
+    ``auto_reset_reason`` set because ``run.py`` clears the reason only
+    inside ``if _was_auto_reset:``.
+    """
+    return _auto_reset_entry(session_key, was_auto_reset=False)
+
+
+@pytest.mark.asyncio
+async def test_close_survives_flag_consumed_by_slash_command():
+    """CLAWD-3534: an idle reset followed by /model must not lose the close.
+
+    Sequence: a session idles past its reset policy, and the user's next
+    inbound is ``/model ...``.  The slash path calls
+    ``get_or_create_session`` — firing the auto-reset, so the close for the
+    prior id is owed — then consumes ``was_auto_reset`` without emitting
+    anything.  If the boundary classifier read only that flag, the close
+    would be unreachable to this block forever.
+
+    Currently masked in production by ``updated_at`` being bumped
+    unconditionally on the healthy path (so the next turn is not a "new
+    session" at all).  The mask disappears with upstream's
+    ``touch_activity=False``, already on upstream/main, which preserves
+    ``updated_at`` — so this is pinned now rather than after that merge.
+    """
+    source = _make_source()
+    entry = _flag_consumed_elsewhere_entry(build_session_key(source))
+    assert entry.was_auto_reset is False and entry.auto_reset_reason == "idle"
+
+    runner = _make_emit_runner(entry)
+    await _drive_to_emit(runner)
+
+    events = [c[0][0] for c in runner.hooks.emit.call_args_list]
+    assert events == ["session:end", "session:start"], (
+        f"close for the prior session was dropped because another path had "
+        f"already consumed was_auto_reset; got {events}"
+    )
+    assert runner.hooks.emit.call_args_list[0][0][1]["session_id"] == (
+        "sess-old-prior"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_reset_never_emits_auto_reset_close():
+    """CLAWD-3534 tripwire: /new must not be reported as an auto-reset.
+
+    The retired field was written at one call site the fork controlled.
+    ``prev_session_id`` is upstream's, and upstream already threads it into
+    lineage columns, so an upstream release that records a parent id on the
+    entry ``reset_session`` builds would — if the close were keyed on that id
+    alone — turn every explicit /new into a spurious reason="auto_reset"
+    close on all 11 live gateways.
+
+    This pins the classifier rather than the current write sites: the entry
+    below is shaped like ``reset_session``'s output but *also* carries a
+    prev_session_id, which is precisely the state no test would otherwise
+    cover.
+    """
+    source = _make_source()
+    entry = _auto_reset_entry(
+        build_session_key(source),
+        was_auto_reset=False,
+        auto_reset_reason=None,
+        is_fresh_reset=True,
+        prev_session_id="sess-old-explicitly-reset",
+    )
+    runner = _make_emit_runner(entry)
+
+    await _drive_to_emit(runner)
+
+    events = [c[0][0] for c in runner.hooks.emit.call_args_list]
+    assert events == ["session:start"], (
+        f"an explicit /new emitted a session boundary close; got {events}"
+    )
+
+
+def test_reset_session_leaves_prev_session_id_unset(tmp_path, monkeypatch):
+    """The write-site half of the tripwire above, against the real store.
+
+    If upstream ever starts recording a parent id here, this fails and points
+    at ``test_explicit_reset_never_emits_auto_reset_close`` as the guard that
+    is now load-bearing.
+    """
+    import hermes_state
+
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store = SessionStore(
+        sessions_dir=tmp_path / "sessions", config=GatewayConfig()
+    )
+
+    source = _make_source()
+    first = store.get_or_create_session(source)
+    reset = store.reset_session(first.session_key)
+
+    assert reset is not None
+    assert reset.is_fresh_reset is True
+    assert reset.prev_session_id is None, (
+        "reset_session now records a prior session id; the session:end emit "
+        "in run.py classifies boundaries by was_auto_reset, so verify that "
+        "guard still holds before relying on this"
+    )
+
+
+def test_session_entry_has_session_end_emitted_for_field():
+    """The dataclass exposes the exactly-once marker the emit needs
+    (#28746, CLAWD-3534)."""
     entry = SessionEntry(
         session_key="k",
         session_id="s",
@@ -424,7 +617,48 @@ def test_session_entry_has_auto_reset_prior_session_id_field():
         updated_at=datetime.now(),
     )
     # default value is None
-    assert entry.auto_reset_prior_session_id is None
+    assert entry.session_end_emitted_for is None
     # field is writable
-    entry.auto_reset_prior_session_id = "prior"
-    assert entry.auto_reset_prior_session_id == "prior"
+    entry.session_end_emitted_for = "prior"
+    assert entry.session_end_emitted_for == "prior"
+
+
+def test_session_end_marker_survives_persistence_roundtrip():
+    """CLAWD-3534: the marker is PERSISTED, unlike the field it replaces.
+
+    The retired ``auto_reset_prior_session_id`` was never written to
+    sessions.json, so a restart between the auto-reset and the next turn
+    dropped the pending close outright.  Both halves now round-trip, so the
+    close still fires after a restart and does not re-fire once the marker
+    has been saved.
+
+    Stated precisely, because this is a real behaviour change and not a
+    strict improvement: if the process dies between the emit and the next
+    save, the marker is lost while ``prev_session_id`` survives, so the
+    close can fire twice.  That trades at-most-once-with-silent-loss for
+    at-least-once.
+
+    Do not read that as "a duplicate is harmless".  The one subscriber
+    installed in this mesh (the clawd-substrate-ingest hook) ignores the
+    ``session_id`` in the context and closes every row in its state file, so
+    a duplicate lands on whatever session is live by then.  What makes the
+    trade defensible is that the fleet ALREADY receives repeated closes for
+    one session_id today — the expiry watcher emits reason="idle_expiry"
+    and this block then emits reason="auto_reset" for the same id — so
+    duplicate-tolerance is a property subscribers need regardless, while a
+    silently dropped close leaves state stuck forever with nothing to
+    reconcile it.
+    """
+    entry = SessionEntry(
+        session_key="k",
+        session_id="s",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        prev_session_id="sess-old-prior",
+        session_end_emitted_for="sess-old-prior",
+    )
+
+    restored = SessionEntry.from_dict(entry.to_dict())
+
+    assert restored.prev_session_id == "sess-old-prior"
+    assert restored.session_end_emitted_for == "sess-old-prior"

@@ -784,24 +784,53 @@ class SessionEntry:
     auto_reset_reason: Optional[str] = None  # "idle" or "daily"
     reset_had_activity: bool = False  # whether the expired session had any messages
 
-    # CLAWD-3388 Phase 2: these two are NOT substitutes and must both exist.
-    # Measured at cc4cab2f: prev_session_id is PERSISTED (to_dict/from_dict)
-    # and never cleared; auto_reset_prior_session_id is transient and is
-    # explicitly cleared in run.py after one use. Collapsing them either
-    # loses the continuity hint after the first turn or re-fires session:end.
     # When this session was created by an auto-reset, the session_id of the
-    # session it replaced.  Used to give Slack/Discord channels/threads a
-    # lightweight continuity hint (see build_channel_continuity_note) so the
-    # agent recalls the prior same-channel session via session_search instead
-    # of binding the request to an unrelated recent session.
+    # session it replaced.  Two consumers, one field — CLAWD-3534 collapsed
+    # the fork's transient ``auto_reset_prior_session_id`` onto this upstream
+    # field after measuring that both were assigned ``entry.session_id`` from
+    # the same two auto-reset arms.  They never diverged *at their assignment
+    # sites*; on a reloaded entry they did (this one persisted, the transient
+    # one came back None), which is exactly the difference this change trades
+    # on — see ``session_end_emitted_for``.  The two consumers:
+    #   - a lightweight Slack/Discord continuity hint (see
+    #     build_channel_continuity_note) so the agent recalls the prior
+    #     same-channel session via session_search instead of binding the
+    #     request to an unrelated recent session;
+    #   - the gateway-level session:end emit for that OLD session_id, fired
+    #     before session:start for the new one (#28746).
+    # PERSISTED via to_dict/from_dict and never cleared.  The emit is kept
+    # exactly-once by ``session_end_emitted_for`` below, NOT by clearing this:
+    # build_channel_continuity_note gates on reset_had_activity + this field
+    # and runs AFTER the emit block in the same turn, so clearing here would
+    # drop the hint on that very turn, not merely on later ones.
     prev_session_id: Optional[str] = None
-    # Set by get_or_create_session() when the prior session_id was just
-    # closed by auto-reset so the next emit pass (in run.py
-    # _handle_message_with_agent) can fire session:end for that OLD
-    # session_id before session:start for the new one.  Transient — consumed
-    # once by the emit code and cleared.  Not persisted to sessions.json.
-    # See #28746.
-    auto_reset_prior_session_id: Optional[str] = None
+    # The ``prev_session_id`` that session:end has ALREADY been emitted for.
+    # Replaces the consume-by-clearing protocol the fork's transient field
+    # used, whose correctness rested entirely on the emit path clearing
+    # exactly once: miss the clear and session:end double-fires, clear early
+    # and the event is lost, and a gateway restart lost the pending emit
+    # outright because the field was never persisted.  Recording the *id*
+    # rather than a bare bool keeps the emit correct if upstream ever starts
+    # re-assigning ``prev_session_id`` on a live entry.
+    #
+    # This is the IDEMPOTENCE half only.  Whether a boundary is an auto-reset
+    # at all is decided by ``was_auto_reset`` at the emit site in run.py —
+    # ``prev_session_id`` is upstream's field and must not be read as a
+    # proxy for "this was an auto-reset".
+    #
+    # On the deploy that introduces this key, entries already on disk have
+    # ``prev_session_id`` set (the running fleet persists it) and no marker.
+    # Those do NOT replay a stale close: reaching the emit also requires
+    # ``was_auto_reset``, which run.py consumes on the first handled turn, so
+    # a persisted True means no turn has completed since the reset and the
+    # close is genuinely still owed.  Treating a missing key as
+    # already-emitted would suppress exactly those owed closes, so the key is
+    # deliberately read with a plain ``.get()`` default rather than a
+    # presence check.  Declared residual: an owed close may be arbitrarily
+    # old, and the installed subscriber applies it to whatever session is
+    # live when it finally lands.
+    # See #28746, CLAWD-3534.
+    session_end_emitted_for: Optional[str] = None
 
     # Set by reset_session() when the user explicitly sends /new or /reset.
     # Consumed once by _handle_message_with_agent to trigger topic/channel
@@ -876,6 +905,7 @@ class SessionEntry:
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
             "prev_session_id": self.prev_session_id,
+            "session_end_emitted_for": self.session_end_emitted_for,
         }
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
@@ -953,6 +983,7 @@ class SessionEntry:
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
+            session_end_emitted_for=data.get("session_end_emitted_for"),
             model_override=sanitize_model_override(data.get("model_override")),
         )
 
@@ -2379,14 +2410,6 @@ class SessionStore:
                 # the assignments only shadowed upstream's new recovery arm.
                 if not force_new:
                     _needs_recover = True
-            # Capture the prior session_id (if any) for the emit pipeline to
-            # consume.  Without this the auto-reset path closes a session
-            # locally without a corresponding gateway-level session:end.  See
-            # #28746.
-            _prior_session_id_for_emit = (
-                db_end_session_id if was_auto_reset else None
-            )
-
         # ---- Phase 3: no-lock I/O -- recovery + create + save + DB ops ----
         if _needs_recover and db_end_session_id is None:
             # The legacy (pre-workspace) Slack key fallback happens INSIDE
@@ -2421,7 +2444,6 @@ class SessionStore:
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
-                auto_reset_prior_session_id=_prior_session_id_for_emit,
                 prev_session_id=prev_session_id,
             )
             with self._lock:

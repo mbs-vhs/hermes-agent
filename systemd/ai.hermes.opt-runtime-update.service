@@ -19,7 +19,7 @@ TimeoutStartSec=1800
 # it room to run before escalating to SIGKILL.
 TimeoutStopSec=120
 Group=root
-UMask=0077
+UMask=0022
 EnvironmentFile=-/etc/hermes-agent/runtime-update.env
 ExecStart=/usr/bin/python3.11 /usr/local/libexec/hermes-agent/update_opt_hermes_runtime.py apply --runtime /opt/hermes-agent --target-file /etc/hermes-agent/runtime-target --fetch --backup-receipt /var/lib/hermes-agent/latest-backup.json --receipt-dir /var/lib/hermes-agent/runtime-receipts
 
@@ -40,7 +40,6 @@ ProtectKernelTunables=yes
 ProtectSystem=strict
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
 StateDirectory=hermes-agent
 ReadOnlyPaths=/etc/hermes-agent
 ReadWritePaths=/opt/hermes-agent /var/lib/hermes-agent /run/lock

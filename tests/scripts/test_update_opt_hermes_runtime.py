@@ -930,7 +930,6 @@ def test_systemd_templates_keep_mutation_manual_and_timer_audit_only():
     assert "CapabilityBoundingSet=\n" in update
     assert "AmbientCapabilities=\n" in update
     assert "LockPersonality=yes" in update
-    assert "RestrictSUIDSGID=yes" in update
     assert " --target-file /etc/hermes-agent/runtime-target " in update
     assert " --fetch " in update
     assert not any(line.startswith("ExecStartPost=") for line in update.splitlines())
@@ -949,3 +948,41 @@ def test_systemd_templates_keep_mutation_manual_and_timer_audit_only():
     assert "RestrictAddressFamilies=AF_UNIX" in audit
     assert "Unit=ai.hermes.opt-runtime-audit.service" in timer
     assert "WantedBy=timers.target" in timer
+
+
+def test_update_unit_allows_tar_openat2_for_backup_fidelity_extract():
+    root = Path(__file__).resolve().parents[2]
+    update = (root / "systemd/ai.hermes.opt-runtime-update.service").read_text()
+    assert "RestrictSUIDSGID=yes" not in update
+
+
+def test_update_unit_umask_preserves_git_declared_modes(
+    runtime_fixture: dict[str, Path | str], tmp_path: Path
+):
+    _init(runtime_fixture)
+    assert _initial_apply(runtime_fixture, tmp_path) == 0
+    source = Path(runtime_fixture["source"])
+    runtime = Path(runtime_fixture["runtime"])
+    (source / "pkg" / "live.py").write_text("VALUE = 2\n", encoding="utf-8")
+    executable = source / "run-target"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    _git(source, "add", "pkg/live.py", "run-target")
+    _git(source, "commit", "-qm", "target with declared modes")
+    _git(source, "push", "-q", "origin", "main")
+    target = _git(source, "rev-parse", "HEAD")
+
+    root = Path(__file__).resolve().parents[2]
+    update = (root / "systemd/ai.hermes.opt-runtime-update.service").read_text()
+    unit_umask = int(
+        next(line.split("=", 1)[1] for line in update.splitlines() if line.startswith("UMask=")),
+        8,
+    )
+    previous_umask = os.umask(unit_umask)
+    try:
+        assert _steady_apply(runtime_fixture, tmp_path, target) == 0
+    finally:
+        os.umask(previous_umask)
+
+    assert (runtime / "pkg" / "live.py").stat().st_mode & 0o777 == 0o644
+    assert (runtime / "run-target").stat().st_mode & 0o777 == 0o755

@@ -189,6 +189,11 @@ def get_cron_output_dir() -> Path:
     return _current_cron_store().output_dir
 
 
+def get_cron_jobs_file() -> Path:
+    """Return the authoritative jobs file for the active profile context."""
+    return _current_cron_store().jobs_file
+
+
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
 # the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
 # in which case no finite run bound exists to derive from. Also acts as the

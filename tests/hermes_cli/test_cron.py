@@ -92,6 +92,7 @@ class TestCronCommandLifecycle:
                 script=None,
                 workdir=None,
                 no_agent=False,
+                allow_inactive_store=True,
             )
         )
         out = capsys.readouterr().out
@@ -172,6 +173,7 @@ class TestExternalCronProviderStatus:
                 script=None,
                 workdir=None,
                 no_agent=False,
+                allow_inactive_store=False,
             )
         )
         out = capsys.readouterr().out
@@ -227,6 +229,7 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
         script=None,
         workdir=None,
         no_agent=False,
+        allow_inactive_store=True,
     )
 
     rc = cron_cli.cron_create(args)
@@ -234,3 +237,96 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+
+def test_cron_create_refuses_unserved_builtin_store(tmp_cron_dir, monkeypatch, capsys):
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr(cron_cli, "_active_builtin_store_is_served", lambda: False)
+
+    rc = cron_cli.cron_create(
+        SimpleNamespace(
+            schedule="every 1h",
+            prompt="refresh docs",
+            name=None,
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            script=None,
+            workdir=None,
+            model=None,
+            model_provider=None,
+            no_agent=False,
+            allow_inactive_store=False,
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "Refusing to create" in out
+    assert str(tmp_cron_dir / "cron" / "jobs.json") in out
+    assert list_jobs() == []
+
+
+@pytest.mark.parametrize(
+    "heartbeat_age, success_age, expected",
+    [(1, 1, True), (None, 1, False), (1, None, False), (201, 1, False), (1, 201, False)],
+)
+def test_builtin_store_service_proof_uses_its_own_tick_markers(
+    monkeypatch, heartbeat_age, success_age, expected
+):
+    monkeypatch.setattr("cron.jobs.TICKER_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr("cron.jobs.get_ticker_heartbeat_age", lambda: heartbeat_age)
+    monkeypatch.setattr("cron.jobs.get_ticker_success_age", lambda: success_age)
+
+    assert cron_cli._active_builtin_store_is_served() is expected
+
+
+def test_cron_list_prints_authoritative_store(tmp_cron_dir, capsys, monkeypatch):
+    create_job(prompt="Daily report", schedule="0 11 * * *")
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+
+    cron_cli.cron_list(show_all=True)
+
+    out = capsys.readouterr().out
+    assert f"Cron store: {tmp_cron_dir / 'cron' / 'jobs.json'}" in out
+
+
+def test_cron_create_list_execute_share_one_store(tmp_cron_dir, monkeypatch, capsys):
+    from hermes_constants import get_hermes_home
+    from tools.cronjob_tools import cronjob
+    import json
+
+    scripts_dir = get_hermes_home() / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "store_probe.py").write_text("print('executed-from-authoritative-store')\n")
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr(cron_cli, "_active_builtin_store_is_served", lambda: True)
+
+    rc = cron_cli.cron_create(
+        SimpleNamespace(
+            schedule="every 1h",
+            prompt=None,
+            name="store probe",
+            deliver="local",
+            repeat=None,
+            skill=None,
+            skills=None,
+            script="store_probe.py",
+            workdir=None,
+            model=None,
+            model_provider=None,
+            no_agent=True,
+            allow_inactive_store=False,
+        )
+    )
+    assert rc in (None, 0)
+    created = list_jobs()
+    assert len(created) == 1
+
+    result = json.loads(cronjob(action="run", job_id=created[0]["id"]))
+    assert result["success"] is True
+    assert result["job"]["executed"] is True
+    assert result["job"]["execution_success"] is True, result
+    assert get_job(created[0]["id"])["last_status"] == "ok"
+    assert str(tmp_cron_dir / "cron" / "jobs.json") in capsys.readouterr().out

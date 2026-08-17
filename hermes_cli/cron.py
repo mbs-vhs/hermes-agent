@@ -96,11 +96,34 @@ def _warn_if_gateway_not_running() -> None:
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
 
+def _active_builtin_store_is_served() -> bool:
+    """Return whether this exact profile store has a healthy builtin ticker."""
+    try:
+        from cron.jobs import (
+            TICKER_INTERVAL_SECONDS,
+            get_ticker_heartbeat_age,
+            get_ticker_success_age,
+        )
+
+        stale_after = TICKER_INTERVAL_SECONDS * 3 + 20
+        heartbeat_age = get_ticker_heartbeat_age()
+        success_age = get_ticker_success_age()
+        return (
+            heartbeat_age is not None
+            and success_age is not None
+            and heartbeat_age <= stale_after
+            and success_age <= stale_after
+        )
+    except Exception:
+        return False
+
+
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
-    from cron.jobs import list_jobs
+    from cron.jobs import get_cron_jobs_file, list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
+    print(color(f"Cron store: {get_cron_jobs_file()}", Colors.DIM))
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -216,10 +239,11 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
 
 def cron_status():
     """Show cron execution status."""
-    from cron.jobs import list_jobs
+    from cron.jobs import get_cron_jobs_file, list_jobs
     from hermes_cli.gateway import find_gateway_pids
 
     print()
+    print(color(f"Cron store: {get_cron_jobs_file()}", Colors.DIM))
 
     provider = _active_cron_provider_name()
     if provider != "builtin":
@@ -338,6 +362,22 @@ def cron_create(args):
     # raises GatewayLifecycleBlocked, the `cronjob` tool wrapper catches it and
     # returns it as result["error"], and the `if not result.get("success")`
     # branch below prints it in red and exits 1 — same UX as before.
+    from cron.jobs import get_cron_jobs_file
+
+    store = get_cron_jobs_file()
+    if (
+        _active_cron_provider_name() == "builtin"
+        and not getattr(args, "allow_inactive_store", False)
+    ):
+        if not _active_builtin_store_is_served():
+            print(color("Refusing to create a job in an unserved cron store.", Colors.RED))
+            print(f"  Cron store: {store}")
+            print(
+                "  Start the gateway for this exact profile/store, or pass "
+                "--allow-inactive-store to acknowledge that it cannot fire yet."
+            )
+            return 1
+
     result = _cron_api(
         action="create",
         schedule=args.schedule,
@@ -357,6 +397,7 @@ def cron_create(args):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
     print(color(f"Created job: {result['job_id']}", Colors.GREEN))
+    print(f"  Cron store: {store}")
     print(f"  Name: {result['name']}")
     print(f"  Schedule: {result['schedule']}")
     if result.get("skills"):

@@ -83,6 +83,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--allow-inactive-store",
+        action="store_true",
+        help=(
+            "Create in the active profile store even when no built-in gateway "
+            "can be proven to serve it. The job will not fire until that exact "
+            "store has a running gateway."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(

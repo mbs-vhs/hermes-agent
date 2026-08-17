@@ -130,6 +130,43 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_allowlisted_job_env_reaches_script_without_mutating_parent(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        env_file = cron_env / "fleet.env"
+        env_file.write_text("placeholder\n")
+        script = cron_env / "scripts" / "env_probe.py"
+        script.write_text(
+            "import os\nprint(os.environ.get('CLAWD_ENV_FILE', 'ABSENT'))\n"
+        )
+
+        success, output = _run_job_script(
+            "env_probe.py", job_env={"CLAWD_ENV_FILE": str(env_file)}
+        )
+
+        assert success is True
+        assert output == str(env_file)
+        assert os.environ.get("CLAWD_ENV_FILE") is None
+
+    @pytest.mark.parametrize(
+        "job_env, expected",
+        [
+            ({"ENGINEER_SHARED_SECRET": "do-not-copy-secrets"}, "non-allowlisted"),
+            ({"CLAWD_ENV_FILE": "relative.env"}, "absolute path"),
+            ({"CLAWD_ENV_FILE": ""}, "non-empty string"),
+        ],
+    )
+    def test_job_env_fails_closed(self, cron_env, job_env, expected):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "must_not_run.py"
+        script.write_text("raise SystemExit('executed')\n")
+
+        success, output = _run_job_script("must_not_run.py", job_env=job_env)
+
+        assert success is False
+        assert expected in output
+
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script

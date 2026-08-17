@@ -1,5 +1,6 @@
 """Tests for hermes_cli.cron command handling."""
 
+import time
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -118,7 +119,7 @@ class TestGatewayNotRunningWarning:
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
-        assert "Gateway is not running" in out
+        assert "Selected cron store is not served" in out
 
 
 class TestExternalCronProviderStatus:
@@ -146,7 +147,7 @@ class TestExternalCronProviderStatus:
         assert "managed scheduler" in out
         assert "not firing" not in out.lower()
         assert "STALLED" not in out
-        assert "Gateway is not running" not in out
+        assert "Selected cron store is not served" not in out
         # Still surfaces the active-job summary.
         assert "active job(s)" in out
 
@@ -178,7 +179,7 @@ class TestExternalCronProviderStatus:
         )
         out = capsys.readouterr().out
         assert "Created job" in out
-        assert "Gateway is not running" not in out
+        assert "Selected cron store is not served" not in out
 
 
 def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
@@ -202,7 +203,7 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
     cron_cli.cron_list()
 
     out = capsys.readouterr().out
-    assert "Gateway is not running" in out
+    assert "Selected cron store is not served" in out
     assert "Nightly docs" in out
 
 
@@ -290,6 +291,61 @@ def test_cron_list_prints_authoritative_store(tmp_cron_dir, capsys, monkeypatch)
 
     out = capsys.readouterr().out
     assert f"Cron store: {tmp_cron_dir / 'cron' / 'jobs.json'}" in out
+
+
+def test_cron_list_rejects_unrelated_gateway_pid_as_store_proof(
+    tmp_cron_dir, capsys, monkeypatch
+):
+    create_job(prompt="Daily report", schedule="0 11 * * *")
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4242])
+
+    cron_cli.cron_list(show_all=True)
+
+    out = capsys.readouterr().out
+    assert f"Cron store: {tmp_cron_dir / 'cron' / 'jobs.json'}" in out
+    assert "Selected cron store is not served" in out
+    assert "jobs won't fire automatically" in out
+
+
+@pytest.mark.parametrize(
+    "present_markers",
+    [(), ("ticker_heartbeat",), ("ticker_last_success",)],
+)
+def test_cron_status_never_affirms_incomplete_exact_store_proof(
+    tmp_cron_dir, capsys, monkeypatch, present_markers
+):
+    create_job(prompt="Daily report", schedule="0 11 * * *")
+    cron_dir = tmp_cron_dir / "cron"
+    for marker in present_markers:
+        (cron_dir / marker).write_text(str(time.time()), encoding="utf-8")
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4242])
+
+    cron_cli.cron_status()
+
+    out = capsys.readouterr().out
+    assert f"Cron store: {cron_dir / 'jobs.json'}" in out
+    assert "will fire automatically" not in out
+    assert "NOT served" in out
+
+
+def test_cron_status_affirms_fresh_exact_store_markers(
+    tmp_cron_dir, capsys, monkeypatch
+):
+    create_job(prompt="Daily report", schedule="0 11 * * *")
+    cron_dir = tmp_cron_dir / "cron"
+    now = str(time.time())
+    (cron_dir / "ticker_heartbeat").write_text(now, encoding="utf-8")
+    (cron_dir / "ticker_last_success").write_text(now, encoding="utf-8")
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+
+    cron_cli.cron_status()
+
+    out = capsys.readouterr().out
+    assert "Selected cron store is served" in out
+    assert "cron jobs will fire automatically" in out
 
 
 def test_cron_create_list_execute_share_one_store(tmp_cron_dir, monkeypatch, capsys):

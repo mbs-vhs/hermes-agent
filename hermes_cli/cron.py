@@ -64,33 +64,34 @@ def _active_cron_provider_name() -> str:
 
 
 def _warn_if_gateway_not_running() -> None:
-    """Warn that scheduled jobs won't fire unless the gateway is running.
+    """Warn when the selected built-in cron store has no serving proof.
 
     The cron ticker only runs inside the gateway (``_start_cron_ticker`` in
     gateway/run.py); there is no standalone cron daemon. Without a running
     gateway, ``next_run_at`` passes but jobs never fire and ``last_run_at``
-    stays null — the most common cron support report (#51038). Surfacing this
-    at create/list time, when the user is right there, prevents it.
+    stays null — the most common cron support report (#51038). A gateway PID
+    alone is not enough: it may belong to another profile/store. The selected
+    store's own ticker markers are the authoritative serving proof.
 
     An external provider (e.g. Chronos) fires jobs via a NAS-mediated webhook,
     NOT the in-process ticker, so a momentarily-absent gateway process does not
     mean jobs won't fire — the warning would be a false alarm. Stay quiet for
-    any non-builtin provider; the gateway-process heuristic only speaks to the
-    built-in ticker's trigger.
+    any non-builtin provider; profile-local ticker markers only speak to the
+    built-in provider's trigger.
     """
     try:
         if _active_cron_provider_name() != "builtin":
             return
 
-        from hermes_cli.gateway import find_gateway_pids
-
-        if find_gateway_pids():
+        if _active_builtin_store_is_served():
             return
     except Exception:
-        # If we can't determine gateway state, stay quiet rather than nag.
-        return
+        pass
 
-    print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
+    from cron.jobs import get_cron_jobs_file
+
+    print(color("  ⚠  Selected cron store is not served — jobs won't fire automatically.", Colors.YELLOW))
+    print(color(f"     Cron store: {get_cron_jobs_file()}", Colors.DIM))
     print(color("     Start it with: hermes gateway install", Colors.DIM))
     print(color("                    sudo hermes gateway install --system  # Linux servers", Colors.DIM))
     print(color("     Check status:  hermes cron status", Colors.DIM))
@@ -270,12 +271,21 @@ def cron_status():
         return
 
     pids = find_gateway_pids()
-    if pids:
-        # The gateway PROCESS is alive — but the cron ticker THREAD inside it
-        # can die silently, or stay alive while every tick fails. Check both
-        # the liveness heartbeat and the last-successful-tick marker so we
-        # don't report "will fire" when the ticker is dead or failing
-        # (#32612, #32895).
+    store_is_served = _active_builtin_store_is_served()
+    if store_is_served:
+        print(color("✓ Selected cron store is served — cron jobs will fire automatically", Colors.GREEN))
+        if pids:
+            print(f"  PID: {', '.join(map(str, pids))}")
+        from cron.jobs import get_ticker_heartbeat_age
+
+        hb_age = get_ticker_heartbeat_age()
+        if hb_age is not None:
+            print(f"  Ticker heartbeat: {int(hb_age)}s ago")
+    else:
+        # A gateway PID, if found, is diagnostic only: it may serve another
+        # profile. Check this store's liveness heartbeat and last-successful-
+        # tick marker so we don't report "will fire" when its ticker is dead
+        # or failing (#32612, #32895).
         from cron.jobs import (
             get_ticker_heartbeat_age,
             get_ticker_last_error,
@@ -290,24 +300,33 @@ def cron_status():
         hb_age = get_ticker_heartbeat_age()
         ok_age = get_ticker_success_age()
 
-        if hb_age is not None and hb_age > STALE_AFTER:
-            # No heartbeat at all → the ticker thread is gone.
+        if hb_age is None:
             print(color(
-                "⚠ Gateway is running but the cron ticker looks STALLED — "
+                "⚠ Selected cron store is NOT served — no ticker heartbeat "
+                "was found for this store.",
+                Colors.YELLOW,
+            ))
+        elif hb_age > STALE_AFTER:
+            # A stale heartbeat means the ticker thread stopped advancing.
+            print(color(
+                "⚠ Selected cron store's ticker looks STALLED — "
                 f"no heartbeat for {int(hb_age)}s (expected every ~60s).",
                 Colors.YELLOW,
             ))
-            print(f"  PID: {', '.join(map(str, pids))}")
-            print("  Cron jobs may NOT be firing. Restart: hermes gateway restart")
-        elif hb_age is not None and ok_age is not None and ok_age > STALE_AFTER:
+        elif ok_age is None:
+            print(color(
+                "⚠ Selected cron store is NOT served — no successful-tick "
+                "marker was found for this store.",
+                Colors.YELLOW,
+            ))
+        elif ok_age > STALE_AFTER:
             # Loop is alive (fresh heartbeat) but no tick has SUCCEEDED in a
             # long time → ticks are failing every iteration.
             print(color(
-                "⚠ Gateway and cron ticker are running, but no tick has "
+                "⚠ Selected cron store's ticker is running, but no tick has "
                 f"succeeded in {int(ok_age)}s — ticks may be failing.",
                 Colors.YELLOW,
             ))
-            print(f"  PID: {', '.join(map(str, pids))}")
             last_error = get_ticker_last_error()
             if last_error:
                 # Show WHY ticks fail — e.g. a root-rewritten jobs.json
@@ -323,15 +342,16 @@ def cron_status():
                         Colors.YELLOW,
                     ))
             print("  Check the gateway log for 'Cron tick error'.")
-        else:
-            print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
+        else:  # pragma: no cover - markers can race between the proof and diagnostics
+            print(color("⚠ Selected cron store serving proof changed during status.", Colors.YELLOW))
+
+        if pids:
             print(f"  PID: {', '.join(map(str, pids))}")
-            if hb_age is not None:
-                print(f"  Ticker heartbeat: {int(hb_age)}s ago")
-    else:
-        print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
+        else:
+            print("  No gateway process was detected.")
+        print(color("✗ Cron jobs will NOT fire automatically from this store", Colors.RED))
         print()
-        print("  To enable automatic execution:")
+        print("  To serve this exact profile/store:")
         print("    hermes gateway install    # Install as a user service")
         print("    sudo hermes gateway install --system  # Linux servers: boot-time system service")
         print("    hermes gateway            # Or run in foreground")
